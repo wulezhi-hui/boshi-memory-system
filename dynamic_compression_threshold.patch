@@ -1,0 +1,42 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index c343882b2..02839d0e1 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1485,6 +1485,18 @@ def init_agent(
+     # Reject models whose context window is below the minimum required
+     # for reliable tool-calling workflows (64K tokens).
+     _ctx = getattr(agent.context_compressor, "context_length", 0)
++    try:
++        from pathlib import Path; _boshi = Path.home() / ".boshi"; import sys; sys.path.insert(0, str(_boshi))  # noqa: E402
++        from dynamic_threshold import get_dynamic_threshold
++        _dyn = get_dynamic_threshold(_ctx)
++        if _dyn is not None and _dyn != compression_threshold:
++            agent.context_compressor.threshold_percent = _dyn
++            agent.context_compressor.threshold_tokens = max(int(_ctx * _dyn), MINIMUM_CONTEXT_LENGTH)
++            if not agent.quiet_mode:
++                _ra().logger.info("Dynamic compression threshold: %.0f%% (ctx=%s, default=%.0f%%)", _dyn * 100, f"{_ctx:,}", compression_threshold * 100)
++            compression_threshold = _dyn
++    except Exception:
++        pass
+     if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH:
+         raise ValueError(
+             f"Model {agent.model} has a context window of {_ctx:,} tokens, "
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 079c4b0b5..6260963ca 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -569,6 +569,14 @@ class ContextCompressor(ContextEngine):
+         self.provider = provider
+         self.api_mode = api_mode
+         self.context_length = context_length
++        try:
++            from pathlib import Path; _boshi = Path.home() / ".boshi"; import sys; sys.path.insert(0, str(_boshi))  # noqa: E402
++            from dynamic_threshold import get_dynamic_threshold
++            _dyn = get_dynamic_threshold(context_length)
++            if _dyn is not None:
++                self.threshold_percent = _dyn
++        except Exception:
++            pass
+         self.threshold_tokens = max(
+             int(context_length * self.threshold_percent),
+             MINIMUM_CONTEXT_LENGTH,

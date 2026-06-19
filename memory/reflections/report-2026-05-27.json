@@ -1,0 +1,194 @@
+[
+  {
+    "timestamp": "2026-05-27T08:29:09.085124",
+    "summary": "🗂️ 改进日志中有 1 个待处理项，三省可复查是否需要推进",
+    "sections": {
+      "desktop": {
+        "central": 3,
+        "side": 2,
+        "corner": 1,
+        "total": 6,
+        "alerts": []
+      },
+      "reflections": [
+        {
+          "date": "2026-05-26",
+          "time": "2026-05-26T09:00:42.209823",
+          "issues": [],
+          "total_projects": 5,
+          "newly_archived": 0
+        },
+        {
+          "date": "2026-05-26",
+          "time": "2026-05-26T15:02:39.679120",
+          "issues": [],
+          "total_projects": 5,
+          "newly_archived": 0
+        },
+        {
+          "date": "2026-05-26",
+          "time": "2026-05-26T21:00:48.420795",
+          "issues": [],
+          "total_projects": 5,
+          "newly_archived": 0
+        },
+        {
+          "date": "2026-05-25",
+          "time": "2026-05-25T09:00:24.176051",
+          "issues": [],
+          "total_projects": 4,
+          "newly_archived": 0
+        },
+        {
+          "date": "2026-05-25",
+          "time": "2026-05-25T15:00:15.454072",
+          "issues": [],
+          "total_projects": 5,
+          "newly_archived": 0
+        },
+        {
+          "date": "2026-05-25",
+          "time": "2026-05-25T21:00:50.132775",
+          "issues": [],
+          "total_projects": 5,
+          "newly_archived": 0
+        },
+        {
+          "date": "2026-05-24",
+          "time": "2026-05-24T09:00:15.664823",
+          "issues": [],
+          "total_projects": 4,
+          "newly_archived": 0
+        },
+        {
+          "date": "2026-05-24",
+          "time": "2026-05-24T15:15:11.139341",
+          "issues": [],
+          "total_projects": 4,
+          "newly_archived": 0
+        },
+        {
+          "date": "2026-05-24",
+          "time": "2026-05-24T21:00:34.870601",
+          "issues": [],
+          "total_projects": 4,
+          "newly_archived": 0
+        }
+      ],
+      "corrections": {
+        "total_recent": 0,
+        "by_topic": {},
+        "repeated_topics": {},
+        "unfixed_count": 0,
+        "unfixed": [],
+        "has_repeated_issues": false
+      },
+      "pending": [
+        {
+          "file": "2026-05-22-记忆系统重构.md",
+          "line": "└─→ v3.3（TODO: 清理main()中E37复杂度CLI代码到独立文件）",
+          "keyword": "TODO"
+        }
+      ]
+    },
+    "alerts": [
+      "🗂️ 改进日志中有 1 个待处理项，三省可复查是否需要推进"
+    ]
+  },
+  {
+    "timestamp": "2026-05-27T09:03:12.009400",
+    "summary": "🗂️ 改进日志中有 1 个待处理项，三省可复查是否需要推进",
+    "sections": {
+      "desktop": {
+        "central": 3,
+        "side": 2,
+        "corner": 1,
+        "total": 6,
+        "alerts": []
+      },
+      "reflections": [
+        {
+          "date": "2026-05-26",
+          "time": "2026-05-26T09:00:42.209823",
+          "issues": [],
+          "total_projects": 5,
+          "newly_archived": 0
+        },
+        {
+          "date": "2026-05-26",
+          "time": "2026-05-26T15:02:39.679120",
+          "issues": [],
+          "total_projects": 5,
+          "newly_archived": 0
+        },
+        {
+          "date": "2026-05-26",
+          "time": "2026-05-26T21:00:48.420795",
+          "issues": [],
+          "total_projects": 5,
+          "newly_archived": 0
+        },
+        {
+          "date": "2026-05-25",
+          "time": "2026-05-25T09:00:24.176051",
+          "issues": [],
+          "total_projects": 4,
+          "newly_archived": 0
+        },
+        {
+          "date": "2026-05-25",
+          "time": "2026-05-25T15:00:15.454072",
+          "issues": [],
+          "total_projects": 5,
+          "newly_archived": 0
+        },
+        {
+          "date": "2026-05-25",
+          "time": "2026-05-25T21:00:50.132775",
+          "issues": [],
+          "total_projects": 5,
+          "newly_archived": 0
+        },
+        {
+          "date": "2026-05-24",
+          "time": "2026-05-24T09:00:15.664823",
+          "issues": [],
+          "total_projects": 4,
+          "newly_archived": 0
+        },
+        {
+          "date": "2026-05-24",
+          "time": "2026-05-24T15:15:11.139341",
+          "issues": [],
+          "total_projects": 4,
+          "newly_archived": 0
+        },
+        {
+          "date": "2026-05-24",
+          "time": "2026-05-24T21:00:34.870601",
+          "issues": [],
+          "total_projects": 4,
+          "newly_archived": 0
+        }
+      ],
+      "corrections": {
+        "total_recent": 0,
+        "by_topic": {},
+        "repeated_topics": {},
+        "unfixed_count": 0,
+        "unfixed": [],
+        "has_repeated_issues": false
+      },
+      "pending": [
+        {
+          "file": "2026-05-22-记忆系统重构.md",
+          "line": "└─→ v3.3（TODO: 清理main()中E37复杂度CLI代码到独立文件）",
+          "keyword": "TODO"
+        }
+      ]
+    },
+    "alerts": [
+      "🗂️ 改进日志中有 1 个待处理项，三省可复查是否需要推进"
+    ]
+  }
+]

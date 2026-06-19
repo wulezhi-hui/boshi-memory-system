@@ -1,0 +1,56 @@
+{
+  "version": "5.8",
+  "last_build": 1780839352.5588434,
+  "profile": {
+    "identity": [
+      {
+        "content": "时区 Asia/Shanghai",
+        "timestamp": 1780839352.5558522,
+        "source": "auto"
+      }
+    ],
+    "preference": [
+      {
+        "content": "偏好直接说结论，不要啰嗦",
+        "timestamp": 1780839352.5558522,
+        "source": "weixin"
+      },
+      {
+        "content": "不喜欢AI啰嗦的回复风格",
+        "timestamp": 1780839352.5568495,
+        "source": "auto"
+      }
+    ],
+    "activity": [
+      {
+        "content": "Ubuntu 工作站部署中",
+        "timestamp": 1780839352.5588434,
+        "source": "terminal"
+      }
+    ],
+    "environment": [
+      {
+        "content": "Windows 10 + 双2080Ti，内存32G",
+        "timestamp": 1780839352.5558522,
+        "source": "auto"
+      }
+    ],
+    "interest": [
+      {
+        "content": "乐之，三友团队核心，古籍整理爱好者",
+        "timestamp": 1780839352.5558522,
+        "source": "weixin"
+      },
+      {
+        "content": "最近在研究 UE5 虚拟寺院项目",
+        "timestamp": 1780839352.5558522,
+        "source": "cli"
+      },
+      {
+        "content": "佛学修行者，禅修净土法门",
+        "timestamp": 1780839352.5558522,
+        "source": "weixin"
+      }
+    ]
+  }
+}

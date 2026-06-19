@@ -1,0 +1,26 @@
+[
+  {
+    "from_id": "470e4f3d",
+    "to_id": "9bde0931",
+    "rel_type": "updates",
+    "reason": "信息更新: 喜欢佛学... → 喜欢佛学和古籍整理...",
+    "created_at": "2026-06-08T16:34:56.511186+00:00",
+    "confidence": 1.0
+  },
+  {
+    "from_id": "9bde0931",
+    "to_id": "470e4f3d",
+    "rel_type": "related",
+    "reason": "同一用户偏好",
+    "created_at": "2026-06-08T16:34:56.512183+00:00",
+    "confidence": 1.0
+  },
+  {
+    "from_id": "4f3cc194",
+    "to_id": "e508f7a5",
+    "rel_type": "updates",
+    "reason": "信息更新: 喜欢佛学... → 喜欢佛学和古籍整理...",
+    "created_at": "2026-06-08T16:34:56.522156+00:00",
+    "confidence": 1.0
+  }
+]

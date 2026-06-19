@@ -1,0 +1,80 @@
+[
+  {
+    "id": "9bde0931",
+    "content": "喜欢佛学",
+    "entity": "乐之",
+    "tag_type": "interest",
+    "created_at": "2026-06-08T16:34:56.509191+00:00",
+    "updated_at": "2026-06-08T16:34:56.509191+00:00",
+    "is_latest": false,
+    "forget_reason": "",
+    "sources": [
+      "s001"
+    ]
+  },
+  {
+    "id": "470e4f3d",
+    "content": "喜欢佛学和古籍整理",
+    "entity": "乐之",
+    "tag_type": "interest",
+    "created_at": "2026-06-08T16:34:56.511186+00:00",
+    "updated_at": "2026-06-08T16:34:56.511186+00:00",
+    "is_latest": true,
+    "forget_reason": "",
+    "sources": [
+      "s001"
+    ]
+  },
+  {
+    "id": "f0dc017d",
+    "content": "名字叫乐之",
+    "entity": "乐之",
+    "tag_type": "identity",
+    "created_at": "2026-06-08T16:34:56.514178+00:00",
+    "updated_at": "2026-06-08T16:34:56.514178+00:00",
+    "is_latest": true,
+    "forget_reason": "",
+    "sources": [
+      "s002"
+    ]
+  },
+  {
+    "id": "b4609a45",
+    "content": "最近在研究 Supermemory",
+    "entity": "乐之",
+    "tag_type": "activity",
+    "created_at": "2026-06-08T16:34:56.516173+00:00",
+    "updated_at": "2026-06-08T16:34:56.516173+00:00",
+    "is_latest": true,
+    "forget_reason": "",
+    "sources": [
+      "s003"
+    ]
+  },
+  {
+    "id": "e508f7a5",
+    "content": "喜欢佛学",
+    "entity": "乐之",
+    "tag_type": "preference",
+    "created_at": "2026-06-08T16:34:56.519165+00:00",
+    "updated_at": "2026-06-08T16:34:56.519165+00:00",
+    "is_latest": false,
+    "forget_reason": "",
+    "sources": [
+      "s004"
+    ]
+  },
+  {
+    "id": "4f3cc194",
+    "content": "喜欢佛学和古籍整理",
+    "entity": "乐之",
+    "tag_type": "preference",
+    "created_at": "2026-06-08T16:34:56.522156+00:00",
+    "updated_at": "2026-06-08T16:34:56.522156+00:00",
+    "is_latest": true,
+    "forget_reason": "",
+    "sources": [
+      "s005"
+    ]
+  }
+]

@@ -1,0 +1,6 @@
+@echo off
+title 伯仕 - 三友战略参谋长
+echo 🦄 伯仕启动中...
+echo 灵魂路径: %USERPROFILE%\.boshi
+echo.
+"C:\Users\Administrator\AppData\Local\hermes\hermes-agent\venv\Scripts\hermes.exe" -s boshi-memory

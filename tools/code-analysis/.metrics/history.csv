@@ -1,0 +1,2 @@
+timestamp,commit,issues,errors,warnings,security_issues,avg_complexity,max_complexity,complex_c_funcs,dep_vulns,high_severity
+2026-05-22T02:35:37.966385+00:00,unknown,7,1,4,2,4.0,37,6,0,0

@@ -1,0 +1,84 @@
+# ========================
+# 伯仕记忆系统 .gitignore
+# ========================
+
+# --- 大数据库/向量存储 ---
+chroma_db/
+chroma_db.*/
+chroma_db_backup_*/
+chroma_db_pre_repair/
+
+# --- Python 缓存 ---
+__pycache__/
+*.py[cod]
+*$py.class
+.ruff_cache/
+
+# --- 运行时隐私文件 ---
+*.db
+*.sqlite
+*.sqlite3
+*.pid
+*.log
+360_*cookies*
+.bridged_msg_ids.txt
+.bridge_weixin.pid
+.sync_state.json
+.auto_collect_state.json
+.profile_cache.json
+.tt_tabid
+*.bak
+
+# --- 浏览器 Profile（隐私！） ---
+gzh_profile/
+toutiao_profile/
+zhihu_profile/
+toutiao_session/
+temp_*_profile/
+
+# --- Camofox 外部依赖 ---
+camofox/node_modules/
+camofox/package-lock.json
+
+# --- 二进制/模型文件 ---
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.png
+*.jpg
+*.jpeg
+
+# --- 备份/快照 ---
+hermes-backup/
+memory-snapshots/
+tmp/
+
+# --- 超大运行时数据 ---
+memory/hot.json*
+memory/forget_log.jsonl
+memory/integrity.json
+memory/integrity.log
+memory/knowledge_graph.json*
+memory/chroma_rebuild_backup.*
+memory/archive/
+memory/evoproposals/
+memory/converge_mode.json
+memory/cross_platform_history.json*
+
+# --- 网关补丁（大文件，单独管理）---
+gateway_patch/*.original
+gateway_patch/*.patched
+
+# --- 操作系统文件 ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*.pma
+
+# --- 编译/构建 ---
+*.exe
+*.dll
+*.so

@@ -1,0 +1,68 @@
+{
+  "version": 2,
+  "generated_at": "2026-06-09T04:07:06.840210+00:00",
+  "boshi_version": "5.3.1",
+  "files": {
+    "memory\\tiered_memory.py": {
+      "exists": true,
+      "checksum": "e974a2e6cd9f8611390a8d3ae2a519bebdbb9c72d8ce259b17f417a93254eeba",
+      "size": 38246,
+      "mtime": 1780313844.950934,
+      "severity": "CRITICAL"
+    },
+    "chroma_bridge.py": {
+      "exists": true,
+      "checksum": "ab6d6d11c6624b5119aa35444eb2a158ff3a0c6b3fd2e9297157703019e31e5f",
+      "size": 13190,
+      "mtime": 1780839558.5978508,
+      "severity": "CRITICAL"
+    },
+    "memory_bridge_api.py": {
+      "exists": true,
+      "checksum": "b01ec99c1fde27293322579bba19711f1ddf1540c4cff21b2befe657fd80027e",
+      "size": 12406,
+      "mtime": 1779757983.8910115,
+      "severity": "CRITICAL"
+    },
+    "memory\\knowledge_graph.py": {
+      "exists": true,
+      "checksum": "a4cc37385fc3771e9949c195c3b8b3b40aa4cd1c7640bf5a5eccbaabcd39bb52",
+      "size": 8131,
+      "mtime": 1779656042.663112,
+      "severity": "WARNING"
+    },
+    "memory\\auto_capture.py": {
+      "exists": true,
+      "checksum": "9ec25bcc7d67262aca26b7cdbe37df9884a04ae91fe13899ba7526d3e22fe329",
+      "size": 19291,
+      "mtime": 1779757174.9732225,
+      "severity": "WARNING"
+    },
+    "memory\\integrity_guard.py": {
+      "exists": true,
+      "checksum": "b3d4d995402889fd7963eba58bb1736b3c9ae20ce389b2b2fae5fd9f203b981a",
+      "size": 13553,
+      "mtime": 1780126729.8981588,
+      "severity": "WARNING"
+    },
+    "memory\\__init__.py": {
+      "exists": false,
+      "severity": "WARNING"
+    },
+    "chroma_db\\chroma.sqlite3": {
+      "exists": true,
+      "size": 38895616,
+      "mtime": 1780977571.78996,
+      "severity": "INFO",
+      "checksum": null
+    },
+    "memory\\knowledge_graph.json": {
+      "exists": true,
+      "size": 278619,
+      "mtime": 1780311639.3453991,
+      "severity": "INFO",
+      "checksum": null
+    }
+  },
+  "checked_at": "2026-06-09T04:07:06.842204+00:00"
+}
