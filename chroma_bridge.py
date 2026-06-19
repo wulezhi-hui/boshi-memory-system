@@ -1,7 +1,7 @@
 """
-ChromaDB 记忆模块
-轻量级离线向量存储，不依赖 Ollama/Gateway/外网
-使用 local sentence-transformers 做 embedding，CPU 秒出
+ChromaDB 记忆模块 — 伯仕记忆系统 v6.0
+使用自带 ONNX 模型（all-MiniLM-L6-v2）做 embedding，零外部依赖
+不依赖 Ollama / HuggingFace / torch / transformers
 """
 
 import os
@@ -9,32 +9,24 @@ import uuid
 import time as _time
 from datetime import datetime as _datetime
 import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+from onnx_embed import BoshiEmbeddingFunction
 
 # ── 配置 ──────────────────────────────────────────────
 CHROMA_DIR = os.path.expanduser("~/.boshi/chroma_db")
+# 本地 ONNX 模型路径（伯仕自带，零外部依赖）
+# 优先使用仓库内的 models/all-MiniLM-L6-v2/onnx/ 目录
+from onnx_embed import get_embedding_function as _get_embedding_function
+
+
+# 兼容：chroma_bridge.py 内部都用 _get_embedding_function()，已由 onnx_embed 提供
+
+
 COLLECTION_NAME = "boshi_memory"
-
-# 本地 cached model 路径（all-MiniLM-L6-v2，384维）
-LOCAL_MODEL_PATH = os.path.expanduser(
-    "~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/"
-    "snapshots/c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
-)
-
-
-def _get_embedding_function():
-    """获取本地 embedding 函数，不依赖外网（带缓存）"""
-    if not hasattr(_get_embedding_function, "_ef"):
-        _get_embedding_function._ef = SentenceTransformerEmbeddingFunction(
-            model_name=LOCAL_MODEL_PATH
-        )
-    return _get_embedding_function._ef
 
 
 def _get_client():
     """获取 ChromaDB 持久化客户端"""
     return chromadb.PersistentClient(path=CHROMA_DIR)
-
 
 def _normalize_metadata(metadata: dict) -> dict:
     """归一化 metadata 中的时间戳字段：ISO 字符串 → float (Unix epoch)
