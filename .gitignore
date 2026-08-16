@@ -1,4 +1,4 @@
-﻿# 凭据与会话数据（安全）
+# 凭据与会话数据（安全）
 360_tt_cookie.txt
 tt_session.json
 *cookie*.txt
@@ -25,3 +25,7 @@ graph/nodes.json
 graph/edges.json
 graph/profiles.json
 workstation/data/
+
+# 本地模型文件（大文件不入库）
+models/
+fastembed_data/

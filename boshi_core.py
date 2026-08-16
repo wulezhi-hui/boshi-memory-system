@@ -90,6 +90,8 @@ def search(query: str, top_k: int = 5, source: str = "all") -> dict:
         hybrid = cb.hybrid_search(query, top_k=top_k)
         vector_results = hybrid.get("memories", [])
         for r in vector_results:
+            # ChromaDB 返回的是距离（越小越相似），转为相似度（越大越好）
+            r["score"] = round(1.0 - r.get("score", 0), 4)
             r["source"] = "hybrid"
 
         graph_results = _graph_search(query, top_k=3)

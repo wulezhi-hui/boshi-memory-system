@@ -1,6 +1,6 @@
 """
 ChromaDB 记忆模块 — 伯仕记忆系统 v6.0
-使用自带 ONNX 模型（all-MiniLM-L6-v2）做 embedding，零外部依赖
+使用自带 ONNX 模型（bge-m3）做 embedding，零外部依赖
 不依赖 Ollama / HuggingFace / torch / transformers
 """
 
@@ -14,7 +14,7 @@ from onnx_embed import BoshiEmbeddingFunction
 # ── 配置 ──────────────────────────────────────────────
 CHROMA_DIR = os.path.expanduser("~/.boshi/chroma_db")
 # 本地 ONNX 模型路径（伯仕自带，零外部依赖）
-# 优先使用仓库内的 models/all-MiniLM-L6-v2/onnx/ 目录
+# 优先使用仓库内的 models/bge-m3/onnx/ 目录
 from onnx_embed import get_embedding_function as _get_embedding_function
 
 
@@ -68,7 +68,7 @@ def add_memory(content: str, metadata: dict = None, memory_id: str = None):
     """
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
 
     if memory_id is None:
         import uuid
@@ -101,7 +101,7 @@ def add_memories_batch(entries: list):
     """
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
 
     BATCH_SIZE = 100
     BATCH_INTERVAL = 3
@@ -145,7 +145,7 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
     """
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
 
     if col.count() == 0:
         return []
@@ -314,7 +314,7 @@ def get_recent(n: int = 10):
     """
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
 
     if col.count() == 0:
         return []
@@ -341,7 +341,7 @@ def get_total_count() -> int:
     """获取记忆库总条数"""
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
     return col.count()
 
 
@@ -349,7 +349,7 @@ def delete_memory(memory_id: str):
     """删除一条记忆"""
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
     col.delete(ids=[memory_id])
 
 
@@ -359,7 +359,7 @@ def delete_memories(ids: list):
         return
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
     BATCH = 100
     for i in range(0, len(ids), BATCH):
         batch = ids[i:i + BATCH]
@@ -380,7 +380,7 @@ def deprecate_memory(memory_id: str, superseded_by: str = None):
     """
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
 
     try:
         existing = col.get(ids=[memory_id])
@@ -443,7 +443,7 @@ def auto_forget(dry_run: bool = False) -> dict:
     """
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
 
     if col.count() == 0:
         return {"forgotten": 0, "skipped": 0, "total_scanned": 0, "dry_run": dry_run}
@@ -586,7 +586,7 @@ def resolve_conflict(winner_id: str, loser_id: str, reason: str = "") -> bool:
     try:
         client = _get_client()
         ef = _get_embedding_function()
-        col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
+        col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
 
         # 获取 loser 信息
         loser_data = col.get(ids=[loser_id])

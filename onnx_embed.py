@@ -1,11 +1,15 @@
 """
-伯仕自带 ONNX 向量模型 — 零外部依赖的 Embedding
+伯仕自带 ONNX 向量模型 — bge-m3 版（零外部依赖，纯本地推理）
+==============================================================
+真·bge-m3（Xenova ONNX 导出，1024 维，多语言旗舰，中文检索质量优秀）。
 
-优先使用仓库内自带的 models/all-MiniLM-L6-v2/onnx/ 目录。
-如果该目录不存在，fallback 到 ChromaDB 的自动下载机制（需联网）。
+实现: onnxruntime（CPU 推理）+ transformers tokenizer（本地加载）
+不依赖: Ollama, torch, sentence-transformers, 在线推理
 
-不依赖: torch, transformers, sentence-transformers, HuggingFace
-仅需: chromadb (已内含 onnxruntime + tokenizers)
+模型文件: ~/.boshi/models/bge-m3/
+  ├─ onnx/model_quantized.onnx   （优先，int8 量化 ~600MB）
+  ├─ onnx/model.onnx             （fp32 回退 ~2.3GB）
+  ├─ tokenizer.json / tokenizer_config.json / config.json / special_tokens_map.json
 
 Usage:
     from onnx_embed import BoshiEmbeddingFunction
@@ -14,125 +18,130 @@ Usage:
 """
 
 import os
+import numpy as np
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 # ── 配置 ──────────────────────────────────────────────
-BOSHI_MODEL_DIR = Path.home() / ".boshi" / "models" / "all-MiniLM-L6-v2"
+BOSHI_MODEL_DIR = Path.home() / ".boshi" / "models" / "bge-m3"
+ONNX_DIR = BOSHI_MODEL_DIR / "onnx"
+ONNX_FILE = (
+    ONNX_DIR / "model_quantized.onnx"
+    if (ONNX_DIR / "model_quantized.onnx").exists()
+    else ONNX_DIR / "model.onnx"
+)
+MODEL_DIMENSIONS = 1024
+MAX_SEQ_LEN = 512
 
-
-def _get_model_path() -> Optional[Path]:
-    """检查自带模型是否存在"""
-    bundled = BOSHI_MODEL_DIR / "onnx" / "model.onnx"
-    if bundled.exists():
-        return BOSHI_MODEL_DIR  # 返回父目录（ONNXMiniLM_L6_V2 会在里面找 onnx/ 子目录）
-    return None
-
-
-def _create_boshi_ef():
-    """
-    创建伯仕专属的 EmbeddingFunction。
-    优先使用自带模型；否则 fallback 到 ChromaDB 默认行为。
-    """
-    # 懒导入（避免启动时加载 ONNX）
-    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
-
-    model_parent = _get_model_path()
-
-    if model_parent is not None:
-        # 有自带模型：monkey-patch 指向本地
-        original_download_path = ONNXMiniLM_L6_V2.DOWNLOAD_PATH
-        original_extracted_folder = ONNXMiniLM_L6_V2.EXTRACTED_FOLDER_NAME
-
-        ONNXMiniLM_L6_V2.DOWNLOAD_PATH = model_parent
-        ONNXMiniLM_L6_V2.EXTRACTED_FOLDER_NAME = "onnx"
-
-        try:
-            ef = ONNXMiniLM_L6_V2()
-            # 标记：这是用自带模型的版本
-            ef._boshi_source = "bundled"
-            return ef
-        finally:
-            # 恢复原始值（不影响其他代码）
-            ONNXMiniLM_L6_V2.DOWNLOAD_PATH = original_download_path
-            ONNXMiniLM_L6_V2.EXTRACTED_FOLDER_NAME = original_extracted_folder
-    else:
-        # 无自带模型：fallback 到 ChromaDB 自动下载
-        ef = ONNXMiniLM_L6_V2()
-        ef._boshi_source = "downloaded"
-        return ef
-
-
-# ── 单例缓存 ──────────────────────────────────────────
 _boshi_ef_instance = None
 
 
+class _BoshiONNX:
+    """onnxruntime + transformers tokenizer 的 bge-m3 推理封装"""
+
+    def __init__(self, tokenizer, session, input_names):
+        self._tokenizer = tokenizer
+        self._session = session
+        self._input_names = input_names
+
+    def _encode(self, texts: List[str]):
+        enc = self._tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=MAX_SEQ_LEN,
+            return_tensors="np",
+        )
+        feed = {k: v for k, v in enc.items() if k in self._input_names}
+        outputs = self._session.run(None, feed)
+        # 输出 0 即 last_hidden_state（[batch, seq, hidden]）
+        last_hidden = outputs[0]
+        return last_hidden, enc["attention_mask"]
+
+
 def _get_cached_ef():
-    """惰性单例，避免重复加载"""
+    """惰性单例：首次调用时加载模型（约 1-3 秒）"""
     global _boshi_ef_instance
     if _boshi_ef_instance is None:
-        _boshi_ef_instance = _create_boshi_ef()
+        import onnxruntime as ort
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(str(BOSHI_MODEL_DIR))
+        session = ort.InferenceSession(str(ONNX_FILE), providers=["CPUExecutionProvider"])
+        input_names = [i.name for i in session.get_inputs()]
+        _boshi_ef_instance = _BoshiONNX(tokenizer, session, input_names)
     return _boshi_ef_instance
 
 
-# ── 公共接口 ───────────────────────────────────────────
+# ── 公共接口（chroma_bridge.py 兼容）────────────────────
 
 class BoshiEmbeddingFunction:
-    """
-    伯仕记忆系统专用 Embedding Function。
-
-    - 优先使用 ~/.boshi/models/all-MiniLM-L6-v2/ 目录下的 ONNX 模型
-    - 模型不存在时自动 fallback 到 ChromaDB 的下载机制
-    - 384 维向量，兼容现有 ChromaDB collection
-    """
+    """伯仕记忆系统专用 Embedding Function — bge-m3 ONNX 本地推理（1024 维）"""
 
     def __call__(self, input: List[str]) -> List[List[float]]:
         ef = _get_cached_ef()
-        return ef(input)
+        last_hidden, mask = ef._encode(input)
+        # mean pooling + L2 归一化
+        maskf = mask[..., None].astype(np.float32)
+        summed = (last_hidden * maskf).sum(axis=1)
+        counts = maskf.sum(axis=1).clip(min=1e-9)
+        mean = summed / counts
+        norm = np.linalg.norm(mean, axis=1, keepdims=True)
+        return (mean / norm).tolist()
+
+    def name(self) -> str:
+        """chromadb 1.5+ 要求 EmbeddingFunction 提供 name() 用于冲突校验"""
+        return "bge-m3-onnx"
+
+    def embed_query(self, input):
+        """chromadb 1.5+ 查询路径：兼容 str 或 List[str] 输入，返回 List[List[float]]（query_embeddings 格式）"""
+        if isinstance(input, str):
+            texts = [input]
+        elif isinstance(input, (list, tuple)):
+            texts = list(input)
+        else:
+            texts = [str(input)]
+        return self.__call__(texts)
+
+    def embed_documents(self, input: List[str]) -> List[List[float]]:
+        """chromadb 1.5+ 文档路径：批量文本 → 向量"""
+        return self.__call__(input)
 
     def get_source(self) -> str:
-        """返回当前使用的模型来源"""
-        ef = _get_cached_ef()
-        return getattr(ef, "_boshi_source", "unknown")
+        return "bge-m3-onnx"
 
     @staticmethod
     def is_bundled_available() -> bool:
-        """检查自带模型是否可用（安装脚本可用此判断）"""
-        return _get_model_path() is not None
+        return ONNX_FILE.exists()
 
     @staticmethod
     def model_info() -> dict:
-        """返回模型信息"""
-        path = _get_model_path()
-        onnx_file = path / "onnx" / "model.onnx" if path else None
+        size_mb = None
+        if ONNX_FILE.exists():
+            size_mb = round(ONNX_FILE.stat().st_size / (1024 * 1024), 1)
         return {
-            "model_name": "all-MiniLM-L6-v2",
-            "dimensions": 384,
-            "bundled_path": str(path) if path else None,
-            "bundled_exists": onnx_file.exists() if onnx_file else False,
-            "onnx_file_size_mb": round(onnx_file.stat().st_size / (1024 * 1024), 1) if onnx_file and onnx_file.exists() else None,
+            "model_name": "BAAI/bge-m3 (Xenova ONNX)",
+            "dimensions": MODEL_DIMENSIONS,
+            "onnx_file": str(ONNX_FILE),
+            "onnx_exists": ONNX_FILE.exists(),
+            "onnx_size_mb": size_mb,
         }
 
 
-# ── chroma_bridge.py 兼容接口 ──────────────────────────
-
 def get_embedding_function():
     """chroma_bridge.py 用这个函数获取 ChromaDB 兼容的 EmbeddingFunction"""
-    return _create_boshi_ef()
+    return BoshiEmbeddingFunction()
 
 
 # ── 调试入口 ───────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("🦄 伯仕自带 ONNX Embedding 测试")
+    print("🦄 伯仕 ONNX Embedding 测试（bge-m3）")
     print(f"模型信息: {BoshiEmbeddingFunction.model_info()}")
     print()
 
     ef = get_embedding_function()
-    print(f"返回类型: {type(ef).__name__}")
-    print(f"模型来源: {getattr(ef, '_boshi_source', 'unknown')}")
-
-    texts = ["伯仕记忆系统 v6.0", "Ubuntu 部署测试", "Hello World"]
+    texts = ["伯仕记忆系统 v6.1", "乐之喜欢直接做不解释", "Hello World"]
     vecs = ef(texts)
 
     for t, v in zip(texts, vecs):
