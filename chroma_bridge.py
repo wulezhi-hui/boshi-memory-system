@@ -255,51 +255,18 @@ def hybrid_search(query: str, top_k: int = 5, where: dict = None,
         "source": "hybrid",
     }
 
-    # 2. 全文会话搜索（副路径）
+    # 2. 全文会话搜索（副路径）— 多 Agent 会话源（Hermes / DSH / 未来接入者）
     if search_sessions:
         try:
-            import sqlite3
-            state_db = os.path.join(
-                os.environ.get("LOCALAPPDATA",
-                               os.path.expanduser("~/AppData/Local")),
-                "hermes", "state.db"
-            )
-            if os.path.exists(state_db):
-                db = sqlite3.connect(state_db)
-                db.text_factory = str
-
-                # FTS5 全文搜索最近30天的会话
-                cutoff = _time.time() - 2592000
-                query_safe = query.replace("%", "\\%").replace("_", "\\_")
-                rows = db.execute(
-                    """SELECT m.session_id, m.content, m.role, m.timestamp,
-                              s.source, s.title
-                       FROM messages m
-                       JOIN sessions s ON m.session_id = s.id
-                       WHERE m.content LIKE ?
-                         AND m.role IN ('user', 'assistant')
-                         AND m.timestamp > ?
-                         AND s.message_count >= 2
-                       ORDER BY m.timestamp DESC
-                       LIMIT ?""",
-                    (f"%{query_safe}%", cutoff, top_k)
-                ).fetchall()
-
-                seen = set()
-                for sid, content, role, ts, source, title in rows:
+            from session_sources import get_active_sources
+            seen = set()
+            for src in get_active_sources():
+                for item in src.search(query, limit=top_k):
+                    sid = item.get("session_id")
                     if sid in seen:
                         continue
                     seen.add(sid)
-                    result["sessions"].append({
-                        "session_id": sid,
-                        "source": source,
-                        "title": title or "",
-                        "snippet": str(content)[:200] if content else "",
-                        "timestamp": ts,
-                        "role": role,
-                    })
-
-                db.close()
+                    result["sessions"].append(item)
         except Exception:
             pass
 
