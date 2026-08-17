@@ -1,6 +1,6 @@
 """
 ChromaDB 记忆模块 — 伯仕记忆系统 v6.0
-使用自带 ONNX 模型（bge-m3）做 embedding，零外部依赖
+使用自带 ONNX 模型（all-MiniLM-L6-v2）做 embedding，零外部依赖
 不依赖 Ollama / HuggingFace / torch / transformers
 """
 
@@ -14,7 +14,7 @@ from onnx_embed import BoshiEmbeddingFunction
 # ── 配置 ──────────────────────────────────────────────
 CHROMA_DIR = os.path.expanduser("~/.boshi/chroma_db")
 # 本地 ONNX 模型路径（伯仕自带，零外部依赖）
-# 优先使用仓库内的 models/bge-m3/onnx/ 目录
+# 优先使用仓库内的 models/all-MiniLM-L6-v2/onnx/ 目录
 from onnx_embed import get_embedding_function as _get_embedding_function
 
 
@@ -23,10 +23,22 @@ from onnx_embed import get_embedding_function as _get_embedding_function
 
 COLLECTION_NAME = "boshi_memory"
 
+# 客户端单例缓存（修复：每次查询重建 PersistentClient 的开销）
+_client_instance = None
+_client_lock = None
+
 
 def _get_client():
-    """获取 ChromaDB 持久化客户端"""
-    return chromadb.PersistentClient(path=CHROMA_DIR)
+    """获取 ChromaDB 持久化客户端（模块级单例复用）"""
+    global _client_instance, _client_lock
+    if _client_instance is None:
+        if _client_lock is None:
+            import threading
+            _client_lock = threading.Lock()
+        with _client_lock:
+            if _client_instance is None:
+                _client_instance = chromadb.PersistentClient(path=CHROMA_DIR)
+    return _client_instance
 
 def _normalize_metadata(metadata: dict) -> dict:
     """归一化 metadata 中的时间戳字段：ISO 字符串 → float (Unix epoch)
@@ -68,7 +80,7 @@ def add_memory(content: str, metadata: dict = None, memory_id: str = None):
     """
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
 
     if memory_id is None:
         import uuid
@@ -101,7 +113,7 @@ def add_memories_batch(entries: list):
     """
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
 
     BATCH_SIZE = 100
     BATCH_INTERVAL = 3
@@ -145,7 +157,7 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
     """
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
 
     if col.count() == 0:
         return []
@@ -255,18 +267,79 @@ def hybrid_search(query: str, top_k: int = 5, where: dict = None,
         "source": "hybrid",
     }
 
-    # 2. 全文会话搜索（副路径）— 多 Agent 会话源（Hermes / DSH / 未来接入者）
+    # 2. 全文会话搜索（副路径）
     if search_sessions:
         try:
-            from session_sources import get_active_sources
-            seen = set()
-            for src in get_active_sources():
-                for item in src.search(query, limit=top_k):
-                    sid = item.get("session_id")
+            import sqlite3
+            state_db = os.path.join(
+                os.environ.get("LOCALAPPDATA",
+                               os.path.expanduser("~/AppData/Local")),
+                "hermes", "state.db"
+            )
+            if os.path.exists(state_db):
+                db = sqlite3.connect(state_db)
+                db.text_factory = str
+
+                # 修复：优先 FTS5 MATCH（有 trigram 索引，中文也支持），
+                # 替代原 LIKE '%q%' 全表扫描
+                cutoff = _time.time() - 2592000
+                rows = []
+                fts_used = False
+                try:
+                    # FTS5 MATCH（trigram tokenizer 支持中文子串匹配）
+                    match_q = query.replace('"', '""').strip()
+                    if match_q:
+                        rows = db.execute(
+                            """SELECT m.session_id, m.content, m.role, m.timestamp,
+                                      s.source, s.title
+                               FROM messages_fts f
+                               JOIN messages m ON m.id = f.rowid
+                               JOIN sessions s ON m.session_id = s.id
+                               WHERE messages_fts MATCH ?
+                                 AND m.role IN ('user', 'assistant')
+                                 AND m.timestamp > ?
+                                 AND s.message_count >= 2
+                               ORDER BY m.timestamp DESC
+                               LIMIT ?""",
+                            (f'"{match_q}"', cutoff, top_k)
+                        ).fetchall()
+                        fts_used = bool(rows) or True
+                except Exception:
+                    fts_used = False
+                    rows = []
+
+                if not fts_used or not rows:
+                    # 降级：FTS 失败或无结果时用 LIKE（保持旧行为）
+                    query_safe = query.replace("%", "\\%").replace("_", "\\_")
+                    rows = db.execute(
+                        """SELECT m.session_id, m.content, m.role, m.timestamp,
+                                  s.source, s.title
+                           FROM messages m
+                           JOIN sessions s ON m.session_id = s.id
+                           WHERE m.content LIKE ?
+                             AND m.role IN ('user', 'assistant')
+                             AND m.timestamp > ?
+                             AND s.message_count >= 2
+                           ORDER BY m.timestamp DESC
+                           LIMIT ?""",
+                        (f"%{query_safe}%", cutoff, top_k)
+                    ).fetchall()
+
+                seen = set()
+                for sid, content, role, ts, source, title in rows:
                     if sid in seen:
                         continue
                     seen.add(sid)
-                    result["sessions"].append(item)
+                    result["sessions"].append({
+                        "session_id": sid,
+                        "source": source,
+                        "title": title or "",
+                        "snippet": str(content)[:200] if content else "",
+                        "timestamp": ts,
+                        "role": role,
+                    })
+
+                db.close()
         except Exception:
             pass
 
@@ -281,7 +354,7 @@ def get_recent(n: int = 10):
     """
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
 
     if col.count() == 0:
         return []
@@ -308,7 +381,7 @@ def get_total_count() -> int:
     """获取记忆库总条数"""
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
     return col.count()
 
 
@@ -316,7 +389,7 @@ def delete_memory(memory_id: str):
     """删除一条记忆"""
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
     col.delete(ids=[memory_id])
 
 
@@ -326,7 +399,7 @@ def delete_memories(ids: list):
         return
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
     BATCH = 100
     for i in range(0, len(ids), BATCH):
         batch = ids[i:i + BATCH]
@@ -347,7 +420,7 @@ def deprecate_memory(memory_id: str, superseded_by: str = None):
     """
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
 
     try:
         existing = col.get(ids=[memory_id])
@@ -410,7 +483,7 @@ def auto_forget(dry_run: bool = False) -> dict:
     """
     client = _get_client()
     ef = _get_embedding_function()
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
 
     if col.count() == 0:
         return {"forgotten": 0, "skipped": 0, "total_scanned": 0, "dry_run": dry_run}
@@ -553,7 +626,7 @@ def resolve_conflict(winner_id: str, loser_id: str, reason: str = "") -> bool:
     try:
         client = _get_client()
         ef = _get_embedding_function()
-        col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef, metadata={"hnsw:space": "cosine"})
+        col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
 
         # 获取 loser 信息
         loser_data = col.get(ids=[loser_id])

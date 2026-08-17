@@ -32,7 +32,7 @@ logger = logging.getLogger("伯仕记忆")
 BOSHI_HOME = os.path.expanduser("~/.boshi")
 MEMORY_DIR = os.path.join(BOSHI_HOME, "memory")
 STATE_DB = os.path.join(
-    os.environ.get('LOCALAPPDATA', r'C:\Users\Administrator\AppData\Local'),
+    os.environ.get('LOCALAPPDATA', os.path.expanduser(r'~\AppData\Local')),
     'hermes', 'state.db'
 )
 
