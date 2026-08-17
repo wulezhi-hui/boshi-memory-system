@@ -1,13 +1,14 @@
-# boshi-memory-system
+# boshi-memory-system（伯仕记忆系统）
 
-Hermes Agent 的四层记忆架构 ，实现持久化、热度调度、知识图谱、跨通道对话桥接。
+Hermes Agent 的四层记忆架构：持久化、热度调度、知识图谱、跨通道对话桥接。
+**双轨接入 Hermes：插件方式（memory provider）+ MCP 方式（8 个工具）**，可同时启用。
 
 ## 功能概览
 
 | 能力 | 说明 |
 |:-----|:-----|
 | 🔥 热区 | 当前专注的事，自动注入上下文 |
-| 🌡️ 温区 | 语义搜索快速召回（ChromaDB + ONNX embedding，零外部依赖） |
+| 🌡️ 温区 | 语义搜索快速召回（ChromaDB + bge-m3 ONNX，零外部 API） |
 | ❄️ 冷区 | 时间久远压缩封存 |
 | 🕉️ 全量 | state.db SQLite FTS5 原始会话 |
 | 版本链 | 追加不覆盖 + isLatest 标记，记忆可追溯 |
@@ -15,42 +16,55 @@ Hermes Agent 的四层记忆架构 ，实现持久化、热度调度、知识图
 | 混合搜索 | 语义向量 + FTS5 全文会话合一 |
 | 用户画像 | Static+Dynamic 双层自动维护 |
 | 自动遗忘 | 热度衰减 + 时间过期折旧 |
-| 开放接口 | Hermes Memory Provider 插件 + MCP Server（8 工具）+ CLI（9 子命令） |
+| 🔌 插件接入 | Hermes MemoryProvider ABC：每轮自动召回/存储/画像注入 |
+| 🔗 MCP 接入 | 8 个工具：search/save/delete/status/profile/graph/graph_add/recent |
 
 ## 快速开始
 
 ### 1. 安装
 
 ```bash
-# 一键安装（跨平台，自动部署 + 装依赖 + 配置 Hermes 双轨接入）
-python install.py
-
-# Ubuntu / Linux 传统方式
+# Ubuntu / Linux / macOS（自动下载 bge-m3 ONNX 模型，默认 hf-mirror 国内镜像）
 curl -sL https://raw.githubusercontent.com/wulezhi-hui/boshi-memory-system/main/install.sh | bash
 
-# Windows：手动 clone 后安装依赖
-git clone https://github.com/wulezhi-hui/boshi-memory-system.git ~/.boshi
-pip install chromadb "mcp>=2.0.0" onnxruntime transformers
+# Windows（克隆后执行安装脚本；--no-model 可跳过 569MB 模型下载）
+git clone https://github.com/wulezhi-hui/boshi-memory-system.git %USERPROFILE%\.boshi
+python %USERPROFILE%\.boshi\install.py
 ```
 
-### 2. 接入 Hermes（双轨：插件 + MCP）
+安装脚本会完成：部署代码 → 安装依赖（chromadb/mcp/onnxruntime/transformers）→
+下载 bge-m3 ONNX 模型 → 复制插件 → 写双轨配置 → 安装 skill。
 
-伯仕同时提供**两种**接入方式，安装脚本会全部配置好：
+> 模型下载源切换：`BOSHI_MODEL_SOURCE=hf python download_model.py`（官方源，需代理）。
+> 国内默认 hf-mirror.com 直连，无需代理。
 
-| 方式 | 机制 | 能力 |
-|:-----|:-----|:-----|
-| **插件方式**（推荐） | `memory.provider = boshi`，Hermes MemoryProvider 插件 | 每轮对话**自动召回**相关记忆（prefetch）、**自动存储**（sync_turn）、画像/热区注入系统提示词；用内置 memory 工具写入自动镜像到伯仕 |
-| **MCP 方式** | `mcp_servers.boshi` → `boshi_mcp_server.py` | 8 个工具：`boshi_search` / `boshi_save` / `boshi_delete` / `boshi_status` / `boshi_profile` / `boshi_graph` / `boshi_graph_add` / `boshi_recent` |
+### 2. 双轨接入方式（安装脚本自动配置，也可手动）
 
-插件源码在 `plugins/boshi/__init__.py`（实现 Hermes 的 `MemoryProvider` ABC，
-数据层与 MCP/CLI 共享 `boshi_core.py`，不重复实现）。
+**插件方式（每轮自动召回，无需 agent 记得调用工具）** — config.yaml:
 
-验证安装：
-
-```bash
-hermes memory status          # 应显示 Provider: boshi / Plugin: installed
-hermes mcp test boshi         # 应显示连接成功
+```yaml
+memory:
+  provider: boshi
+  memory_enabled: true
+  user_profile_enabled: true
 ```
+
+插件文件位于 `$HERMES_HOME/plugins/boshi/`（实现 Hermes `MemoryProvider` ABC：
+prefetch 每轮召回、sync_turn 每轮存储、system_prompt_block 画像/热区注入）。
+
+**MCP 方式（agent 主动调用 8 个 boshi_* 工具）** — config.yaml:
+
+```yaml
+mcp_servers:
+  boshi:
+    enabled: true
+    command: "<python 解释器>"
+    args: ["~/.boshi/boshi_mcp_server.py"]
+```
+
+重启 Hermes 后生效：
+- 插件方式：`hermes memory status` 应显示 `Provider: boshi`
+- MCP 方式：`hermes mcp test boshi` 应连接成功，出现 `boshi_search` / `boshi_save` / `boshi_delete` / `boshi_status` / `boshi_profile` / `boshi_graph` / `boshi_graph_add` / `boshi_recent`
 
 ### 3. CLI 使用
 
@@ -65,10 +79,13 @@ python boshi_cli.py profile
 
 - [v6.1 架构文档](docs/伯仕记忆系统v6.1_技术架构文档.md)
 - [v6.1 技术文档](docs/伯仕记忆系统v6.1_技术文档.md)
+- [Hermes 集成技术手册](docs/Hermes集成技术手册.md)
 - [技能文件](skills/boshi-memory/SKILL.md)
 
 ## 已知注意点
 
 - 路径已统一为 `~/.boshi`（不再硬编码 Administrator）
+- 向量模型：bge-m3 ONNX（1024 维，int8 量化 ~569MB），缺失时用
+  `python download_model.py` 下载（断点续传）
 - 实体提取默认走 Ollama LLM，对话中请用 `extract_facts_async`（后台线程）避免阻塞
 - 检索优先 FTS5，失败自动降级 LIKE
