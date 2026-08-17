@@ -1,5 +1,8 @@
 # boshi-memory-system（伯仕记忆系统）
 
+> **当前版本：v6.2「双轨接入版」**（2026-08-17 · [GitHub Release](https://github.com/wulezhi-hui/boshi-memory-system/releases/tag/v6.2)）
+> 版本演进：v1 JSON → v2 ChromaDB → v3 统一存储 → v4 五大能力 → v5 开放接口 → v6 ONNX 零依赖 → v6.1 bge-m3 → **v6.2 插件+MCP 双轨**
+
 Hermes Agent 的四层记忆架构：持久化、热度调度、知识图谱、跨通道对话桥接。
 **双轨接入 Hermes：插件方式（memory provider）+ MCP 方式（8 个工具）**，可同时启用。
 
@@ -77,9 +80,11 @@ python boshi_cli.py profile
 
 ## 技术文档
 
+- [v6.2 技术架构文档（双轨接入版，当前）](docs/伯仕记忆系统v6.2_技术架构文档.md)
 - [v6.1 架构文档](docs/伯仕记忆系统v6.1_技术架构文档.md)
 - [v6.1 技术文档](docs/伯仕记忆系统v6.1_技术文档.md)
 - [Hermes 集成技术手册](docs/Hermes集成技术手册.md)
+- [演进树 EVOLUTION](EVOLUTION.md)
 - [技能文件](skills/boshi-memory/SKILL.md)
 
 ## 已知注意点
