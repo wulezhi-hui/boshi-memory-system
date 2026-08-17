@@ -11,7 +11,11 @@ Hermes (run_agent.py)
    │
    ├── memory_manager.py          ← Hermes 自带记忆管理器
    │     └── provider: boshi      ← 配置指定使用我们的插件
-   │           └── plugins/memory/boshi/__init__.py  ← 伯仕记忆系统入口
+   │           └── plugins/boshi/__init__.py  ← 伯仕记忆系统入口
+   │               （$HERMES_HOME/plugins/boshi/，实现 MemoryProvider ABC）
+   │
+   ├── mcp_servers.boshi          ← MCP 双轨（8 个 boshi_* 工具）
+   │     └── boshi_mcp_server.py
    │
    ├── config.yaml                 ← 配置（时间区、模型、provider等）
    │
@@ -22,56 +26,38 @@ Hermes (run_agent.py)
          └── weekly_inspection.py  ← 巡检
 ```
 
+> **双轨说明（v6.2+）：** 插件方式（memory.provider=boshi）负责**自动**记忆
+> 召回/存储；MCP 方式（mcp_servers.boshi）提供 8 个**手动**工具。两者并存，
+> 共享 boshi_core.py 同一数据层。
+
 ---
 
 ## 二、关键集成点
 
 ### 2.1 Memory Provider 接口（最重要的集成点）
 
-**文件位置：** `plugins/memory/boshi/__init__.py`
+**文件位置：** `$HERMES_HOME/plugins/boshi/__init__.py`（仓库 `plugins/boshi/`）
 
-**实现接口：** Hermes 的 `BaseMemoryProvider` 抽象类
+**实现接口：** Hermes 新版 `MemoryProvider` 抽象类（`agent/memory_provider.py`），
+**不需要 run_agent.py 补丁**（v6.2+ 的 Hermes 原生提供完整生命周期）。
 
-**必须实现的方法：**
+**已实现的方法：**
 
 | 方法 | 作用 | 调用时机 |
 |:-----|:-----|:---------|
-| `__init__(config)` | 初始化 provider | Hermes 启动时 |
-| `initialize(config)` | 初始化资源（ChromaDB等） | Hermes 启动后 |
-| `add_memory(content, metadata)` | 写入一条记忆 | 对话过程中 |
-| `search_memory(query, limit)` | 搜索记忆 | prefetch / 对话中 |
-| `get_memories(params)` | 批量获取记忆 | prefetch |
-| `delete_memory(memory_id)` | 删除记忆 | 用户操作 |
-| `get_schemas()` | 返回工具定义 | 启动时 |
+| `is_available()` | 检查 ~/.boshi 是否已安装 | Hermes 启动时 |
+| `initialize(session_id, **kwargs)` | 导入 boshi_core（数据层） | Hermes 启动后 |
+| `system_prompt_block()` | 注入记忆状态 + 热区话题 | 系统提示词组装时 |
+| `prefetch(query)` | 返回召回的记忆 | 每轮 API 调用前 |
+| `queue_prefetch(query)` | 后台线程检索（不阻塞对话） | 每轮对话后 |
+| `sync_turn(user, asst)` | 自动存储用户消息 | 每轮对话后 |
+| `on_memory_write(action,target,content)` | 镜像内置 memory 写入到伯仕 | agent 调用 memory 工具时 |
+| `on_session_switch()` / `on_pre_compress()` | 会话边界处理 | 会话切换/压缩前 |
+| `backup_paths()` | 声明 ~/.boshi 数据目录 | hermes backup 时 |
+| `shutdown()` | 清理 | 进程退出 |
 
-**关键内部方法（Hermes 直接调用）：**
-- `system_prompt_block()` → 注入到 system prompt 的记忆内容
-  - 位置：`__init__.py` 约 L580-L680
-  - 作用：注入热区话题、项目信息、行为规则
-- `sync_turn()` → 每轮对话后同步
-  - 位置：`__init__.py` 约 L700-L870
-  - 作用：写 conversation_turn、抽取实体关系、auto worklog
-- `queue_prefetch_all()` → 对话前预加载记忆
-  - 位置：`__init__.py` 约 L500-L580
-  - 作用：加载热区、项目日志、语义搜索、冷区回溯
-
-**破坏风险：** Hermes 升级可能改 `BaseMemoryProvider` 的接口签名、新增必需方法、或改调用方式。
-**修复方法：** 阅读新版本 `BaseMemoryProvider` 定义，对照本表修改签名。
-
-### 2.2 run_agent.py 补丁
-
-**文件位置：** `hermes-agent/run_agent.py`
-
-**我们补丁了什么：**
-
-| 补丁位置 | 做了什么 | 目的 |
-|:---------|:---------|:------|
-| `_MemoryManager` 初始化处 | 增加 provider 的 `initialize()` 调用 | 确保插件初始化 |
-| `queue_prefetch_all()` 调用处 | 在所有入口调用 prefetch | 跨渠道记忆预加载 |
-| `sync_turn()` 调用处 | 每轮对话后强制 sync | 实时记忆同步 |
-
-**破坏风险：** 源码重构 → 补丁位置不存在 → 补丁失效但不报错。
-**修复方法：** 在新版本中找到 `_MemoryManager` 类，重新定位 `queue_prefetch_all()` 和 `sync_turn()` 的调用点，重新打补丁。
+**破坏风险：** Hermes 升级可能改 `MemoryProvider` 的接口签名、新增必需方法。
+**修复方法：** 阅读新版本 `agent/memory_provider.py` 定义，对照本表修改签名。
 
 ### 2.3 config.yaml 关键配置
 
@@ -183,5 +169,22 @@ hermes cron list                      # 确认 cron 任务还在
 
 ---
 
-*文档版本: v1.0 · 2026-05-27*
+*文档版本: v2.0 · 2026-08-17*
 *由伯仕编写，供升级后的伯仕参考*
+
+---
+
+## 七、本地补丁记录（hermes-agent 源码，升级会被覆盖！）
+
+### 7.1 mcp_tool.py — mcp SDK 2.0 CallToolResult 字段兼容
+
+- **位置：** `hermes-agent/tools/mcp_tool.py`（约 L5442）
+- **问题：** mcp SDK ≥2.0 把 CallToolResult 的 `isError` 字段改名为 `is_error`，
+  Hermes 读 `result.isError` 报 `AttributeError: 'CallToolResult' object has no attribute 'isError'`，
+  导致 boshi 等所有 mcp 2.0 服务器的工具调用失败。
+- **补丁：**
+  ```python
+  if getattr(result, "isError", getattr(result, "is_error", False)):
+  ```
+- **升级后检查：** `grep -n "isError" tools/mcp_tool.py`，若仍是 `if result.isError:` 需重打。
+- **判断是否生效：** 调用任一 boshi 工具（如 boshi_status），不再报 isError 错误即生效。

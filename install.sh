@@ -76,8 +76,19 @@ except Exception as e:
     print(f"   伯仕记忆系统仍可运行，首次调用向量化时将再次尝试自动下载。")
 PY
 
-# 4. 安装 Skill
-echo "[6/6] 安装 boshi-memory skill..."
+# 4. 安装 Memory Provider 插件（插件方式接入）
+echo "[6/7] 安装 Memory Provider 插件..."
+mkdir -p "$HERMES_DIR/plugins"
+if [ -d "$INSTALL_DIR/plugins/boshi" ]; then
+    rm -rf "$HERMES_DIR/plugins/boshi"
+    cp -r "$INSTALL_DIR/plugins/boshi" "$HERMES_DIR/plugins/boshi"
+    echo "   ✅ 插件已复制到 $HERMES_DIR/plugins/boshi"
+else
+    echo "   ⚠️ 仓库中未找到 plugins/boshi，跳过插件安装"
+fi
+
+# 5. 安装 Skill
+echo "[7/7] 安装 boshi-memory skill..."
 mkdir -p "$HERMES_DIR/skills"
 if [ -d "$INSTALL_DIR/skills/boshi-memory" ]; then
     rm -rf "$HERMES_DIR/skills/boshi-memory"
@@ -87,7 +98,7 @@ else
     echo "   ⚠️ 仓库中未找到 skills/boshi-memory，跳过"
 fi
 
-# 5. 配置 Hermes config.yaml
+# 6. 配置 Hermes config.yaml（双轨：插件 + MCP）
 echo ""
 echo "🔧 配置 Hermes..."
 CONFIG_FILE="$HERMES_DIR/config.yaml"
@@ -110,16 +121,21 @@ python3 << 'PY'
 import yaml, os
 config_path = os.path.expanduser("~/.config/hermes/config.yaml")
 if not os.path.exists(config_path):
+    config_path = os.path.expanduser("~/.hermes/config.yaml")
+if not os.path.exists(config_path):
     os.makedirs(os.path.dirname(config_path), exist_ok=True)
     data = {}
 else:
     with open(config_path, 'r') as f:
         data = yaml.safe_load(f) or {}
 
+# 插件方式：memory.provider = boshi
 data.setdefault('memory', {})
 data['memory']['provider'] = 'boshi'
-data['memory']['enabled'] = True
+data['memory']['memory_enabled'] = True
+data['memory']['user_profile_enabled'] = True
 
+# MCP 方式：mcp_servers.boshi
 data.setdefault('mcp_servers', {})
 data['mcp_servers'].setdefault('boshi', {})
 data['mcp_servers']['boshi']['enabled'] = True
