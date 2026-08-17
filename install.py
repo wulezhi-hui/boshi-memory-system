@@ -6,15 +6,17 @@
 安装内容（双轨接入 Hermes）：
   1. 部署代码到 ~/.boshi（克隆仓库 / 已存在则跳过）
   2. 安装 Python 依赖（chromadb / mcp / onnxruntime / transformers）
-  3. 【插件方式】复制 plugins/boshi → $HERMES_HOME/plugins/boshi/
+  3. 下载 bge-m3 ONNX 向量模型（~569MB，断点续传，默认 hf-mirror 国内镜像）
+  4. 【插件方式】复制 plugins/boshi → $HERMES_HOME/plugins/boshi/
      并写入 config.yaml: memory.provider = boshi
-  4. 【MCP 方式】写入 config.yaml: mcp_servers.boshi → boshi_mcp_server.py
-  5. 复制 skills/boshi-memory → $HERMES_HOME/skills/
+  5. 【MCP 方式】写入 config.yaml: mcp_servers.boshi → boshi_mcp_server.py
+  6. 复制 skills/boshi-memory → $HERMES_HOME/skills/
 
 用法:
   python install.py                # 本机默认安装
   python install.py --home PATH    # 指定 HERMES_HOME（默认自动探测）
   python install.py --no-deps      # 跳过依赖安装
+  python install.py --no-model     # 跳过模型下载
 """
 import argparse
 import os
@@ -33,7 +35,7 @@ def get_hermes_home() -> Path:
     if env:
         return Path(env)
     if os.name == "nt":
-        # Windows: %LOCALAPPDATA%\hermes
+        # Windows: %LOCALAPPDATA%\\hermes
         return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "hermes"
     # Linux/macOS: ~/.hermes（旧版可能 ~/.config/hermes）
     home_hermes = Path.home() / ".hermes"
@@ -42,9 +44,21 @@ def get_hermes_home() -> Path:
     return Path.home() / ".config" / "hermes"
 
 
+def find_hermes_python(hermes_home: Path) -> str:
+    """优先返回 Hermes 自带 venv 的 python（MCP server 依赖装在那里最稳）。"""
+    candidates = [
+        hermes_home / "hermes-agent" / "venv" / "Scripts" / "python.exe",  # Windows
+        hermes_home / "hermes-agent" / "venv" / "bin" / "python",          # Linux/macOS
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return sys.executable
+
+
 def deploy_code() -> None:
     """克隆/更新仓库到 ~/.boshi。"""
-    print("[1/5] 部署代码到", BOSHI_DIR)
+    print("[1/6] 部署代码到", BOSHI_DIR)
     if (BOSHI_DIR / ".git").exists():
         subprocess.run(["git", "pull", "--ff-only"], cwd=str(BOSHI_DIR), check=False)
         print("   ✅ 已是最新（git pull）")
@@ -57,17 +71,30 @@ def deploy_code() -> None:
 
 def install_deps() -> None:
     """安装 Python 依赖。"""
-    print("[2/5] 安装 Python 依赖...")
-    deps = ["chromadb", "mcp>=2.0.0", "onnxruntime", "transformers"]
+    print("[2/6] 安装 Python 依赖...")
+    deps = ["chromadb", "mcp>=2.0.0", "onnxruntime", "transformers", "pyyaml"]
     pip = [sys.executable, "-m", "pip", "install"]
     for d in deps:
         subprocess.run(pip + [d], check=False)
     print("   ✅ 依赖安装完成")
 
 
+def install_model() -> None:
+    """下载 bge-m3 ONNX 向量模型（调用仓库自带 download_model.py）。"""
+    print("[3/6] 下载 bge-m3 ONNX 向量模型（~569MB，断点续传）...")
+    script = BOSHI_DIR / "download_model.py"
+    if not script.exists():
+        print("   ⚠️ 仓库缺少 download_model.py，跳过模型下载（首次向量化会失败！）")
+        return
+    subprocess.run([sys.executable, str(script), "--check"], cwd=str(BOSHI_DIR))
+    if not (BOSHI_DIR / "models" / "bge-m3" / "onnx" / "model_quantized.onnx").exists():
+        subprocess.run([sys.executable, str(script)], cwd=str(BOSHI_DIR))
+    print("   ✅ 模型就绪")
+
+
 def install_plugin(hermes_home: Path) -> None:
     """插件方式：复制 plugins/boshi 并配置 memory.provider=boshi。"""
-    print("[3/5] 安装 Memory Provider 插件（插件方式）...")
+    print("[4/6] 安装 Memory Provider 插件（插件方式）...")
     src = BOSHI_DIR / "plugins" / "boshi"
     dst = hermes_home / "plugins" / "boshi"
     if not src.exists():
@@ -78,9 +105,9 @@ def install_plugin(hermes_home: Path) -> None:
     print(f"   ✅ 插件已复制到 {dst}")
 
 
-def configure_config(hermes_home: Path) -> None:
+def configure_config(hermes_home: Path, mcp_command: str) -> None:
     """写入 config.yaml：memory.provider=boshi（插件）+ mcp_servers.boshi（MCP）。"""
-    print("[4/5] 配置 Hermes config.yaml（双轨）...")
+    print("[5/6] 配置 Hermes config.yaml（双轨）...")
     config_path = hermes_home / "config.yaml"
     if config_path.exists():
         shutil.copy2(config_path, config_path.with_suffix(".yaml.bak"))
@@ -104,11 +131,11 @@ def configure_config(hermes_home: Path) -> None:
     data["memory"]["memory_enabled"] = True
     data["memory"]["user_profile_enabled"] = True
 
-    # MCP 方式：mcp_servers.boshi
+    # MCP 方式：mcp_servers.boshi（command 用 Hermes venv python 优先）
     data.setdefault("mcp_servers", {})
     data["mcp_servers"].setdefault("boshi", {})
     data["mcp_servers"]["boshi"]["enabled"] = True
-    data["mcp_servers"]["boshi"]["command"] = sys.executable
+    data["mcp_servers"]["boshi"]["command"] = mcp_command
     data["mcp_servers"]["boshi"]["args"] = [str(BOSHI_DIR / "boshi_mcp_server.py")]
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -119,7 +146,7 @@ def configure_config(hermes_home: Path) -> None:
 
 def install_skill(hermes_home: Path) -> None:
     """复制 boshi-memory skill。"""
-    print("[5/5] 安装 boshi-memory skill...")
+    print("[6/6] 安装 boshi-memory skill...")
     src = BOSHI_DIR / "skills" / "boshi-memory"
     dst = hermes_home / "skills" / "boshi-memory"
     if src.exists():
@@ -134,16 +161,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="伯仕记忆系统安装脚本")
     parser.add_argument("--home", default=None, help="HERMES_HOME 路径（默认自动探测）")
     parser.add_argument("--no-deps", action="store_true", help="跳过依赖安装")
+    parser.add_argument("--no-model", action="store_true", help="跳过模型下载")
     args = parser.parse_args()
 
     hermes_home = Path(args.home) if args.home else get_hermes_home()
+    mcp_command = find_hermes_python(hermes_home)
     print(f"🦄 伯仕记忆系统安装脚本 | HERMES_HOME = {hermes_home}")
+    print(f"   MCP command = {mcp_command}")
 
     deploy_code()
     if not args.no_deps:
         install_deps()
+    if not args.no_model:
+        install_model()
     install_plugin(hermes_home)
-    configure_config(hermes_home)
+    configure_config(hermes_home, mcp_command)
     install_skill(hermes_home)
 
     print()
