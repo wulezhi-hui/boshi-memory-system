@@ -79,7 +79,13 @@ def search(query: str, top_k: int = 5, source: str = "all") -> dict:
         mems = result.get("memories", [])
         for r in mems:
             r["source"] = "hybrid"
-        return {"query": query, "total": len(mems), "results": mems, "sources": {"hybrid": len(mems)}}
+        return {
+            "query": query,
+            "total": len(mems),
+            "results": mems,
+            "sessions": result.get("sessions", []),
+            "sources": {"hybrid": len(mems), "sessions": len(result.get("sessions", []))},
+        }
 
     elif source == "graph":
         results = _graph_search(query, top_k=top_k)
@@ -90,6 +96,8 @@ def search(query: str, top_k: int = 5, source: str = "all") -> dict:
         hybrid = cb.hybrid_search(query, top_k=top_k)
         vector_results = hybrid.get("memories", [])
         for r in vector_results:
+            # ChromaDB 返回的是距离（越小越相似），转为相似度（越大越好）
+            r["score"] = round(1.0 - r.get("score", 0), 4)
             r["source"] = "hybrid"
 
         graph_results = _graph_search(query, top_k=3)
@@ -107,9 +115,11 @@ def search(query: str, top_k: int = 5, source: str = "all") -> dict:
             "query": query,
             "total": len(deduped[:top_k]),
             "results": deduped[:top_k],
+            "sessions": hybrid.get("sessions", []),
             "sources": {
                 "hybrid": len(vector_results),
                 "graph": len(graph_results),
+                "sessions": len(hybrid.get("sessions", [])),
             },
         }
 

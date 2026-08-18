@@ -23,10 +23,22 @@ from onnx_embed import get_embedding_function as _get_embedding_function
 
 COLLECTION_NAME = "boshi_memory"
 
+# 客户端单例缓存（修复：每次查询重建 PersistentClient 的开销）
+_client_instance = None
+_client_lock = None
+
 
 def _get_client():
-    """获取 ChromaDB 持久化客户端"""
-    return chromadb.PersistentClient(path=CHROMA_DIR)
+    """获取 ChromaDB 持久化客户端（模块级单例复用）"""
+    global _client_instance, _client_lock
+    if _client_instance is None:
+        if _client_lock is None:
+            import threading
+            _client_lock = threading.Lock()
+        with _client_lock:
+            if _client_instance is None:
+                _client_instance = chromadb.PersistentClient(path=CHROMA_DIR)
+    return _client_instance
 
 def _normalize_metadata(metadata: dict) -> dict:
     """归一化 metadata 中的时间戳字段：ISO 字符串 → float (Unix epoch)
@@ -268,22 +280,50 @@ def hybrid_search(query: str, top_k: int = 5, where: dict = None,
                 db = sqlite3.connect(state_db)
                 db.text_factory = str
 
-                # FTS5 全文搜索最近30天的会话
+                # 修复：优先 FTS5 MATCH（有 trigram 索引，中文也支持），
+                # 替代原 LIKE '%q%' 全表扫描
                 cutoff = _time.time() - 2592000
-                query_safe = query.replace("%", "\\%").replace("_", "\\_")
-                rows = db.execute(
-                    """SELECT m.session_id, m.content, m.role, m.timestamp,
-                              s.source, s.title
-                       FROM messages m
-                       JOIN sessions s ON m.session_id = s.id
-                       WHERE m.content LIKE ?
-                         AND m.role IN ('user', 'assistant')
-                         AND m.timestamp > ?
-                         AND s.message_count >= 2
-                       ORDER BY m.timestamp DESC
-                       LIMIT ?""",
-                    (f"%{query_safe}%", cutoff, top_k)
-                ).fetchall()
+                rows = []
+                fts_used = False
+                try:
+                    # FTS5 MATCH（trigram tokenizer 支持中文子串匹配）
+                    match_q = query.replace('"', '""').strip()
+                    if match_q:
+                        rows = db.execute(
+                            """SELECT m.session_id, m.content, m.role, m.timestamp,
+                                      s.source, s.title
+                               FROM messages_fts f
+                               JOIN messages m ON m.id = f.rowid
+                               JOIN sessions s ON m.session_id = s.id
+                               WHERE messages_fts MATCH ?
+                                 AND m.role IN ('user', 'assistant')
+                                 AND m.timestamp > ?
+                                 AND s.message_count >= 2
+                               ORDER BY m.timestamp DESC
+                               LIMIT ?""",
+                            (f'"{match_q}"', cutoff, top_k)
+                        ).fetchall()
+                        fts_used = bool(rows) or True
+                except Exception:
+                    fts_used = False
+                    rows = []
+
+                if not fts_used or not rows:
+                    # 降级：FTS 失败或无结果时用 LIKE（保持旧行为）
+                    query_safe = query.replace("%", "\\%").replace("_", "\\_")
+                    rows = db.execute(
+                        """SELECT m.session_id, m.content, m.role, m.timestamp,
+                                  s.source, s.title
+                           FROM messages m
+                           JOIN sessions s ON m.session_id = s.id
+                           WHERE m.content LIKE ?
+                             AND m.role IN ('user', 'assistant')
+                             AND m.timestamp > ?
+                             AND s.message_count >= 2
+                           ORDER BY m.timestamp DESC
+                           LIMIT ?""",
+                        (f"%{query_safe}%", cutoff, top_k)
+                    ).fetchall()
 
                 seen = set()
                 for sid, content, role, ts, source, title in rows:

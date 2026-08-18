@@ -51,11 +51,31 @@ def add_relation(
             logger.warning(f"未知关系类型 {rel_type}，降级为 related")
             rel_type = "related"
 
-        # 去重：同一条边不重复写入
-        dedup_key = f"{from_id}---{rel_type}---{to_id}"
-        existing = search_memory(dedup_key, top_k=1, where={"type": "relation"})
-        if existing and existing[0].get("score", 0) < 0.3:
-            return existing[0]["id"]
+        # 去重：同一条边不重复写入（修复：原语义搜索匹配不可靠）
+        # 改用 ChromaDB where 精确匹配 from_id + rel_type + to_id
+        try:
+            from chroma_bridge import _get_client, _get_embedding_function, COLLECTION_NAME
+            _client = _get_client()
+            _ef = _get_embedding_function()
+            _col = _client.get_or_create_collection(COLLECTION_NAME, embedding_function=_ef)
+            _existing = _col.get(
+                where={
+                    "$and": [
+                        {"type": "relation"},
+                        {"rel_type": rel_type},
+                        {"from_id": from_id},
+                        {"to_id": to_id},
+                    ]
+                }
+            )
+            if _existing["ids"]:
+                return _existing["ids"][0]
+        except Exception:
+            # 精确查询失败时降级为语义查询（保持旧行为）
+            dedup_key = f"{from_id}---{rel_type}---{to_id}"
+            existing = search_memory(dedup_key, top_k=1, where={"type": "relation"})
+            if existing and existing[0].get("score", 0) < 0.3:
+                return existing[0]["id"]
 
         edge_id = str(uuid.uuid4())
         now = time.time()

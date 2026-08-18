@@ -66,36 +66,49 @@ def keyword_search(query: str, top_k: int = 5) -> list:
     
     if col.count() == 0:
         return []
-    
-    # 获取全部文档（更高效的方式：按需取）
-    all_data = col.get()
+
+    # 分批获取文档（修复：原 col.get() 一次性拉全量 11k 条到内存）
+    # 限制扫描上限，避免对话每轮调用的 O(N) 开销
+    MAX_SCAN = 3000
     query_tokens = _tokenize(query)
-    
+
     if not query_tokens:
         return []
-    
+
     scored = []
-    for i in range(len(all_data["ids"])):
-        doc = all_data["documents"][i] if all_data["documents"] else ""
-        doc_tokens = _tokenize(doc)
-        if not doc_tokens:
-            continue
-        # Jaccard 相似度
-        overlap = len(query_tokens & doc_tokens)
-        union = len(query_tokens | doc_tokens)
-        if union == 0:
-            continue
-        score = overlap / union
-        if score > 0:
-            meta = all_data["metadatas"][i] if all_data["metadatas"] else {}
-            scored.append({
-                "id": all_data["ids"][i],
-                "content": doc,
-                "metadata": meta,
-                "score": score,
-                "source": "keyword",
-            })
-    
+    seen_ids = set()
+    offset = 0
+    BATCH = 500
+    while offset < MAX_SCAN:
+        all_data = col.get(limit=BATCH, offset=offset)
+        if not all_data["ids"]:
+            break
+        for i in range(len(all_data["ids"])):
+            mem_id = all_data["ids"][i]
+            if mem_id in seen_ids:
+                continue
+            seen_ids.add(mem_id)
+            doc = all_data["documents"][i] if all_data["documents"] else ""
+            doc_tokens = _tokenize(doc)
+            if not doc_tokens:
+                continue
+            # Jaccard 相似度
+            overlap = len(query_tokens & doc_tokens)
+            union = len(query_tokens | doc_tokens)
+            if union == 0:
+                continue
+            score = overlap / union
+            if score > 0:
+                meta = all_data["metadatas"][i] if all_data["metadatas"] else {}
+                scored.append({
+                    "id": mem_id,
+                    "content": doc,
+                    "metadata": meta,
+                    "score": score,
+                    "source": "keyword",
+                })
+        offset += BATCH
+
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored[:top_k]
 
@@ -118,8 +131,8 @@ def _read_state_db_recent(session_id: str = None, limit: int = 10) -> list:
     """从 Hermes state.db 读取最近对话轮次"""
     import sqlite3
     
-    localappdata = os.environ.get('LOCALAPPDATA', 
-        r'C:\Users\Administrator\AppData\Local')
+    localappdata = os.environ.get('LOCALAPPDATA',
+        os.path.expanduser(r'~\AppData\Local'))
     state_db = os.path.join(localappdata, 'hermes', 'state.db')
     
     if not os.path.exists(state_db):

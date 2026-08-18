@@ -4,6 +4,7 @@
 """
 import json
 import logging
+import re
 import requests
 import sys
 
@@ -99,20 +100,20 @@ def _normalize_relation_keys(relations: list) -> list:
 def extract_facts(text: str, model: str = DEFAULT_MODEL) -> dict:
     """
     从文本中提取实体和关系。
-    
+
     参数：
         text: 要分析的文本
         model: Ollama 模型名
-    
+
     返回：
         {"entities": [...], "relations": [...]}
         失败时返回空结构
     """
     if not text or len(text.strip()) < 5:
         return {"entities": [], "relations": []}
-    
+
     prompt = EXTRACT_PROMPT.replace("{text}", text[:800])  # 限制输入长度，避免 .format 冲突
-    
+
     try:
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
@@ -122,40 +123,40 @@ def extract_facts(text: str, model: str = DEFAULT_MODEL) -> dict:
                 "stream": False,
                 "options": {"temperature": 0.1, "num_predict": 500}
             },
-            timeout=30,
+            timeout=15,  # 修复：30s → 15s，减少对话阻塞
         )
         resp.raise_for_status()
         raw = resp.json().get("response", "").strip()
-        
+
         # 清理模型输出
         raw = _cleanup_response(raw)
-        
+
         # 解析 JSON
         result = json.loads(raw)
         if not isinstance(result, dict):
             return {"entities": [], "relations": []}
-        
+
         entities = result.get("entities", [])
         relations = result.get("relations", [])
-        
+
         if not isinstance(entities, list):
             entities = []
         if not isinstance(relations, list):
             relations = []
-        
+
         # 过滤掉空的实体名
         entities = [e for e in entities if e.get("name")]
         # 过滤掉黑名单通用术语
         entities = _filter_entities(entities)
-        
+
         # 归一化关系字段名
         relations = _normalize_relation_keys(relations)
-        
+
         return {
             "entities": entities[:10],
             "relations": relations[:10],
         }
-    
+
     except requests.exceptions.Timeout:
         logger.warning(f"实体提取超时（{model}）")
         return {"entities": [], "relations": []}
@@ -168,6 +169,64 @@ def extract_facts(text: str, model: str = DEFAULT_MODEL) -> dict:
     except Exception as e:
         logger.error(f"实体提取异常: {e}")
         return {"entities": [], "relations": []}
+
+
+# 规则提取兜底（修复：LLM 不可用/超时时不空手而归）
+_RULE_ENTITY_TYPES = {
+    # 技术名词 → tool/framework
+    "ollama": ("tool", "本地模型运行工具"), "comfyui": ("tool", "ComfyUI 工作流"),
+    "chromadb": ("tool", "向量数据库"), "qwen": ("framework", "大语言模型"),
+    "hermes": ("tool", "Hermes Agent"), "minimax": ("framework", "MiniMax 模型"),
+    "h3": ("framework", "MiniMax H3 视频模型"), "wan": ("framework", "Wan 视频模型"),
+    "searxng": ("tool", "本地搜索服务"), "docker": ("tool", "容器"), "uv": ("tool", "包管理"),
+}
+_RULE_RELATIONS = {
+    "运行于": ("updates",), "使用": ("extends",), "依赖": ("extends",),
+}
+
+
+def extract_facts_rule_based(text: str) -> dict:
+    """纯规则提取（不调 LLM，零延迟），用于对话中快速兜底。"""
+    if not text:
+        return {"entities": [], "relations": []}
+    lower = text.lower()
+    entities = []
+    for kw, (etype, attr) in _RULE_ENTITY_TYPES.items():
+        if kw in lower:
+            entities.append({"name": kw, "type": etype, "attr": attr})
+    # 项目名/路径等大写缩写
+    for m in re.findall(r"\b[A-Z][A-Z0-9_\-]{1,}\b", text):
+        name = m.strip()
+        if name and name.lower() not in ("http", "https", "www", "api"):
+            if not any(e["name"].lower() == name.lower() for e in entities):
+                entities.append({"name": name, "type": "project", "attr": ""})
+    return {"entities": entities[:10], "relations": []}
+
+
+def extract_facts_async(text: str, model: str = DEFAULT_MODEL,
+                        callback=None, timeout: float = 15.0):
+    """异步提取：后台线程调 LLM，不阻塞主流程（修复：同步阻塞 30s 的坑）。
+
+    用法:
+        extract_facts_async(text, callback=lambda r: print(r))
+    回调收到 {"entities": [...], "relations": [...]}；LLM 失败时自动用规则提取兜底。
+    """
+    import threading
+
+    def _run():
+        result = extract_facts(text, model)
+        if not result.get("entities") and not result.get("relations"):
+            # LLM 无结果 → 规则兜底
+            result = extract_facts_rule_based(text)
+        if callback:
+            try:
+                callback(result)
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_run, daemon=True, name="boshi-extract")
+    t.start()
+    return t
 
 
 if __name__ == "__main__":
