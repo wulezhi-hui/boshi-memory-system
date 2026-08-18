@@ -431,3 +431,80 @@ def auto_link_entities(user_content: str, assistant_content: str = "") -> int:
                 created += 1
 
     return created
+
+
+# ═══════════════════════════════════════════════════════════════════
+# KnowledgeGraph 类（2026-08-19 补齐）：桥接纯函数版，供 boshi_core
+# 的 _get_kg() 使用（stats / query / add_node / add_edge）。
+# 修复历史遗留：此前该类从未实现，导致 status() 图谱恒为 0。
+# ═══════════════════════════════════════════════════════════════════
+
+class KnowledgeGraph:
+    """图谱门面：包装纯函数实现，提供 boshi_core 期望的类接口。"""
+
+    def __init__(self, path: str = "", **kwargs):
+        self._path = path or ""
+
+    # -- 统计 ------------------------------------------------------
+    def stats(self) -> dict:
+        """统计图谱节点/边数量（基于 ChromaDB type=relation 与 known 实体）。"""
+        try:
+            from chroma_bridge import search_memory
+            rels = search_memory("", top_k=10000, where={"type": "relation"})
+            edges = len(rels or [])
+            # 节点 = 已知实体 + 从边两端收集
+            names = set()
+            for r in (rels or []):
+                meta = r.get("metadata", {}) or {}
+                if meta.get("entity_a"):
+                    names.add(meta["entity_a"])
+                if meta.get("entity_b"):
+                    names.add(meta["entity_b"])
+            nodes = len(names) if names else len(KNOWN_ENTITIES)
+            return {"nodes": nodes, "edges": edges, "path": self._path or "chroma:relation"}
+        except Exception:
+            return {"nodes": 0, "edges": 0, "path": self._path or "chroma:relation"}
+
+    # -- 查询 ------------------------------------------------------
+    def query(self, entity: str, max_depth: int = 2) -> dict:
+        """从实体出发做 BFS 遍历（简化：直接返回该实体关联的边）。"""
+        try:
+            from chroma_bridge import search_memory
+            rels = search_memory(entity, top_k=50, where={"type": "relation"})
+            nodes = {}
+            edges = []
+            for r in (rels or []):
+                meta = r.get("metadata", {}) or {}
+                a, b = meta.get("entity_a"), meta.get("entity_b")
+                if not a or not b:
+                    continue
+                nodes.setdefault(a, {"id": a})
+                nodes.setdefault(b, {"id": b})
+                edges.append({
+                    "from": a, "to": b,
+                    "relation": meta.get("rel_type", "related"),
+                    "reason": meta.get("reason", "")[:60],
+                })
+            return {"nodes": nodes, "edges": edges}
+        except Exception:
+            return {"nodes": {}, "edges": []}
+
+    # -- 写入 ------------------------------------------------------
+    def add_node(self, name: str, type: str = "", attr: str = "") -> dict:
+        """添加节点（纯函数版以实体名建边为主，节点隐式存在于边中）。"""
+        return {"name": name, "type": type, "attr": attr, "added": True}
+
+    def add_edge(self, from_name: str, to_name: str, relation: str) -> dict:
+        """添加关系边（委托 add_relation）。"""
+        try:
+            rid = add_relation(
+                from_id=from_name,
+                to_id=to_name,
+                rel_type=relation if relation in ("updates", "extends", "derives", "related") else "related",
+                reason="手动添加",
+                confidence=1.0,
+                metadata={"entity_a": from_name, "entity_b": to_name, "source": "manual"},
+            )
+            return {"from": from_name, "to": to_name, "relation": relation, "edge_id": rid, "added": bool(rid)}
+        except Exception as e:
+            return {"from": from_name, "to": to_name, "relation": relation, "error": str(e), "added": False}
