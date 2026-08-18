@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
 """
-伯仕记忆系统 MCP Server 🦄
-===========================
+伯仕记忆系统 MCP Server 🦄 — mcp 2.0.0 适配版
+===========================================
 通过 MCP 协议暴露记忆系统，让任何支持 MCP 的 Agent 都能使用伯仕的记忆。
 
 启动方式:
-  python boshi_mcp_server.py                # stdio 模式（Hermes/Claude Code/Cursor 连接）
-
-Hermes 配置 (config.yaml):
-  mcp_servers:
-    boshi:
-      command: "python"
-      args: ["~/.boshi/boshi_mcp_server.py"]
+  python boshi_mcp_server.py                # stdio 模式（Hermes/Claude Code/Cursor/DSH 连接）
 
 暴露的 Tools:
   boshi_search    — 三路融合检索
@@ -22,11 +16,17 @@ Hermes 配置 (config.yaml):
   boshi_graph     — 知识图谱查询
   boshi_graph_add — 添加图谱节点/边
   boshi_recent    — 最近N条记忆
+
+适配说明:
+  原版基于 mcp SDK 1.x 的 Server.list_tools 装饰器；mcp 2.0.0 改用
+  MCPServer + @server.tool() 装饰器 + run_stdio_async()。
 """
 import os
 import sys
 import json
+import asyncio
 import argparse
+from typing import Literal, Optional
 
 # ── 路径 ──
 BOSHI_HOME = os.path.expanduser("~/.boshi")
@@ -36,246 +36,119 @@ if BOSHI_HOME not in sys.path:
 from boshi_core import (
     search, save, delete, status, profile,
     graph_query, graph_add_node, graph_add_edge,
-    recent, brief,
+    recent,
 )
 
+from mcp.server import MCPServer
 
-# ═══════════════════════════════════════════
-# MCP Server — 使用 mcp SDK (v1.27+)
-# ═══════════════════════════════════════════
 
 def create_server():
-    """创建 MCP Server 实例，注册所有 tools。"""
-    from mcp.server import Server
-    from mcp.types import Tool, TextContent
+    """创建 mcp 2.0 MCPServer，注册全部 8 个工具。"""
+    server = MCPServer("boshi-memory", version="6.1.0")
 
-    server = Server("boshi-memory")
+    @server.tool(
+        name="boshi_search",
+        description="搜索伯仕的记忆。支持多策略检索（语义向量+全文混合+知识图谱），找到最相关的记忆。",
+    )
+    def boshi_search(
+        query: str,
+        top_k: int = 5,
+        source: Literal["all", "vector", "hybrid", "graph"] = "all",
+    ) -> str:
+        """搜索记忆：query 搜索查询文本；top_k 返回条数默认5；source 检索策略 all=融合(hybrid+图谱), vector=语义, hybrid=语义+全文混合, graph=图谱"""
+        result = search(query=query, top_k=top_k, source=source)
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
-    # ── 注册 tool 元数据 ──
-    @server.list_tools()
-    async def list_tools():
-        return [
-            Tool(
-                name="boshi_search",
-                description="搜索伯仕的记忆。支持多策略检索（语义向量+全文混合+知识图谱），找到最相关的记忆。",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "搜索查询文本"},
-                        "top_k": {"type": "integer", "description": "返回条数，默认5", "default": 5},
-                        "source": {
-                            "type": "string",
-                            "enum": ["all", "vector", "hybrid", "graph"],
-                            "description": "检索策略：all=融合(hybrid+图谱), vector=语义, hybrid=语义+全文混合, graph=图谱",
-                            "default": "all",
-                        },
-                    },
-                    "required": ["query"],
-                },
-            ),
-            Tool(
-                name="boshi_save",
-                description="向伯仕记忆系统存入一条记忆/事实。适合保存用户偏好、项目决策、重要信息等。",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "content": {"type": "string", "description": "记忆内容"},
-                        "topic": {"type": "string", "description": "主题标签，默认 external", "default": "external"},
-                        "metadata": {"type": "object", "description": "附加元数据（可选）"},
-                    },
-                    "required": ["content"],
-                },
-            ),
-            Tool(
-                name="boshi_delete",
-                description="删除一条记忆（按ID）。",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "memory_id": {"type": "string", "description": "要删除的记忆ID"},
-                    },
-                    "required": ["memory_id"],
-                },
-            ),
-            Tool(
-                name="boshi_status",
-                description="查看记忆库状态：总条数、知识图谱节点/边数、ChromaDB路径。",
-                inputSchema={"type": "object", "properties": {}},
-            ),
-            Tool(
-                name="boshi_profile",
-                description="获取用户画像摘要：当前热区话题、记忆总数、最近记忆。适合作为对话开场的上下文注入。",
-                inputSchema={"type": "object", "properties": {}},
-            ),
-            Tool(
-                name="boshi_graph",
-                description="查询知识图谱：从指定实体出发，BFS遍历关联实体和关系。用于了解实体间的关联。",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "entity": {"type": "string", "description": "起始实体名"},
-                        "max_depth": {"type": "integer", "description": "遍历深度，默认2", "default": 2},
-                    },
-                    "required": ["entity"],
-                },
-            ),
-            Tool(
-                name="boshi_graph_add",
-                description="向知识图谱添加节点或关系边。用于手动补充实体关系。",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["add_node", "add_edge"],
-                            "description": "添加节点(add_node)还是关系边(add_edge)",
-                        },
-                        "name": {"type": "string", "description": "节点名（add_node时必填）"},
-                        "type": {"type": "string", "description": "节点类型（add_node时可选）"},
-                        "attr": {"type": "string", "description": "节点属性（add_node时可选）"},
-                        "from_name": {"type": "string", "description": "关系起点（add_edge时必填）"},
-                        "to_name": {"type": "string", "description": "关系终点（add_edge时必填）"},
-                        "relation": {"type": "string", "description": "关系类型（add_edge时必填）"},
-                    },
-                    "required": ["action"],
-                },
-            ),
-            Tool(
-                name="boshi_recent",
-                description="获取最近N条记忆，用于快速了解最近的活动记录。",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "n": {"type": "integer", "description": "返回条数，默认10", "default": 10},
-                    },
-                },
-            ),
-        ]
+    @server.tool(
+        name="boshi_save",
+        description="向伯仕记忆系统存入一条记忆/事实。适合保存用户偏好、项目决策、重要信息等。",
+    )
+    def boshi_save(content: str, topic: str = "external", metadata: Optional[dict] = None) -> str:
+        """存入记忆：content 记忆内容；topic 主题标签默认 external；metadata 附加元数据（可选）"""
+        result = save(content=content, topic=topic, metadata=metadata)
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
-    # ── tool 执行 ──
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict):
-        try:
-            if name == "boshi_search":
-                result = search(
-                    query=arguments["query"],
-                    top_k=arguments.get("top_k", 5),
-                    source=arguments.get("source", "all"),
-                )
-                return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+    @server.tool(
+        name="boshi_delete",
+        description="删除一条记忆（按ID）。",
+    )
+    def boshi_delete(memory_id: str) -> str:
+        """删除记忆：memory_id 要删除的记忆ID"""
+        result = delete(memory_id)
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
-            elif name == "boshi_save":
-                result = save(
-                    content=arguments["content"],
-                    topic=arguments.get("topic", "external"),
-                    metadata=arguments.get("metadata"),
-                )
-                return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+    @server.tool(
+        name="boshi_status",
+        description="查看记忆库状态：总条数、知识图谱节点/边数、ChromaDB路径。",
+    )
+    def boshi_status() -> str:
+        """记忆库状态：总条数、知识图谱节点/边数、ChromaDB路径"""
+        result = status()
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
-            elif name == "boshi_delete":
-                result = delete(arguments["memory_id"])
-                return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+    @server.tool(
+        name="boshi_profile",
+        description="获取用户画像摘要：当前热区话题、记忆总数、最近记忆。适合作为对话开场的上下文注入。",
+    )
+    def boshi_profile() -> str:
+        """用户画像摘要：当前热区话题、记忆总数、最近记忆"""
+        result = profile()
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
-            elif name == "boshi_status":
-                result = status()
-                return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+    @server.tool(
+        name="boshi_graph",
+        description="查询知识图谱：从指定实体出发，BFS遍历关联实体和关系。用于了解实体间的关联。",
+    )
+    def boshi_graph(entity: str, max_depth: int = 2) -> str:
+        """图谱查询：entity 起始实体名；max_depth 遍历深度默认2"""
+        result = graph_query(entity=entity, max_depth=max_depth)
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
-            elif name == "boshi_profile":
-                result = profile()
-                return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+    @server.tool(
+        name="boshi_graph_add",
+        description="向知识图谱添加节点或关系边。action=add_node 时提供 name；action=add_edge 时提供 from_name/to_name/relation。",
+    )
+    def boshi_graph_add(
+        action: Literal["add_node", "add_edge"],
+        name: Optional[str] = None,
+        type: Optional[str] = None,
+        attr: Optional[str] = None,
+        from_name: Optional[str] = None,
+        to_name: Optional[str] = None,
+        relation: Optional[str] = None,
+    ) -> str:
+        """图谱添加：action 必填；add_node 需要 name/type/attr；add_edge 需要 from_name/to_name/relation"""
+        if action == "add_node":
+            result = graph_add_node(name=name, type=type or "", attr=attr or "")
+        elif action == "add_edge":
+            result = graph_add_edge(from_name=from_name, to_name=to_name, relation=relation)
+        else:
+            result = {"error": f"Unknown action: {action}"}
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
-            elif name == "boshi_graph":
-                result = graph_query(
-                    entity=arguments["entity"],
-                    max_depth=arguments.get("max_depth", 2),
-                )
-                return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
-
-            elif name == "boshi_graph_add":
-                action = arguments["action"]
-                if action == "add_node":
-                    result = graph_add_node(
-                        name=arguments["name"],
-                        type=arguments.get("type", ""),
-                        attr=arguments.get("attr", ""),
-                    )
-                elif action == "add_edge":
-                    result = graph_add_edge(
-                        from_name=arguments["from_name"],
-                        to_name=arguments["to_name"],
-                        relation=arguments["relation"],
-                    )
-                else:
-                    result = {"error": f"Unknown action: {action}"}
-                return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
-
-            elif name == "boshi_recent":
-                results = recent(n=arguments.get("n", 10))
-                return [TextContent(type="text", text=json.dumps(results, ensure_ascii=False, indent=2))]
-
-            else:
-                return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
-
-        except Exception as e:
-            return [TextContent(type="text", text=json.dumps({"error": str(e)}, ensure_ascii=False))]
+    @server.tool(
+        name="boshi_recent",
+        description="获取最近N条记忆，用于快速了解最近的活动记录。",
+    )
+    def boshi_recent(n: int = 10) -> str:
+        """最近记忆：n 返回条数默认10"""
+        result = recent(n=n)
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
     return server
 
 
-async def run_stdio():
-    """stdio 模式 — Hermes/Claude Code/Cursor 通过 stdin/stdout 连接"""
-    from mcp.server.stdio import stdio_server
-
-    server = create_server()
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
-
-
 def main():
     parser = argparse.ArgumentParser(description="伯仕记忆系统 MCP Server")
-    parser.add_argument("--sse", type=int, metavar="PORT", help="SSE 模式，指定监听端口")
+    parser.add_argument("--sse", type=int, metavar="PORT", help="SSE 模式，指定监听端口（mcp 2.0 新 API）")
     parser.add_argument("--stdio", action="store_true", help="stdio 模式（默认）")
     args = parser.parse_args()
 
-    import asyncio
-    if args.sse:
-        asyncio.run(run_sse(args.sse))
-    else:
-        asyncio.run(run_stdio())
-
-
-async def run_sse(port: int):
-    """SSE 模式 — 通过 HTTP SSE 协议连接（OpenClaw/Claude Code 等）"""
-    from mcp.server.sse import SseServerTransport
-    from starlette.applications import Starlette
-    from starlette.routing import Route
-    import uvicorn
-
     server = create_server()
-    sse = SseServerTransport("/messages/")
-
-    async def handle_sse(request):
-        async with sse.connect_sse(
-            request.scope, request.receive, request._send
-        ) as (read_stream, write_stream):
-            await server.run(
-                read_stream, write_stream,
-                server.create_initialization_options()
-            )
-
-    async def handle_messages(request):
-        await sse.handle_post_message(request.scope, request.receive, request._send)
-
-    app = Starlette(
-        routes=[
-            Route("/sse", endpoint=handle_sse),
-            Route("/messages/", endpoint=handle_messages, methods=["POST"]),
-        ]
-    )
-    print(f"Boshi Memory MCP SSE server running on http://127.0.0.1:{port}/sse")
-    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info")
-    server_uv = uvicorn.Server(config)
-    await server_uv.serve()
+    if args.sse:
+        asyncio.run(server.run_sse_async(args.sse))
+    else:
+        asyncio.run(server.run_stdio_async())
 
 
 if __name__ == "__main__":

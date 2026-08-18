@@ -1,31 +1,38 @@
 #!/bin/bash
-# 伯仕记忆系统 v6.1 — Ubuntu 一键安装脚本（自动下载 ONNX 模型，不打包）
+# 伯仕记忆系统 v6.2 — Ubuntu/Linux 一键安装脚本（双轨接入：插件 + MCP）
 # 用法: curl -sL https://raw.githubusercontent.com/wulezhi-hui/boshi-memory-system/main/install.sh | bash
 #
 # 说明：
-# - 仓库本身不包含 86MB 的 model.onnx（太大了）
-# - 安装时会利用 ChromaDB 内置机制自动下载到 ~/.boshi/models/
+# - 仓库不包含 ~569MB 的 bge-m3 ONNX 模型，安装时调用 download_model.py
+#   （默认 hf-mirror.com 国内镜像，可设 BOSHI_MODEL_SOURCE=hf 切换官方源）
 # - 如果目标机器有代理，请提前设置 http_proxy/https_proxy 环境变量
 
 set -e
 
 REPO_URL="https://github.com/wulezhi-hui/boshi-memory-system.git"
 INSTALL_DIR="$HOME/.boshi"
-HERMES_DIR="${HERMES_DIR:-$HOME/.config/hermes}"
-MODEL_DIR="$INSTALL_DIR/models/all-MiniLM-L6-v2"
+# Hermes 配置目录：用户显式设置优先，否则探测 ~/.hermes / ~/.config/hermes
+if [ -z "${HERMES_DIR:-}" ]; then
+    if [ -d "$HOME/.hermes" ]; then
+        HERMES_DIR="$HOME/.hermes"
+    elif [ -d "$HOME/.config/hermes" ]; then
+        HERMES_DIR="$HOME/.config/hermes"
+    else
+        HERMES_DIR="$HOME/.hermes"
+    fi
+fi
+export HERMES_DIR
 
-echo "🦄 伯仕记忆系统 v6.1 安装脚本（自动下载 ONNX 模型）"
-echo "================================================"
+echo "🦄 伯仕记忆系统 v6.2 安装脚本（bge-m3 ONNX 向量模型）"
+echo "========================================================"
 
 # 0. 检查依赖
-echo "[1/6] 检查 Python3..."
+echo "[1/7] 检查 Python3 / pip..."
 python3 --version > /dev/null 2>&1 || { echo "❌ 未找到 python3，请先安装"; exit 1; }
-
-echo "[2/6] 检查 pip..."
 pip3 --version > /dev/null 2>&1 || { echo "❌ 未找到 pip3，请先安装"; exit 1; }
 
 # 1. 克隆/更新仓库
-echo "[3/6] 克隆仓库到 $INSTALL_DIR..."
+echo "[2/7] 克隆仓库到 $INSTALL_DIR..."
 if [ -d "$INSTALL_DIR/.git" ]; then
     cd "$INSTALL_DIR"
     git pull --ff-only
@@ -34,50 +41,37 @@ else
     git clone "$REPO_URL" "$INSTALL_DIR"
 fi
 
-# 2. 安装 Python 依赖
-echo "[4/6] 安装 Python 依赖..."
-pip3 install --user chromadb 2>/dev/null || pip3 install chromadb
+# 2. 安装 Python 依赖（含 bge-m3 ONNX 推理所需）
+echo "[3/7] 安装 Python 依赖..."
+pip3 install --user chromadb "mcp>=2.0.0" onnxruntime transformers pyyaml 2>/dev/null \
+    || pip3 install chromadb "mcp>=2.0.0" onnxruntime transformers pyyaml
 
-# 3. 预下载 ONNX 向量模型
-# 如果模型目录已存在，跳过；否则让 ChromaDB 自动下载一次
-echo "[5/6] 准备 ONNX 向量模型（自动下载）..."
-python3 << 'PY'
-import os, shutil
-from pathlib import Path
+# 3. 下载 bge-m3 ONNX 向量模型（~569MB，断点续传）
+echo "[4/7] 下载 bge-m3 ONNX 向量模型（int8 量化 ~569MB，请耐心等待）..."
+cd "$INSTALL_DIR"
+if python3 download_model.py --check; then
+    echo "   ✅ 模型已就位，跳过下载"
+else
+    SOURCE_ARG=""
+    if [ -n "${BOSHI_MODEL_SOURCE:-}" ]; then
+        SOURCE_ARG="--source $BOSHI_MODEL_SOURCE"
+    fi
+    python3 download_model.py $SOURCE_ARG
+fi
 
-model_dir = Path(os.path.expanduser("~/.boshi/models/all-MiniLM-L6-v2"))
+# 4. 安装 Memory Provider 插件（插件方式接入）
+echo "[5/7] 安装 Memory Provider 插件..."
+mkdir -p "$HERMES_DIR/plugins"
+if [ -d "$INSTALL_DIR/plugins/boshi" ]; then
+    rm -rf "$HERMES_DIR/plugins/boshi"
+    cp -r "$INSTALL_DIR/plugins/boshi" "$HERMES_DIR/plugins/boshi"
+    echo "   ✅ 插件已复制到 $HERMES_DIR/plugins/boshi"
+else
+    echo "   ⚠️ 仓库中未找到 plugins/boshi，跳过插件安装"
+fi
 
-# 如果模型已经就位，跳过
-if (model_dir / "onnx" / "model.onnx").exists():
-    print(f"   ℹ️ ONNX 模型已存在于 {model_dir}")
-    print(f"   来源: 本地副本")
-    exit(0)
-
-# 否则，触发 ChromaDB 内置下载机制
-print(f"   ⬇️ 正在下载 all-MiniLM-L6-v2 ONNX 模型（约 86MB，请稍候）...")
-try:
-    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
-    ef = ONNXMiniLM_L6_V2()  # 首次实例化会自动下载
-
-    # 下载完成后，ChromaDB 把它放在 ~/.cache/chroma/onnx_models/...
-    cache_dir = Path(os.path.expanduser("~/.cache/chroma/onnx_models/all-MiniLM-L6-v2"))
-    if cache_dir.exists():
-        model_dir.mkdir(parents=True, exist_ok=True)
-        target = model_dir / "onnx"
-        if not target.exists():
-            shutil.copytree(cache_dir, target)
-            print(f"   ✅ 模型已下载并复制到 {target}")
-        else:
-            print(f"   ℹ️ 模型目录已存在，跳过复制")
-    else:
-        print(f"   ⚠️ ChromaDB 下载路径未找到，将在首次查询时自动重试")
-except Exception as e:
-    print(f"   ⚠️ 模型下载遇到问题: {e}")
-    print(f"   伯仕记忆系统仍可运行，首次调用向量化时将再次尝试自动下载。")
-PY
-
-# 4. 安装 Skill
-echo "[6/6] 安装 boshi-memory skill..."
+# 5. 安装 Skill
+echo "[6/7] 安装 boshi-memory skill..."
 mkdir -p "$HERMES_DIR/skills"
 if [ -d "$INSTALL_DIR/skills/boshi-memory" ]; then
     rm -rf "$HERMES_DIR/skills/boshi-memory"
@@ -87,9 +81,8 @@ else
     echo "   ⚠️ 仓库中未找到 skills/boshi-memory，跳过"
 fi
 
-# 5. 配置 Hermes config.yaml
-echo ""
-echo "🔧 配置 Hermes..."
+# 6. 配置 Hermes config.yaml（双轨：插件 + MCP）
+echo "[7/7] 配置 Hermes..."
 CONFIG_FILE="$HERMES_DIR/config.yaml"
 
 if [ -f "$CONFIG_FILE" ]; then
@@ -106,42 +99,42 @@ agent:
 CONF
 fi
 
-python3 << 'PY'
-import yaml, os
-config_path = os.path.expanduser("~/.config/hermes/config.yaml")
-if not os.path.exists(config_path):
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-    data = {}
-else:
-    with open(config_path, 'r') as f:
-        data = yaml.safe_load(f) or {}
+python3 - "$HERMES_DIR" << 'PY'
+import os, sys, yaml
+config_path = os.path.join(sys.argv[1], "config.yaml")
+with open(config_path, "r") as f:
+    data = yaml.safe_load(f) or {}
 
-data.setdefault('memory', {})
-data['memory']['provider'] = 'boshi'
-data['memory']['enabled'] = True
+# 插件方式：memory.provider = boshi
+data.setdefault("memory", {})
+data["memory"]["provider"] = "boshi"
+data["memory"]["memory_enabled"] = True
+data["memory"]["user_profile_enabled"] = True
 
-data.setdefault('mcp_servers', {})
-data['mcp_servers'].setdefault('boshi', {})
-data['mcp_servers']['boshi']['enabled'] = True
-data['mcp_servers']['boshi']['command'] = 'python3'
-data['mcp_servers']['boshi']['args'] = [os.path.expanduser('~/.boshi/boshi_mcp_server.py')]
+# MCP 方式：mcp_servers.boshi
+data.setdefault("mcp_servers", {})
+data["mcp_servers"].setdefault("boshi", {})
+data["mcp_servers"]["boshi"]["enabled"] = True
+data["mcp_servers"]["boshi"]["command"] = "python3"
+data["mcp_servers"]["boshi"]["args"] = [os.path.expanduser("~/.boshi/boshi_mcp_server.py")]
 
-with open(config_path, 'w') as f:
+with open(config_path, "w") as f:
     yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
 print("   ✅ Hermes 配置已写入", config_path)
 PY
 
 echo ""
-echo "================================================"
+echo "========================================================"
 echo "✅ 伯仕记忆系统安装完成！"
 echo ""
 echo "📂 安装位置: $INSTALL_DIR"
-echo "🧠 ONNX 模型: $MODEL_DIR/onnx/（首次使用自动下载）"
-echo "📂 Skill 位置: $HERMES_DIR/skills/boshi-memory（如有）"
+echo "🧠 bge-m3 ONNX 模型: $INSTALL_DIR/models/bge-m3/（int8 量化）"
+echo "🔌 插件方式: $HERMES_DIR/plugins/boshi（memory.provider = boshi）"
+echo "🔗 MCP 方式 : mcp_servers.boshi（8 个 boshi_* 工具）"
 echo ""
 echo "下一步："
-echo "   重启 Hermes Gateway："
-echo "      hermes gateway run"
+echo "   1. 在 Hermes 配置确认：hermes memory status / hermes mcp list"
+echo "   2. 重启 Hermes：hermes gateway run（或 CLI 重新打开）"
 echo ""
 echo "🦄 若有疑问，随时呼唤伯仕。"
 echo ""

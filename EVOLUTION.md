@@ -12,7 +12,7 @@
 - **搜索方式**：Numpy 余弦距离暴力计算
 - **瓶颈**：Ollama 经常超时（BGE-M3 加载到 2070 8GB 显存失败），qwen3-embedding 太慢
 
-### v2 — ChromaDB 离线迁移（2026-05-21）← 当前
+### v2 — ChromaDB 离线迁移（2026-05-21）
 - **动机**：Ollama embedding 不可靠，记忆系统不应依赖外部服务
 - **存储**：`~/.boshi/chroma_db/` — ChromaDB 持久化向量库
 - **向量模型**：`sentence-transformers/all-MiniLM-L6-v2`（384维），离线 cache，CPU 秒出
@@ -25,6 +25,33 @@
   - 改 `memory_provider/__init__.py` — is_available 改为检查 chroma_bridge.py
 - **废弃**：Ollama embedding 调用、warm.json 写入、vectors.npy 读写
 - **保留**：热度引擎（TieredMemory 的话题热度衰减）、冷区挖掘（state.db）
+
+### v3 — 统一热区存储（2026-05-26）
+- 存储从三套（hot.json + Chroma + cold.json）统一为纯 Chroma
+- 新增 conversation_turn 类型兜底写入；sync_turn 每轮对话即时写库
+
+### v4 — 五大能力引入（2026-06-11，借鉴 Supermemory）
+- 版本链（追加不覆盖 + isLatest）、用户画像（Static+Dynamic）、知识图谱（4 种关系）、混合搜索（语义+全文）、自动遗忘（热度衰减+时间折旧）
+- 清理 ChromaDB 重建，索引修复
+
+### v5 — 开放接口层（2026-06-12）
+- 新增 MCP Server（boshi_mcp_server.py，8 工具）+ CLI（boshi_cli.py）+ 共享 Core 层（boshi_core.py）
+
+### v6 — 零外网依赖向量层（2026-06-18）
+- Embedding 从 SentenceTransformer（torch ~1.5GB）重构为 ONNX 推理，去掉 torch/sentence-transformers/HF 缓存依赖
+
+### v6.1 — bge-m3 ONNX 升级（2026-08-16）
+- 向量模型升级为 BAAI/bge-m3（Xenova ONNX，1024 维，中文检索质量优秀）；chroma 改 cosine 空间
+- MCP 适配 2.0.0（MCPServer + @server.tool）
+- 新增 session_sources.py 多 Agent 会话源路由
+- 安全清理：移除泄露凭据，.gitignore 排除运行时数据
+
+### v6.2 — 双轨接入版（2026-08-17）← 当前
+- **插件方式**：`plugins/boshi/__init__.py` 实现 Hermes `MemoryProvider` ABC（每轮自动召回/存储/画像注入），`memory.provider: boshi` 激活
+- **MCP 方式**：8 个工具保留，与插件可同时启用
+- **跨平台一键安装**：install.sh（Linux curl|bash）+ install.py（Windows）+ download_model.py（bge-m3 模型下载，hf-mirror 国内镜像，断点续传）
+- **工程规范**：.gitattributes 统一 LF；已发布 GitHub tag v6.2 + Release
+- **开源可用**：仓库 public，任何人可 clone 安装使用
 
 ---
 

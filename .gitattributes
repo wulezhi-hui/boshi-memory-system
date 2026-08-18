@@ -1,0 +1,7 @@
+# 行尾规范化：脚本统一 LF（防止 Windows CRLF 破坏 `curl | bash` 安装）
+*.sh text eol=lf
+*.py text eol=lf
+*.md text
+*.yaml text
+*.yml text
+*.json text
