@@ -21,6 +21,7 @@ Hermes Agent 的四层记忆架构：持久化、热度调度、知识图谱、�
 | 自动遗忘 | 热度衰减 + 时间过期折旧 |
 | 🔌 插件接入 | Hermes MemoryProvider ABC：每轮自动召回/存储/画像注入 |
 | 🔗 MCP 接入 | 8 个工具：search/save/delete/status/profile/graph/graph_add/recent |
+| 🧩 DSH 接入 | 自动记忆插件：每轮存储 + 画像/召回注入（见 `dsh/`） |
 
 ## 快速开始
 
@@ -76,6 +77,23 @@ python boshi_cli.py search "查询文本"
 python boshi_cli.py save "记忆内容" --topic 项目
 python boshi_cli.py status
 python boshi_cli.py profile
+```
+
+### 4. DSH 接入（自动记忆）
+
+DSH（DeepSeek Harness）用户可通过 `dsh/` 目录下的自动记忆插件实现每轮自动存储 + 画像/召回注入，无需 agent 记得调用工具。详见 [dsh/README.md](dsh/README.md)。
+
+```bash
+# 1. 复制插件到 DSH profile
+cp ~/.boshi/dsh/boshi-auto-memory.mjs $DSH_HOME/profiles/web/plugins/
+
+# 2. 在 $DSH_HOME/profiles/web/cordis.patch.yml 追加：
+#    - insert:
+#        - id: boshi-auto-memory
+#          name: './plugins/boshi-auto-memory.mjs'
+#          config: { python, bridge, cwd }  # 见 dsh/README.md
+
+# 3. 重启 dsh web
 ```
 
 ## 技术文档
