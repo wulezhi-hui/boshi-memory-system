@@ -143,6 +143,18 @@ def save(content: str, topic: str = "external", metadata: dict = None) -> dict:
     meta.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
 
     memory_id = cb.add_memory(content=content, metadata=meta)
+
+    # 知识图谱联动（2026-08-19 接线）：自动提取实体并建立关系边。
+    # 失败不阻断主流程（图谱只是增强层）。
+    try:
+        from knowledge_graph import auto_link_entities
+        try:
+            auto_link_entities(content)
+        except Exception:
+            pass  # 图谱写入失败不影响记忆保存
+    except ImportError:
+        pass
+
     return {
         "success": True,
         "memory_id": memory_id,

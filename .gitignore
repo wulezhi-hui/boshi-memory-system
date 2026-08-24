@@ -7,6 +7,8 @@ tmp_cookies.db
 
 # 运行时 / 记忆数据（不入库）
 chroma_db/
+chroma_db_broken/
+chroma_extract.json
 venv/
 __pycache__/
 *.pyc

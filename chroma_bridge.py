@@ -647,3 +647,37 @@ def resolve_conflict(winner_id: str, loser_id: str, reason: str = "") -> bool:
         return True
     except Exception:
         return False
+
+def get_all_relations(top_k: int = 10000) -> list:
+    """精确列出所有 type=relation 的记忆（供图谱去重使用）。
+
+    注意：不走 search_memory 语义检索（会误匹配），直接按 metadata where 过滤。
+    """
+    try:
+        col = _get_collection()
+        data = col.get(
+            where={"type": "relation"},
+            limit=top_k,
+            include=["documents", "metadatas"],
+        )
+        docs = data.get("documents") or []
+        metas = data.get("metadatas") or []
+        ids = data.get("ids") or []
+        results = []
+        for i, d in enumerate(docs):
+            m = metas[i] if i < len(metas) else {}
+            results.append({
+                "id": ids[i] if i < len(ids) else "",
+                "content": d or "",
+                "metadata": m,
+            })
+        return results
+    except Exception:
+        return []
+
+
+def _get_collection():
+    """返回当前 collection（供内部精确查询使用）。"""
+    from chroma_bridge import _get_client, _get_embedding_function, COLLECTION_NAME
+    client = _get_client()
+    return client.get_or_create_collection(COLLECTION_NAME, embedding_function=_get_embedding_function())
