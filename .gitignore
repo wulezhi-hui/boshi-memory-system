@@ -17,6 +17,7 @@ memory/metadata.json
 memory/knowledge_graph.json
 memory/live_turns.json
 memory/integrity.json
+memory/reflections/
 memory/user_profile.cache.json
 memory/.last_heat_decay
 memory/last_broadcast_ts.txt
