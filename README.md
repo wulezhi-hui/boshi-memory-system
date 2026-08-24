@@ -110,5 +110,5 @@ cp ~/.boshi/dsh/boshi-auto-memory.mjs $DSH_HOME/profiles/web/plugins/
 - 路径已统一为 `~/.boshi`（不再硬编码 Administrator）
 - 向量模型：bge-m3 ONNX（1024 维，int8 量化 ~569MB），缺失时用
   `python download_model.py` 下载（断点续传）
-- 实体提取默认走 Ollama LLM，对话中请用 `extract_facts_async`（后台线程）避免阻塞
+- 实体提取：规则/启发式（`auto_link_entities`，纯本地零外部依赖），`save()` 时自动提取实体并建边
 - 检索优先 FTS5，失败自动降级 LIKE
