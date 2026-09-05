@@ -46,9 +46,17 @@
 - 新增 session_sources.py 多 Agent 会话源路由
 - 安全清理：移除泄露凭据，.gitignore 排除运行时数据
 
-### v6.2 — 双轨接入版（2026-08-17）← 当前
-- **插件方式**：`plugins/boshi/__init__.py` 实现 Hermes `MemoryProvider` ABC（每轮自动召回/存储/画像注入），`memory.provider: boshi` 激活
-- **MCP 方式**：8 个工具保留，与插件可同时启用
+### v6.4 — 跨话题联想召回版（2026-09-05）← 当前
+- **问题**：跨话题时记忆召回失效——"微调"搜不到"2080Ti推理框架配置"
+- **根因**：查询词=当前消息无联想；知识图谱只匹配静态KNOWN_ENTITIES列表
+- **方案**：`_expand_query_search()`从主查询结果提取实体名（正则：大写缩写、数字+字母、驼峰），扩展二次查询（最多3次）
+- **依赖修复**：install.py新增`install_hermes_deps()`，首次安装时同步安装到Hermes venv
+- **文件**：`plugins/boshi/__init__.py` 第307-375行
+
+### v6.3 — prefetch缓存TTL修复版（2026-09-02）
+- **问题**：Hermes v0.20.6升级后`_EXTERNAL_PREFETCH_TIMEOUT_S=8.0`，伯仕搜索常超8秒被静默跳过
+- **方案**：给缓存加5分钟TTL，第2轮起毫秒级返回，避免超时
+- **文件**：`plugins/boshi/__init__.py` 第289-305行
 - **跨平台一键安装**：install.sh（Linux curl|bash）+ install.py（Windows）+ download_model.py（bge-m3 模型下载，hf-mirror 国内镜像，断点续传）
 - **工程规范**：.gitattributes 统一 LF；已发布 GitHub tag v6.2 + Release
 - **开源可用**：仓库 public，任何人可 clone 安装使用

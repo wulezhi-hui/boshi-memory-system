@@ -27,6 +27,7 @@ from pathlib import Path
 
 REPO_URL = "https://github.com/wulezhi-hui/boshi-memory-system.git"
 BOSHI_DIR = Path.home() / ".boshi"
+BOSHI_VENV = BOSHI_DIR / "venv"  # 伯仕独立 venv，依赖均安装于此
 
 
 def get_hermes_home() -> Path:
@@ -70,13 +71,37 @@ def deploy_code() -> None:
 
 
 def install_deps() -> None:
-    """安装 Python 依赖。"""
-    print("[2/6] 安装 Python 依赖...")
+    """安装 Python 依赖到伯仕 venv。"""
+    print("[2/6] 安装 Python 依赖到 ~/.boshi/venv...")
     deps = ["chromadb", "mcp>=2.0.0", "onnxruntime", "transformers", "pyyaml"]
-    pip = [sys.executable, "-m", "pip", "install"]
+    pip = [str(BOSHI_VENV / "Scripts" / "pip.exe"), "install"]
     for d in deps:
         subprocess.run(pip + [d], check=False)
-    print("   ✅ 依赖安装完成")
+    print("   ✅ 伯仕 venv 依赖安装完成")
+
+
+def install_hermes_deps(hermes_home: Path) -> None:
+    """额外安装到 Hermes venv（让插件直接 import 可用）。"""
+    print("[2b/6] 检查 Hermes venv 依赖（可选）...")
+    hermes_python = find_hermes_python(hermes_home)
+    if not hermes_python or not Path(hermes_python).exists():
+        print("   ⚠️ 未找到 Hermes venv，跳过（插件将通过 fallback 使用伯仕 venv）")
+        return
+
+    # 检查是否已安装
+    result = subprocess.run([hermes_python, "-m", "pip", "show", "chromadb"],
+                          capture_output=True, text=True)
+    if result.returncode == 0:
+        print("   ✅ Hermes venv 已有 chromadb，无需额外安装")
+        return
+
+    # 安装
+    deps = ["chromadb", "mcp>=2.0.0", "onnxruntime", "transformers", "pyyaml"]
+    pip = [hermes_python, "-m", "pip", "install"]
+    print("   ℹ️ 正在安装到 Hermes venv（首次启动会稍慢）...")
+    for d in deps:
+        subprocess.run(pip + [d], check=False)
+    print("   ✅ Hermes venv 依赖安装完成（插件可直接 import，无需 fallback）")
 
 
 def install_model() -> None:
@@ -172,6 +197,7 @@ def main() -> None:
     deploy_code()
     if not args.no_deps:
         install_deps()
+        install_hermes_deps(hermes_home)  # 额外安装到 Hermes venv，确保插件直接可用
     if not args.no_model:
         install_model()
     install_plugin(hermes_home)

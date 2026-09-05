@@ -26,7 +26,7 @@ Hermes (run_agent.py)
          └── weekly_inspection.py  ← 巡检
 ```
 
-> **双轨说明（v6.2+）：** 插件方式（memory.provider=boshi）负责**自动**记忆
+> **双轨说明（v6.3+）：** 插件方式（memory.provider=boshi）负责**自动**记忆
 > 召回/存储；MCP 方式（mcp_servers.boshi）提供 8 个**手动**工具。两者并存，
 > 共享 boshi_core.py 同一数据层。
 
@@ -39,7 +39,7 @@ Hermes (run_agent.py)
 **文件位置：** `$HERMES_HOME/plugins/boshi/__init__.py`（仓库 `plugins/boshi/`）
 
 **实现接口：** Hermes 新版 `MemoryProvider` 抽象类（`agent/memory_provider.py`），
-**不需要 run_agent.py 补丁**（v6.2+ 的 Hermes 原生提供完整生命周期）。
+**不需要 run_agent.py 补丁**（v6.3+ 的 Hermes 原生提供完整生命周期）。
 
 **已实现的方法：**
 
