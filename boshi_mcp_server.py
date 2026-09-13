@@ -36,27 +36,44 @@ if BOSHI_HOME not in sys.path:
 from boshi_core import (
     search, save, delete, status, profile,
     graph_query, graph_add_node, graph_add_edge,
-    recent,
+    recent, time_range,
 )
 
 from mcp.server import MCPServer
 
 
 def create_server():
-    """创建 mcp 2.0 MCPServer，注册全部 8 个工具。"""
+    """创建 mcp 2.0 MCPServer，注册全部 9 个工具。"""
     server = MCPServer("boshi-memory", version="6.1.0")
 
     @server.tool(
         name="boshi_search",
-        description="搜索伯仕的记忆。支持多策略检索（语义向量+全文混合+知识图谱），找到最相关的记忆。",
+        description="搜索伯仕的记忆。支持多策略检索（语义向量+全文混合+知识图谱），找到最相关的记忆。可用 since/until 限定时间范围（Unix 时间戳）。默认排除知识图谱自动提边（占库85%的噪声），需要图谱联想时 include_graph=true。",
     )
     def boshi_search(
         query: str,
         top_k: int = 5,
         source: Literal["all", "vector", "hybrid", "graph"] = "all",
+        since: Optional[float] = None,
+        until: Optional[float] = None,
+        include_graph: bool = False,
     ) -> str:
-        """搜索记忆：query 搜索查询文本；top_k 返回条数默认5；source 检索策略 all=融合(hybrid+图谱), vector=语义, hybrid=语义+全文混合, graph=图谱"""
-        result = search(query=query, top_k=top_k, source=source)
+        """搜索记忆：query 搜索查询文本；top_k 返回条数默认5；source 检索策略 all=融合(hybrid+图谱), vector=语义, hybrid=语义+全文混合, graph=图谱；since/until 可选，Unix 时间戳秒，限定结果时间范围；include_graph 是否包含图谱自动提边（默认 false）"""
+        result = search(query=query, top_k=top_k, source=source,
+                        include_graph=include_graph)
+        # 时间过滤（Python 端，不依赖 ChromaDB where）
+        if since or until:
+            results = result.get("results", [])
+            filtered = []
+            for r in results:
+                ts = r.get("metadata", {}).get("_version_created", 0)
+                if since and ts < since:
+                    continue
+                if until and ts > until:
+                    continue
+                filtered.append(r)
+            result["results"] = filtered
+            result["total"] = len(filtered)
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     @server.tool(
@@ -133,6 +150,21 @@ def create_server():
     def boshi_recent(n: int = 10) -> str:
         """最近记忆：n 返回条数默认10"""
         result = recent(n=n)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    @server.tool(
+        name="boshi_time_range",
+        description="按时间范围查询伯仕的记忆（Unix 时间戳）。适合查'今天/昨天/本周做了什么'等时间线问题。默认排除知识图谱自动提边，需要时 include_graph=true。",
+    )
+    def boshi_time_range(
+        since: float,
+        until: Optional[float] = None,
+        top_k: int = 50,
+        include_graph: bool = False,
+    ) -> str:
+        """按时间范围查记忆：since 起始 Unix 时间戳（秒）必填；until 结束 Unix 时间戳（秒）可选，默认至今；top_k 返回条数默认50；include_graph 是否包含图谱自动提边（默认 false）。结果按写入时间降序。"""
+        result = time_range(since=since, until=until, top_k=top_k,
+                            include_graph=include_graph)
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     return server

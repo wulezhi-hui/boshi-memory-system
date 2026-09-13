@@ -53,7 +53,8 @@ def _get_kg():
 # 核心 API — MCP Server 和 CLI 的统一接口
 # ═══════════════════════════════════════════
 
-def search(query: str, top_k: int = 5, source: str = "all") -> dict:
+def search(query: str, top_k: int = 5, source: str = "all",
+           include_graph: bool = False) -> dict:
     """
     多策略检索记忆。
 
@@ -61,6 +62,9 @@ def search(query: str, top_k: int = 5, source: str = "all") -> dict:
         query:  查询文本
         top_k:  返回条数（默认5）
         source: "all"(三路融合) | "vector"(语义) | "hybrid"(混合) | "graph"(图谱)
+        include_graph: 是否把知识图谱自动提边（type=relation）计入召回。
+            默认 False —— 这类边占全库 85%，混入召回会挤占真记忆的名额
+            （实测技术类 query 噪声率 70%）。需要图谱联想时传 True。
 
     返回:
         {"query": str, "total": int, "results": [...], "sources": {...}}
@@ -68,14 +72,14 @@ def search(query: str, top_k: int = 5, source: str = "all") -> dict:
     cb = _get_chroma()
 
     if source == "vector":
-        results = cb.search_memory(query, top_k=top_k)
+        results = cb.search_memory(query, top_k=top_k, include_graph=include_graph)
         for r in results:
             r["score"] = round(1.0 - r.get("score", 0), 4)
             r["source"] = "vector"
         return {"query": query, "total": len(results), "results": results, "sources": {"vector": len(results)}}
 
     elif source == "hybrid":
-        result = cb.hybrid_search(query, top_k=top_k)
+        result = cb.hybrid_search(query, top_k=top_k, include_graph=include_graph)
         mems = result.get("memories", [])
         for r in mems:
             r["source"] = "hybrid"
@@ -93,7 +97,7 @@ def search(query: str, top_k: int = 5, source: str = "all") -> dict:
 
     else:
         # 三路融合：hybrid_search(语义+全文) + graph
-        hybrid = cb.hybrid_search(query, top_k=top_k)
+        hybrid = cb.hybrid_search(query, top_k=top_k, include_graph=include_graph)
         vector_results = hybrid.get("memories", [])
         for r in vector_results:
             # ChromaDB 返回的是距离（越小越相似），转为相似度（越大越好）
@@ -274,6 +278,25 @@ def recent(n: int = 10) -> list:
     """获取最近 n 条记忆。"""
     cb = _get_chroma()
     return cb.get_recent(n)
+
+
+def time_range(since: float, until: float = None, top_k: int = 50,
+               include_graph: bool = False) -> list:
+    """
+    按时间范围查询记忆。
+
+    参数:
+        since:  起始时间（Unix 时间戳秒）
+        until:  结束时间（Unix 时间戳秒，默认 None = 至今）
+        top_k:  最多返回条数
+        include_graph: 是否包含知识图谱自动提边（type=relation，默认 False）
+
+    返回:
+        [{"id": str, "content": str, "metadata": dict}, ...]
+    """
+    cb = _get_chroma()
+    return cb.get_time_range(since=since, until=until, top_k=top_k,
+                             include_graph=include_graph)
 
 
 # ═══════════════════════════════════════════

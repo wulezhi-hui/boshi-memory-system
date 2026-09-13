@@ -32,3 +32,5 @@ workstation/data/
 # 本地模型文件（大文件不入库）
 models/
 fastembed_data/
+# 本地快照（不入库）
+memory-snapshots/

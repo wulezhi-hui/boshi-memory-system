@@ -46,12 +46,28 @@
 - 新增 session_sources.py 多 Agent 会话源路由
 - 安全清理：移除泄露凭据，.gitignore 排除运行时数据
 
-### v6.4 — 跨话题联想召回版（2026-09-05）← 当前
+### v6.5 — 图谱边隔离版（2026-09-13）← 当前
+- **问题**：技术类 query 召回被图谱噪声淹没——L2 全库 12020 条中 `type=relation` 的图谱自动提边占 10260 条（85.4%），真记忆仅约 11%；实测 30 条召回 21 条噪声（70%）
+- **根因**：图谱自动提边（`source=auto_extract`）与真记忆混在同一 ChromaDB collection、参与同一套语义检索；搜索排序按相似度取 top_k，边占比压倒性 → 真记忆名额被挤掉
+- **方案**：数据层默认隔离——`chroma_bridge` 新增 `_apply_graph_exclusion()`（默认加 `type != relation`）+ `_where_has_type()`（图谱模块自带 type 条件时白名单放行）；`include_graph` 开关从 `boshi_core.search/time_range` 透传到 MCP 工具；退化路径 Python 端过滤改用新写的 `_where_matches()`（支持 `$ne/$gte/$lte/$and`）
+- **效果**：噪声率 70% → **0%**；`include_graph=True` 保留图谱召回能力；图谱模块（`get_relations`/`get_all_relations`/`kg.search`）未误伤；CLI/桥接/插件/MCP 四入口全通；数据完整性无损
+- **影响面**：一处改动全链路生效（Hermes 插件 + dsh 桥接 + MCP + CLI）
+- **文件**：`chroma_bridge.py`、`boshi_core.py`、`boshi_mcp_server.py`；文档 `docs/伯仕记忆系统v6.5_技术架构文档.md`
+- **遗留**：图谱边仍占 85% 存储（本次只做检索隔离）；`get_recent()` 未同步过滤
+
+### v6.4 — 跨话题联想召回版（2026-09-05）
 - **问题**：跨话题时记忆召回失效——"微调"搜不到"2080Ti推理框架配置"
 - **根因**：查询词=当前消息无联想；知识图谱只匹配静态KNOWN_ENTITIES列表
 - **方案**：`_expand_query_search()`从主查询结果提取实体名（正则：大写缩写、数字+字母、驼峰），扩展二次查询（最多3次）
 - **依赖修复**：install.py新增`install_hermes_deps()`，首次安装时同步安装到Hermes venv
 - **文件**：`plugins/boshi/__init__.py` 第307-375行
+
+### 运维记录 — opentelemetry 版本撕裂（2026-09-13）
+- **事件**：Hermes 主 venv 下 `import chroma_bridge` 报 `ModuleNotFoundError: opentelemetry..._exporter_metrics`，boshi 向量召回静默失效
+- **根因**：09-09 装 chromadb 1.5.9 时自动拉入 opentelemetry 全家桶 7 包；`exporter-otlp-proto-grpc` 被单独升到 1.44.0、`sdk` 等 6 包停在 1.39.1 → 版本撕裂（"装 A 带出一串 B"依赖地雷）
+- **修复**：grpc-exporter 降回 1.39.1 全套收敛 + `hermes gateway restart`（新 PID 12000）
+- **巡检**：`upgrading-hermes-checklist.md` 已加"opentelemetry 版本一致性巡检"节（pip list 核对 7 包同版本 + import 实测）
+- **待办**：中期把伯仕数据层隔离进 `~/.boshi/venv`，与 Hermes 主 venv 解耦（见下方待办项）
 
 ### v6.3 — prefetch缓存TTL修复版（2026-09-02）
 - **问题**：Hermes v0.20.6升级后`_EXTERNAL_PREFETCH_TIMEOUT_S=8.0`，伯仕搜索常超8秒被静默跳过
@@ -96,6 +112,7 @@
 
 - [ ] ComfyUI + SD 图像生成（2080Ti 到货后）
 - [ ] 独立向量知识库（古籍/佛经检索）
+- [ ] **伯仕数据层 venv 隔离**（2026-09-13 立）：把 chroma_bridge/chromadb 数据层隔离进 `~/.boshi/venv`，与 Hermes 主 venv 解耦，消除"装 chromadb 拖累 Hermes 依赖树 / opentelemetry 撕裂"的复发风险。根治 09-13 那次 opentelemetry 版本撕裂的中期方案
 - [ ] UE5 虚拟寺院 学习（02:00 空闲时段）
 - [ ] 结构图可视化
 - [ ] **🧬 伯仕分身计划** ← 2026-05-21 灵感

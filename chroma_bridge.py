@@ -142,8 +142,81 @@ def add_memories_batch(entries: list):
     return {"added": added, "failed": failed, "errors": errors}
 
 
+def _where_has_type(where: dict) -> bool:
+    """调用方是否显式指定了 type 过滤条件（图谱模块查 relation 时用）"""
+    if not isinstance(where, dict):
+        return False
+    if "type" in where:
+        return True
+    for c in (where.get("$and") or []):
+        if isinstance(c, dict) and "type" in c:
+            return True
+    return False
+
+
+def _apply_graph_exclusion(where: dict, include_graph: bool) -> dict:
+    """默认隔离知识图谱自动提边（type=relation）。
+
+    全库 85% 是 auto_extract 生成的 `A --[derives]--> B` 边，它们混在同一
+    collection 参与语义检索，会挤占召回名额——实测技术类 query（"qwen3.5
+    微调"、"MiniMax H3 视频"）召回 5 条里 5 条是噪声，合计噪声率 70%。
+
+    默认排除；两种情况放行：
+      1. 显式 include_graph=True
+      2. 调用方自带 type 条件（图谱模块自身按 relation 检索，不能被误伤）
+
+    返回新 dict，不修改调用方传入的 where。
+    """
+    where = dict(where) if where else None
+    if where and "$and" in where:
+        # 浅拷贝会把 $and 列表共享给调用方，后续 append 会污染原对象 → 显式复制
+        where = {"$and": [dict(c) for c in where["$and"]]}
+    if include_graph or (where and _where_has_type(where)):
+        return where
+    cond = {"type": {"$ne": "relation"}}
+    if not where:
+        return cond
+    if "$and" in where:
+        return {"$and": [dict(c) for c in where["$and"]] + [cond]}
+    return {"$and": [where, cond]}
+
+
+def _cond_matches(meta: dict, cond: dict) -> bool:
+    """评估单条 metadata 过滤条件（支持 {k: v} 与 {k: {"$ne"/"$gte"/"$lte": v}}）"""
+    if not isinstance(cond, dict):
+        return True
+    for key, expected in cond.items():
+        actual = meta.get(key)
+        if isinstance(expected, dict):
+            if "$ne" in expected:
+                if actual == expected["$ne"]:
+                    return False
+            elif "$gte" in expected or "$lte" in expected:
+                try:
+                    val = float(actual)
+                except (TypeError, ValueError):
+                    return False
+                if "$gte" in expected and not val >= float(expected["$gte"]):
+                    return False
+                if "$lte" in expected and not val <= float(expected["$lte"]):
+                    return False
+        else:
+            if actual != expected:
+                return False
+    return True
+
+
+def _where_matches(meta: dict, where: dict) -> bool:
+    """where 条件匹配（含 $and）；供退化路径的 Python 端过滤使用"""
+    if not where:
+        return True
+    if "$and" in where:
+        return all(_cond_matches(meta, c) for c in where["$and"])
+    return _cond_matches(meta, where)
+
+
 def search_memory(query: str, top_k: int = 5, where: dict = None,
-                  all_versions: bool = False):
+                  all_versions: bool = False, include_graph: bool = False):
     """
     语义搜索记忆。
     参数：
@@ -151,6 +224,9 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
         top_k: 返回条数（默认5，最多20）
         where: 可选的 metadata 过滤条件，如 {"type": "project_registry"}
         all_versions: 是否返回历史版本（默认 false，只返回 isLatest=true）
+        include_graph: 是否包含知识图谱自动提边（type=relation）。
+            默认 False——图谱边占全库 85%，不排除会挤占召回名额。
+            显式传 True 或自带 type 条件时放行。
     返回：
         [{"id": str, "content": str, "metadata": dict, "score": float}, ...]
         按相似度降序排列
@@ -161,6 +237,9 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
 
     if col.count() == 0:
         return []
+
+    # 图谱边隔离（默认排除 type=relation，见 _apply_graph_exclusion）
+    where = _apply_graph_exclusion(where, include_graph)
 
     # 版本链过滤：默认只返回当前有效版本
     if not all_versions:
@@ -197,21 +276,9 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
                 # 版本过滤
                 if not all_versions and meta.get("isLatest") is False:
                     continue
-                # 原始 where 条件过滤（简化为 type 匹配）
-                if where and isinstance(where, dict):
-                    # 直接匹配: {"type": "xxx"}
-                    if "type" in where and not isinstance(where["type"], dict):
-                        if meta.get("type") != where["type"]:
-                            continue
-                    # $and 条件
-                    if "$and" in where:
-                        skip = False
-                        for cond in where["$and"]:
-                            if "type" in cond and meta.get("type") != cond["type"]:
-                                skip = True
-                                break
-                        if skip:
-                            continue
+                # 原始 where 条件过滤（统一走 _where_matches，支持 $ne/$gte/$lte/$and）
+                if not _where_matches(meta, where):
+                    continue
                 filtered_ids.append(results["ids"][0][i])
                 filtered_docs.append(docs_list[0][i] if docs_list and docs_list[0] else "")
                 filtered_metas.append(meta)
@@ -241,7 +308,8 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
 
 
 def hybrid_search(query: str, top_k: int = 5, where: dict = None,
-                  all_versions: bool = False, search_sessions: bool = True):
+                  all_versions: bool = False, search_sessions: bool = True,
+                  include_graph: bool = False):
     """
     混合搜索（Supermemory 借鉴）：语义向量 + 全文会话 合一。
     参数：
@@ -250,6 +318,7 @@ def hybrid_search(query: str, top_k: int = 5, where: dict = None,
         where: 可选的 metadata 过滤条件
         all_versions: 是否返回历史版本
         search_sessions: 是否同时搜索 state.db 会话记录
+        include_graph: 是否包含知识图谱自动提边（透传给 search_memory，默认 False）
     返回：
         {
             "memories": [{id, content, metadata, score}, ...],
@@ -259,7 +328,8 @@ def hybrid_search(query: str, top_k: int = 5, where: dict = None,
     """
     # 1. 语义搜索（主路径）
     memories = search_memory(query, top_k=top_k, where=where,
-                             all_versions=all_versions)
+                             all_versions=all_versions,
+                             include_graph=include_graph)
 
     result = {
         "memories": memories,
@@ -344,6 +414,73 @@ def hybrid_search(query: str, top_k: int = 5, where: dict = None,
             pass
 
     return result
+
+
+def get_time_range(since: float, until: float = None, top_k: int = 50,
+                   include_graph: bool = False) -> list:
+    """
+    按时间范围查询记忆。
+    参数：
+        since:  起始时间（Unix 时间戳秒，必填）
+        until:  结束时间（Unix 时间戳秒，默认 None = 至今）
+        top_k:  最多返回条数（默认50）
+        include_graph: 是否包含知识图谱自动提边（type=relation，默认 False）
+    返回：
+        [{"id": str, "content": str, "metadata": dict}, ...]
+        按 _version_created 降序排列
+    """
+    client = _get_client()
+    ef = _get_embedding_function()
+    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
+
+    if col.count() == 0:
+        return []
+
+    # 构建 where 条件：基于 _version_created（每条记忆写入时自动记录的 Unix 时间戳）
+    if until:
+        where = {"_version_created": {"$gte": since, "$lte": until}}
+    else:
+        where = {"_version_created": {"$gte": since}}
+
+    # 图谱边隔离：默认排除 type=relation（否则"今天干了啥"返回的
+    # 大半是 auto_extract 的 A --[derives]--> B，实测近24h 首屏全是噪声）
+    where = _apply_graph_exclusion(where, include_graph)
+
+    # 先尝试 ChromaDB 原生 where 过滤，失败则退化到全量 + Python 过滤
+    try:
+        results = col.get(where=where, limit=top_k * 3)
+        raw_ids = results["ids"]
+        raw_docs = results.get("documents") or []
+        raw_metas = results.get("metadatas") or []
+    except Exception:
+        # 退化：全量获取后在 Python 端过滤（兼容旧数据/损坏 metadata）
+        all_results = col.get()
+        raw_ids = all_results["ids"]
+        raw_docs = all_results.get("documents") or []
+        raw_metas = all_results.get("metadatas") or []
+        # Python 端过滤（统一走 _where_matches，支持 $ne/$gte/$lte/$and）
+        filtered = []
+        for i in range(len(raw_ids)):
+            meta = raw_metas[i] if i < len(raw_metas) and raw_metas[i] else {}
+            if _where_matches(meta, where):
+                filtered.append(i)
+        raw_ids = [raw_ids[i] for i in filtered]
+        raw_docs = [raw_docs[i] for i in filtered if i < len(raw_docs)]
+        raw_metas = [raw_metas[i] for i in filtered if i < len(raw_metas)]
+
+    # 组装输出
+    output = []
+    for i in range(len(raw_ids)):
+        doc = raw_docs[i] if i < len(raw_docs) and raw_docs[i] else ""
+        meta = raw_metas[i] if i < len(raw_metas) and raw_metas[i] else {}
+        output.append({
+            "id": raw_ids[i],
+            "content": doc,
+            "metadata": meta,
+        })
+    # 按 _version_created 降序
+    output.sort(key=lambda x: x.get("metadata", {}).get("_version_created", 0), reverse=True)
+    return output[:top_k]
 
 
 def get_recent(n: int = 10):
