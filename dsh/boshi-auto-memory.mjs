@@ -52,12 +52,6 @@ export default {
       return false
     }
 
-    function isGraphNoise(s) {
-      // 图谱边形态：实体A --[关系]--> 实体B（双连字符+方括号+双连字符+箭头）
-      // 精确匹配，不误伤 [2026-07-04]、[Intro]、[Verse] 等方括号开头的正常记忆
-      return typeof s === 'string' && s.includes('--[') && s.includes('-->')
-    }
-
     // 来源黑名单：排除图谱自动提取的边碎片，其它来源全部放行
     // 比白名单安全——新来源不会被误杀
     function isGraphFragment(meta) {
@@ -104,11 +98,11 @@ export default {
     function formatProfile(json) {
       if (!json || json.error || typeof json.total_memories !== 'number') return ''
       let text = '记忆库 ' + json.total_memories + ' 条'
-      if (json.hot_topic && !isGraphNoise(json.hot_topic)) text += '；热区「' + json.hot_topic + '」'
+      if (json.hot_topic) text += '；热区「' + json.hot_topic + '」'
       const recent = json.recent_memories || []
       const items = []
       for (const m of recent) {
-        if (m && m.content && !isGraphNoise(m.content)) items.push(String(m.content).slice(0, 80))
+        if (m && m.content && !isGraphFragment(m.metadata)) items.push(String(m.content).slice(0, 80))
       }
       if (items.length > 0) text += '\n近期：' + items.map((x) => '\n- ' + x).join('')
       return text
@@ -118,25 +112,29 @@ export default {
       if (!json || json.error) return ''
       const results = json.results || []
       if (results.length === 0) return ''
-      // 过滤：排除图谱噪声 + 排除图谱边碎片
+      // 过滤：排除图谱边碎片（按元数据判定，不碰正文）
       const items = []
       for (const r of results) {
-        if (!r || !r.content || isGraphNoise(r.content)) continue
+        if (!r || !r.content) continue
         if (isGraphFragment(r.metadata)) continue
         items.push(String(r.content).slice(0, 120))
       }
-      return items.length > 0 ? '与当前话题相关的历史记忆：' + items.map((x) => '\n- ' + x).join('') : ''
+      // 截断到 5 条，避免注入量撑大提示词（搜 15 条 → 展示 5 条）
+      const shown = items.slice(0, 5)
+      return shown.length > 0 ? '与当前话题相关的历史记忆：' + shown.map((x) => '\n- ' + x).join('') : ''
     }
 
     function formatTimeRange(json) {
       if (!json || json.error || !Array.isArray(json)) return ''
       const items = []
       for (const r of json) {
-        if (!r || !r.content || isGraphNoise(r.content)) continue
+        if (!r || !r.content) continue
         if (isGraphFragment(r.metadata)) continue
         items.push(String(r.content).slice(0, 150))
       }
-      return items.length > 0 ? '时间线记忆（按写入时间降序）：' + items.map((x) => '\n- ' + x).join('') : ''
+      // 截断到 10 条（时间线查询返回最多 50 条，展示 10 条足够）
+      const shown = items.slice(0, 10)
+      return shown.length > 0 ? '时间线记忆（按写入时间降序）：' + shown.map((x) => '\n- ' + x).join('') : ''
     }
 
     function refreshProfile() {
@@ -217,19 +215,16 @@ export default {
       // 检测时间窗口：如果有，走 time_range 查询；否则走 search
       const tw = detectTimeWindow(text)
       if (tw) {
-        // 时间线查询：since, until（Unix 秒），top_k=50
-        // DSH 插件通过 subprocess 调 Python bridge：
-        //   python boshi_bridge.py time_range <since> [until] [top_k]
-        // until 可选：不传 = 不限止时间（至今）
-        // 注意：PowerShell 下空字符串参数会被丢弃，所以 until 为空时不传该参数
+        // 时间线查询（bridge 显式标志位，无歧义）：
+        //   time_range <since> [--until=<ts>] [--top-k=<n>]
         const bridgeArgs = ['time_range', String(tw[0])]
-        if (tw[1]) bridgeArgs.push(String(tw[1]))
-        bridgeArgs.push('50')
+        if (tw[1]) bridgeArgs.push('--until=' + tw[1])
+        bridgeArgs.push('--top-k=50')
         callBridge(bridgeArgs, (json) => {
           if (json) recallText = formatTimeRange(json)
         })
       } else {
-        // 语义搜索：搜 15 条再截断到 3 条（Hermes 的 top_k=5+FTS 模式）
+        // 语义搜索：搜 15 条，formatRecall 过滤 + 截断到 5 条展示
         callBridge(['search', content, '15'], (json) => {
           if (json) recallText = formatRecall(json)
         })
@@ -257,14 +252,14 @@ export default {
       text: () => `## 伯仕记忆使用规则
 - 问"今天/刚才/上午/下午/昨天/本周/本月干了啥" → 用 mcp__boshi__boshi_time_range(since, until, top_k) 查时间线
   - since/until 是 Unix 时间戳（秒）
-  - 结果中 source=auto_extract 的是图谱边碎片，忽略
-  - 重点看 source=conversation/assistant_conclusion/hermes_plugin/boshi_api 的条目
+  - 结果中 metadata.type=relation 或 metadata.source=auto_extract 的是图谱边碎片，跳过
+  - 重点看 topic 为 conversation / assistant_conclusion 的条目（source 通常是 hermes_plugin / boshi_api / state_db_import_milestone）
 - 问"XX相关的记忆/经验/之前怎么做的" → 用 mcp__boshi__boshi_search(query) 查语义
-  - 结果中 source=auto_extract 的是图谱边碎片，忽略
-  - 重点看 source=conversation/assistant_conclusion 的条目
+  - 结果中 metadata.type=relation 或 metadata.source=auto_extract 的是图谱边碎片，跳过
+  - 重点看 topic 为 conversation / assistant_conclusion 的条目
 - 问"最近的记忆" → 用 mcp__boshi__boshi_recent(n)
 - 记忆库里 85% 是知识图谱自动提取的边（type=relation），真正的对话记忆只占 11%
-  自动召回已过滤噪声，但如果手动查 boshi_time_range 返回结果里仍有 auto_extract 碎片，跳过它们`,
+  自动召回已按元数据过滤噪声，但手动查 boshi_time_range / boshi_search 返回结果里若仍有 auto_extract 碎片，跳过它们`,
     }))
 
     // 5) 会话开始时刷新画像

@@ -62,34 +62,33 @@ def main():
             _out({"error": str(e)})
 
     elif cmd == "time_range":
+        # 调法（显式标志位，无歧义）：
+        #   time_range <since> [--until=<ts>] [--top-k=<n>]
+        # since 位置参数必填；until / top_k 用 --key=value 或 --key value
         if len(sys.argv) < 3:
             _out({"error": "time_range needs since"})
             return
         since = float(sys.argv[2])
-        # 位置参数（均可选）：
-        #   argv[3] = until 或 top_k（根据大小判断）
-        #   argv[4] = top_k
-        # DSH 插件调法：
-        #   time_range <since> <top_k>        → 3 个值，argv[3] 是小整数=top_k
-        #   time_range <since> <until> <top_k> → 4 个值，argv[3] 是大数=until
-        # 判断标准：Unix 时间戳远大于 1000（1970年1月15日 = 1209600），
-        # top_k 最大合理值 < 1000
         until = None
         top_k = 50
-        if len(sys.argv) > 3:
-            arg3 = sys.argv[3].strip()
-            if arg3:
-                val3 = float(arg3)
-                if val3 < 1000:
-                    # 小整数 → 这是 top_k，不是 until
-                    top_k = int(val3)
-                else:
-                    # 大数 → 这是 until
-                    until = val3
-        if len(sys.argv) > 4:
-            arg4 = sys.argv[4].strip()
-            if arg4:
-                top_k = int(arg4)
+        rest = sys.argv[3:]
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a.startswith("--until="):
+                until = float(a.split("=", 1)[1])
+            elif a.startswith("--top-k="):
+                top_k = int(float(a.split("=", 1)[1]))
+            elif a == "--until" and i + 1 < len(rest):
+                i += 1
+                until = float(rest[i])
+            elif a == "--top-k" and i + 1 < len(rest):
+                i += 1
+                top_k = int(float(rest[i]))
+            else:
+                _out({"error": f"unknown argument: {a} (use --until=<ts> / --top-k=<n>)"})
+                return
+            i += 1
         try:
             _out(time_range(since=since, until=until, top_k=top_k))
         except Exception as e:
