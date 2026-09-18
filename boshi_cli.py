@@ -122,12 +122,14 @@ def _fmt_recent(results: list):
 # ═══════════════════════════════════════════
 
 def cmd_search(args):
-    result = search(query=args.query, top_k=args.top_k, source=args.source)
+    result = search(query=args.query, top_k=args.top_k, source=args.source,
+                    scope=getattr(args, "scope", None))
     _fmt_search(result)
 
 
 def cmd_save(args):
-    result = save(content=args.content, topic=args.topic)
+    result = save(content=args.content, topic=args.topic,
+                  profile=getattr(args, "profile", None))
     if result.get("success"):
         print(f"✅ 已保存 (ID: {result['memory_id']})")
         print(f"   {result['content_preview']}")
@@ -194,12 +196,15 @@ def main():
     p_search.add_argument("query", help="搜索查询文本")
     p_search.add_argument("--top-k", type=int, default=5, help="返回条数")
     p_search.add_argument("--source", choices=["all", "vector", "hybrid", "graph"], default="all", help="检索策略")
+    p_search.add_argument("--scope", choices=["self", "all"], default=None,
+                          help="记忆归属范围：self=只读本 profile（默认，见 ~/.boshi/profiles.json）；all=全库")
     p_search.set_defaults(func=cmd_search)
 
     # save
     p_save = subparsers.add_parser("save", help="存入记忆")
     p_save.add_argument("content", help="记忆内容")
     p_save.add_argument("--topic", default="external", help="主题标签")
+    p_save.add_argument("--profile", default=None, help="记忆归属标识（默认按当前 HERMES_HOME 推导）")
     p_save.set_defaults(func=cmd_save)
 
     # delete

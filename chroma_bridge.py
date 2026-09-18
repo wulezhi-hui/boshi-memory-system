@@ -5,6 +5,7 @@ ChromaDB 记忆模块 — 伯仕记忆系统 v6.0
 """
 
 import os
+import json
 import uuid
 import time as _time
 from datetime import datetime as _datetime
@@ -90,6 +91,11 @@ def add_memory(content: str, metadata: dict = None, memory_id: str = None):
     meta = _normalize_metadata(metadata or {})
     if "isLatest" not in meta:
         meta["isLatest"] = True
+
+    # 记忆归属打标：图谱边（type=relation）保持无标识 = 全局知识网络，
+    # 其余按当前进程 profile 打标（除非调用方已显式指定）
+    if meta.get("type") != "relation":
+        meta.setdefault("profile", resolve_profile())
 
     # 记录版本时间
     import time as _time_module
@@ -181,10 +187,90 @@ def _apply_graph_exclusion(where: dict, include_graph: bool) -> dict:
     return {"$and": [where, cond]}
 
 
+# ══════════════════════════════════════════════════════
+# 记忆归属（profile 标识）：写入打标 + 检索按 scope 过滤
+# ══════════════════════════════════════════════════════
+
+PROFILE_CONFIG_PATH = os.path.expanduser("~/.boshi/profiles.json")
+DEFAULT_PROFILE = "default"
+
+
+def resolve_profile() -> str:
+    """当前进程的记忆归属标识：BOSHI_PROFILE > HERMES_HOME 推导 > default。
+
+    HERMES_HOME 形如 ``.../hermes/profiles/<name>`` → ``<name>``；
+    形如 ``.../hermes``（default profile 的 home）→ ``default``。
+    """
+    env = (os.environ.get("BOSHI_PROFILE") or "").strip()
+    if env:
+        return env
+    home = (os.environ.get("HERMES_HOME") or "").strip()
+    if home:
+        try:
+            norm = home.rstrip("\\/").replace("\\", "/")
+            name = norm.rsplit("/", 1)[-1]
+            parent = norm.rsplit("/", 2)[-2] if "/" in norm else ""
+            if parent == "profiles" and name:
+                return name
+        except Exception:
+            pass
+    return DEFAULT_PROFILE
+
+
+def load_profile_config() -> dict:
+    """读取 ``~/.boshi/profiles.json``（per-profile 设置，当前支持 scope）。"""
+    try:
+        if os.path.exists(PROFILE_CONFIG_PATH):
+            with open(PROFILE_CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def default_scope(profile: str = None) -> str:
+    """该 profile 的默认检索范围：``self``（只读自己的）或 ``all``（全库）。
+
+    由 ``~/.boshi/profiles.json`` 的 ``{"<profile>": {"scope": "all"}}`` 配置；
+    未配置时默认 ``self``。
+    """
+    prof = profile or resolve_profile()
+    cfg = load_profile_config().get(prof) or {}
+    scope = str(cfg.get("scope") or "").strip().lower()
+    return scope if scope in ("self", "all") else "self"
+
+
+def _apply_profile_scope(where: dict, scope: str, me: str) -> dict:
+    """按记忆归属过滤：``scope=self`` 只保留本 profile 的记忆。
+
+    - ``scope=all`` / ``"*"``：不加过滤（全库检索，含其他 profile 与外部 agent）
+    - 图谱边（``type=relation``）保持**全局可见**：它们是跨领域知识网络，
+      不跟随写入方隔离（否则 include_graph=True 会失效）
+    - 调用方自带 ``profile`` 条件时尊重调用方，不叠加
+    - 返回新 dict，不修改调用方传入的 where
+    """
+    if not scope or str(scope).strip().lower() in ("all", "*"):
+        return where
+    where = dict(where) if where else None
+    if where and "$and" in where:
+        where = {"$and": [dict(c) for c in where["$and"]]}
+    if where and "profile" in where:
+        return where
+    cond = {"$or": [{"profile": me}, {"type": "relation"}]}
+    if not where:
+        return cond
+    if "$and" in where:
+        return {"$and": [dict(c) for c in where["$and"]] + [cond]}
+    return {"$and": [where, cond]}
+
+
 def _cond_matches(meta: dict, cond: dict) -> bool:
-    """评估单条 metadata 过滤条件（支持 {k: v} 与 {k: {"$ne"/"$gte"/"$lte": v}}）"""
+    """评估单条 metadata 过滤条件（支持 {k: v}、$ne/$gte/$lte、$or）"""
     if not isinstance(cond, dict):
         return True
+    if "$or" in cond:
+        return any(_cond_matches(meta, c) for c in (cond["$or"] or []))
     for key, expected in cond.items():
         actual = meta.get(key)
         if isinstance(expected, dict):
@@ -216,7 +302,8 @@ def _where_matches(meta: dict, where: dict) -> bool:
 
 
 def search_memory(query: str, top_k: int = 5, where: dict = None,
-                  all_versions: bool = False, include_graph: bool = False):
+                  all_versions: bool = False, include_graph: bool = False,
+                  scope: str = None, me: str = None):
     """
     语义搜索记忆。
     参数：
@@ -227,6 +314,10 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
         include_graph: 是否包含知识图谱自动提边（type=relation）。
             默认 False——图谱边占全库 85%，不排除会挤占召回名额。
             显式传 True 或自带 type 条件时放行。
+        scope: 记忆归属范围。"self"（默认，只读本 profile 的记忆）｜
+            "all"（全库，含其他 profile 与外部 agent 的记忆）。
+            默认值取自 ~/.boshi/profiles.json 的 per-profile 配置。
+        me: 当前归属标识（默认由 resolve_profile() 解析）
     返回：
         [{"id": str, "content": str, "metadata": dict, "score": float}, ...]
         按相似度降序排列
@@ -238,8 +329,13 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
     if col.count() == 0:
         return []
 
+    _me = me or resolve_profile()
+    _scope = scope if scope is not None else default_scope(_me)
+
     # 图谱边隔离（默认排除 type=relation，见 _apply_graph_exclusion）
     where = _apply_graph_exclusion(where, include_graph)
+    # 记忆归属过滤（默认只读自己的，见 _apply_profile_scope）
+    where = _apply_profile_scope(where, _scope, _me)
 
     # 版本链过滤：默认只返回当前有效版本
     if not all_versions:
@@ -309,7 +405,7 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
 
 def hybrid_search(query: str, top_k: int = 5, where: dict = None,
                   all_versions: bool = False, search_sessions: bool = True,
-                  include_graph: bool = False):
+                  include_graph: bool = False, scope: str = None, me: str = None):
     """
     混合搜索（Supermemory 借鉴）：语义向量 + 全文会话 合一。
     参数：
@@ -319,6 +415,8 @@ def hybrid_search(query: str, top_k: int = 5, where: dict = None,
         all_versions: 是否返回历史版本
         search_sessions: 是否同时搜索 state.db 会话记录
         include_graph: 是否包含知识图谱自动提边（透传给 search_memory，默认 False）
+        scope: 记忆归属范围 self/all（透传给 search_memory，默认取 profiles.json）
+        me: 当前归属标识（默认 resolve_profile()）
     返回：
         {
             "memories": [{id, content, metadata, score}, ...],
@@ -329,7 +427,8 @@ def hybrid_search(query: str, top_k: int = 5, where: dict = None,
     # 1. 语义搜索（主路径）
     memories = search_memory(query, top_k=top_k, where=where,
                              all_versions=all_versions,
-                             include_graph=include_graph)
+                             include_graph=include_graph,
+                             scope=scope, me=me)
 
     result = {
         "memories": memories,
@@ -417,7 +516,8 @@ def hybrid_search(query: str, top_k: int = 5, where: dict = None,
 
 
 def get_time_range(since: float, until: float = None, top_k: int = 50,
-                   include_graph: bool = False) -> list:
+                   include_graph: bool = False, scope: str = None,
+                   me: str = None) -> list:
     """
     按时间范围查询记忆。
     参数：
@@ -425,6 +525,8 @@ def get_time_range(since: float, until: float = None, top_k: int = 50,
         until:  结束时间（Unix 时间戳秒，默认 None = 至今）
         top_k:  最多返回条数（默认50）
         include_graph: 是否包含知识图谱自动提边（type=relation，默认 False）
+        scope: 记忆归属范围 self/all（默认取 profiles.json 配置）
+        me: 当前归属标识（默认 resolve_profile()）
     返回：
         [{"id": str, "content": str, "metadata": dict}, ...]
         按 _version_created 降序排列
@@ -445,6 +547,9 @@ def get_time_range(since: float, until: float = None, top_k: int = 50,
     # 图谱边隔离：默认排除 type=relation（否则"今天干了啥"返回的
     # 大半是 auto_extract 的 A --[derives]--> B，实测近24h 首屏全是噪声）
     where = _apply_graph_exclusion(where, include_graph)
+    # 记忆归属过滤（默认只读自己的）
+    where = _apply_profile_scope(where, scope if scope is not None else default_scope(me),
+                                me or resolve_profile())
 
     # 先尝试 ChromaDB 原生 where 过滤，失败则退化到全量 + Python 过滤
     try:
@@ -483,11 +588,20 @@ def get_time_range(since: float, until: float = None, top_k: int = 50,
     return output[:top_k]
 
 
-def get_recent(n: int = 10):
+def get_recent(n: int = 10, scope: str = None, me: str = None,
+               include_graph: bool = False):
     """
     获取最近的 n 条记忆。
+    参数：
+        n: 返回条数
+        scope: 记忆归属范围 self/all（默认取 profiles.json 配置）
+        me: 当前归属标识（默认 resolve_profile()）
+        include_graph: 是否包含知识图谱自动提边（默认 False）
     返回：
         [{"id": str, "content": str, "metadata": dict}, ...]
+
+    已知限制：底层是 col.get(limit=n)，按 ChromaDB 内部顺序取，**不是**按时间倒序
+    （历史遗留行为，本次只叠加归属/噪声过滤，未改排序语义）。
     """
     client = _get_client()
     ef = _get_embedding_function()
@@ -496,7 +610,25 @@ def get_recent(n: int = 10):
     if col.count() == 0:
         return []
 
-    results = col.get(limit=n)
+    _me = me or resolve_profile()
+    _scope = scope if scope is not None else default_scope(_me)
+    where = _apply_graph_exclusion(None, include_graph)
+    where = _apply_profile_scope(where, _scope, _me)
+    try:
+        results = col.get(limit=n, where=where)
+    except Exception:
+        # 退化：全量 get + Python 端过滤
+        allr = col.get()
+        ids_all = allr.get("ids") or []
+        docs_all = allr.get("documents") or []
+        metas_all = allr.get("metadatas") or []
+        keep = [i for i in range(len(ids_all))
+                if _where_matches(metas_all[i] if i < len(metas_all) and metas_all[i] else {}, where)]
+        results = {
+            "ids": [ids_all[i] for i in keep][:n],
+            "documents": [docs_all[i] for i in keep if i < len(docs_all)][:n],
+            "metadatas": [metas_all[i] for i in keep if i < len(metas_all)][:n],
+        }
     output = []
     if results["ids"]:
         for i in range(len(results["ids"])):
@@ -598,6 +730,19 @@ def update_memory(memory_id: str, new_content: str, new_metadata: dict = None) -
     meta["_version_created"] = _time.time()
     if ok:
         meta["_parent_id"] = memory_id
+
+    # 继承旧版本的归属标识（避免版本链把 profile 改写成当前进程的）
+    if "profile" not in meta:
+        try:
+            _client = _get_client()
+            _ef = _get_embedding_function()
+            _col = _client.get_or_create_collection(COLLECTION_NAME, embedding_function=_ef)
+            _old = _col.get(ids=[memory_id], include=["metadatas"])
+            _old_meta = (_old.get("metadatas") or [{}])[0] or {}
+            if _old_meta.get("profile"):
+                meta["profile"] = _old_meta["profile"]
+        except Exception:
+            pass
 
     add_memory(
         content=new_content,

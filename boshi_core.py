@@ -54,7 +54,8 @@ def _get_kg():
 # ═══════════════════════════════════════════
 
 def search(query: str, top_k: int = 5, source: str = "all",
-           include_graph: bool = False) -> dict:
+           include_graph: bool = False, scope: str = None,
+           me: str = None) -> dict:
     """
     多策略检索记忆。
 
@@ -65,6 +66,10 @@ def search(query: str, top_k: int = 5, source: str = "all",
         include_graph: 是否把知识图谱自动提边（type=relation）计入召回。
             默认 False —— 这类边占全库 85%，混入召回会挤占真记忆的名额
             （实测技术类 query 噪声率 70%）。需要图谱联想时传 True。
+        scope:  记忆归属范围。"self" 只读本 profile/agent 的记忆（默认，取自
+            ~/.boshi/profiles.json）；"all" 读全库（含其他 profile 与外部 agent）。
+        me:     调用方归属标识（如 "opencode"/"dsh"/"dashi"）。显式传入可避免
+            依赖进程环境变量，供多客户端共用同一 MCP 进程时使用。
 
     返回:
         {"query": str, "total": int, "results": [...], "sources": {...}}
@@ -72,14 +77,16 @@ def search(query: str, top_k: int = 5, source: str = "all",
     cb = _get_chroma()
 
     if source == "vector":
-        results = cb.search_memory(query, top_k=top_k, include_graph=include_graph)
+        results = cb.search_memory(query, top_k=top_k, include_graph=include_graph,
+                                   scope=scope, me=me)
         for r in results:
             r["score"] = round(1.0 - r.get("score", 0), 4)
             r["source"] = "vector"
         return {"query": query, "total": len(results), "results": results, "sources": {"vector": len(results)}}
 
     elif source == "hybrid":
-        result = cb.hybrid_search(query, top_k=top_k, include_graph=include_graph)
+        result = cb.hybrid_search(query, top_k=top_k, include_graph=include_graph,
+                                  scope=scope, me=me)
         mems = result.get("memories", [])
         for r in mems:
             r["source"] = "hybrid"
@@ -97,7 +104,8 @@ def search(query: str, top_k: int = 5, source: str = "all",
 
     else:
         # 三路融合：hybrid_search(语义+全文) + graph
-        hybrid = cb.hybrid_search(query, top_k=top_k, include_graph=include_graph)
+        hybrid = cb.hybrid_search(query, top_k=top_k, include_graph=include_graph,
+                                  scope=scope, me=me)
         vector_results = hybrid.get("memories", [])
         for r in vector_results:
             # ChromaDB 返回的是距离（越小越相似），转为相似度（越大越好）
@@ -128,7 +136,13 @@ def search(query: str, top_k: int = 5, source: str = "all",
         }
 
 
-def save(content: str, topic: str = "external", metadata: dict = None) -> dict:
+def current_profile() -> str:
+    """当前进程的记忆归属标识（BOSHI_PROFILE > HERMES_HOME 推导 > default）"""
+    return _get_chroma().resolve_profile()
+
+
+def save(content: str, topic: str = "external", metadata: dict = None,
+         profile: str = None) -> dict:
     """
     存入一条记忆。
 
@@ -136,6 +150,8 @@ def save(content: str, topic: str = "external", metadata: dict = None) -> dict:
         content:  记忆内容
         topic:    主题标签
         metadata: 附加元数据
+        profile:  记忆归属标识（默认由当前 HERMES_HOME/BOSHI_PROFILE 推导，
+                  即写入方所属 profile/agent）
 
     返回:
         {"success": True, "memory_id": str, "content_preview": str}
@@ -145,6 +161,9 @@ def save(content: str, topic: str = "external", metadata: dict = None) -> dict:
     meta.setdefault("source", "boshi_api")
     meta.setdefault("topic", topic)
     meta.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+    if profile:
+        meta["profile"] = profile
+    # profile 未显式给出时，由 chroma_bridge.add_memory 按当前进程归属打标
 
     memory_id = cb.add_memory(content=content, metadata=meta)
 
@@ -197,9 +216,13 @@ def status() -> dict:
     }
 
 
-def profile() -> dict:
+def profile(scope: str = None, me: str = None) -> dict:
     """
     获取用户画像摘要（热区话题 + 最近记忆）。
+
+    参数:
+        scope: 记忆归属范围 self/all（默认取 profiles.json 配置）
+        me:    调用方归属标识（显式传入，避免依赖进程环境变量）
 
     返回:
         {"hot_topic": str, "total_memories": int, "recent_memories": [...]}
@@ -210,7 +233,8 @@ def profile() -> dict:
     # 热区话题
     hot_topic = ""
     try:
-        hot = cb.search_memory("", top_k=1, where={"heat": {"$gte": 10.0}})
+        hot = cb.search_memory("", top_k=1, where={"heat": {"$gte": 10.0}},
+                               scope=scope, me=me)
         if hot:
             hot_topic = hot[0].get("content", "")[:60]
     except Exception:
@@ -218,7 +242,7 @@ def profile() -> dict:
 
     recent_memories = []
     try:
-        for r in cb.search_memory(hot_topic or "记忆", top_k=3):
+        for r in cb.search_memory(hot_topic or "记忆", top_k=3, scope=scope, me=me):
             recent_memories.append({
                 "content": r.get("content", "")[:100],
                 "topic": r.get("metadata", {}).get("topic", ""),
@@ -274,14 +298,15 @@ def brief() -> dict:
     return profile()
 
 
-def recent(n: int = 10) -> list:
-    """获取最近 n 条记忆。"""
+def recent(n: int = 10, scope: str = None, me: str = None) -> list:
+    """获取最近 n 条记忆（scope: self 只读本 profile/agent / all 读全库）。"""
     cb = _get_chroma()
-    return cb.get_recent(n)
+    return cb.get_recent(n, scope=scope, me=me)
 
 
 def time_range(since: float, until: float = None, top_k: int = 50,
-               include_graph: bool = False) -> list:
+               include_graph: bool = False, scope: str = None,
+               me: str = None) -> list:
     """
     按时间范围查询记忆。
 
@@ -290,13 +315,15 @@ def time_range(since: float, until: float = None, top_k: int = 50,
         until:  结束时间（Unix 时间戳秒，默认 None = 至今）
         top_k:  最多返回条数
         include_graph: 是否包含知识图谱自动提边（type=relation，默认 False）
+        scope:  记忆归属范围 self/all（默认取 profiles.json 配置）
+        me:     调用方归属标识（显式传入，避免依赖进程环境变量）
 
     返回:
         [{"id": str, "content": str, "metadata": dict}, ...]
     """
     cb = _get_chroma()
     return cb.get_time_range(since=since, until=until, top_k=top_k,
-                             include_graph=include_graph)
+                             include_graph=include_graph, scope=scope, me=me)
 
 
 # ═══════════════════════════════════════════

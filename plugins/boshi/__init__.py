@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -77,11 +78,43 @@ def _is_capture_worthy_conclusion(text: str) -> bool:
     return True
 
 
+def _resolve_plugin_profile() -> str:
+    """当前 profile 的记忆归属标识。
+
+    Hermes 的 profile 是进程级隔离的（每个 profile 一个 gateway 进程），
+    所以此处解析出的标识即"写入方"，用于记忆打标与归属检索：
+      BOSHI_PROFILE 环境变量 > get_hermes_home() 推导 > "default"
+    """
+    env = (os.environ.get("BOSHI_PROFILE") or "").strip()
+    if env:
+        return env
+    home = ""
+    try:
+        from hermes_constants import get_hermes_home  # Hermes 内部工具（同进程可导入）
+        home = str(get_hermes_home())
+    except Exception:
+        home = os.environ.get("HERMES_HOME", "")
+    norm = home.replace("\\", "/").rstrip("/")
+    if norm:
+        name = norm.rsplit("/", 1)[-1]
+        parent = norm.rsplit("/", 2)[-2] if "/" in norm else ""
+        if parent == "profiles" and name:
+            return name
+    return "default"
+
+
 class BoshiMemoryProvider(MemoryProvider):
     """Hermes 原生 memory provider，桥接 ~/.boshi 数据层（ChromaDB + bge-m3）。"""
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         self._config = config or {}
+        # 确立本进程的记忆归属标识：下游所有写入/检索经 chroma_bridge.resolve_profile()
+        # 读取 BOSHI_PROFILE，从而自动带上本 profile 的标识（环境变量已显式设置则尊重之）
+        self._profile = _resolve_plugin_profile()
+        try:
+            os.environ.setdefault("BOSHI_PROFILE", self._profile)
+        except Exception:
+            pass
         self._core = None          # boshi_core 模块（惰性导入）
         self._session_id = ""
         self._agent_context = "primary"

@@ -1,0 +1,10 @@
+{
+  "_comment": "伯仕记忆 per-入口设置。scope: self=只读自己的记忆（默认）；all=全库（含其他 profile 与 agent）。读取时实时生效，无需重启。键名 = 记忆归属标识，见下。",
+  "_identity": "归属标识来源优先级：BOSHI_PROFILE 环境变量 > HERMES_HOME 派生的 profile 名 > MCP 握手自动识别的客户端名（如 opencode/dsh） > external。通过 MCP 接入的 agent 无需任何配置，伯仕自动认人。",
+  "default": { "scope": "self" },
+  "dashi": { "scope": "self" },
+  "shizhen": { "scope": "self" },
+  "zuojia": { "scope": "self" },
+  "dsh": { "scope": "self" },
+  "opencode": { "scope": "self" }
+}

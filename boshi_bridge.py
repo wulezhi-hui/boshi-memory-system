@@ -40,24 +40,36 @@ def main():
     cmd = sys.argv[1]
 
     if cmd == "save":
-        if len(sys.argv) < 3:
+        # 用法: save <content> [topic] [--profile=<name>]
+        args = [a for a in sys.argv[2:] if not a.startswith("--")]
+        prof = None
+        for a in sys.argv[2:]:
+            if a.startswith("--profile="):
+                prof = a.split("=", 1)[1].strip() or None
+        if not args:
             _out({"error": "save needs content"})
             return
-        content = sys.argv[2]
-        topic = sys.argv[3] if len(sys.argv) > 3 else "conversation"
+        content = args[0]
+        topic = args[1] if len(args) > 1 else "conversation"
         try:
-            _out(save(content=content, topic=topic))
+            _out(save(content=content, topic=topic, profile=prof))
         except Exception as e:
             _out({"error": str(e)})
 
     elif cmd == "search":
-        if len(sys.argv) < 3:
+        # 用法: search <query> [top_k] [--scope=self|all]
+        args = [a for a in sys.argv[2:] if not a.startswith("--")]
+        scope = None
+        for a in sys.argv[2:]:
+            if a.startswith("--scope="):
+                scope = a.split("=", 1)[1].strip() or None
+        if not args:
             _out({"error": "search needs query"})
             return
-        query = sys.argv[2]
-        top_k = int(sys.argv[3]) if len(sys.argv) > 3 else 3
+        query = args[0]
+        top_k = int(args[1]) if len(args) > 1 else 3
         try:
-            _out(search(query=query, top_k=top_k, source="all"))
+            _out(search(query=query, top_k=top_k, source="all", scope=scope))
         except Exception as e:
             _out({"error": str(e)})
 
@@ -71,6 +83,7 @@ def main():
         since = float(sys.argv[2])
         until = None
         top_k = 50
+        scope = None
         rest = sys.argv[3:]
         i = 0
         while i < len(rest):
@@ -79,18 +92,23 @@ def main():
                 until = float(a.split("=", 1)[1])
             elif a.startswith("--top-k="):
                 top_k = int(float(a.split("=", 1)[1]))
+            elif a.startswith("--scope="):
+                scope = a.split("=", 1)[1].strip() or None
             elif a == "--until" and i + 1 < len(rest):
                 i += 1
                 until = float(rest[i])
             elif a == "--top-k" and i + 1 < len(rest):
                 i += 1
                 top_k = int(float(rest[i]))
+            elif a == "--scope" and i + 1 < len(rest):
+                i += 1
+                scope = rest[i].strip() or None
             else:
-                _out({"error": f"unknown argument: {a} (use --until=<ts> / --top-k=<n>)"})
+                _out({"error": f"unknown argument: {a} (use --until=<ts> / --top-k=<n> / --scope=self|all)"})
                 return
             i += 1
         try:
-            _out(time_range(since=since, until=until, top_k=top_k))
+            _out(time_range(since=since, until=until, top_k=top_k, scope=scope))
         except Exception as e:
             _out({"error": str(e)})
 

@@ -63,6 +63,9 @@ export default {
       return false
     }
 
+    // 记忆归属标识：本 agent 写入的记忆带此标识，默认只读自己的（boshi profiles.json 可配 all）
+    const PROFILE = config.profile || 'dsh'
+
     // 异步调用 bridge，解析 JSON，回调 onResult
     function callBridge(args, onResult) {
       try {
@@ -75,7 +78,7 @@ export default {
             stderr: 'ignore',
           },
           graceMs: 30000,
-          env: { PYTHONIOENCODING: 'utf-8' },
+          env: { PYTHONIOENCODING: 'utf-8', BOSHI_PROFILE: PROFILE },
         })
         handle.done.then(() => {
           if (typeof onResult !== 'function') return

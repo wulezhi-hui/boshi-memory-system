@@ -46,7 +46,17 @@
 - 新增 session_sources.py 多 Agent 会话源路由
 - 安全清理：移除泄露凭据，.gitignore 排除运行时数据
 
-### v6.5 — 图谱边隔离版（2026-09-13）← 当前
+### v6.6 — 记忆归属隔离版（2026-09-15）← 当前
+- **问题**：伯仕从"只有 default 在用"升级为「多 profile + 外部 agent 共享同一份 ChromaDB」，但记忆没有归属标识 → 各 agent 互相看到彼此的记忆；外部 agent（opencode/dsh）的历史写入还因环境变量误判落进 `default`，污染主身记忆空间
+- **方案**：写入自动打标 `profile`（`add_memory` 非图谱边；`update_memory` 继承旧标识）；检索默认 `scope=self`（`$or:[{profile: me}, {type: relation}]`，图谱边保持全局），可显式 `scope=all` 读全库；per-profile 配置 `~/.boshi/profiles.json`
+- **通用 MCP 接口自动认人**：优先级 `BOSHI_PROFILE` > MCP 握手 `clientInfo.name` > `HERMES_HOME` 派生 > `external`。**握手必须优先于环境变量**——`HERMES_HOME` 被写进 Windows 用户级环境变量（`HKCU\Environment`），所有进程都继承，不能当作"这是 Hermes 在调用"的证据（此条为实测发现的 critical bug）
+- **接口自述**：`initialize.instructions` + 参数级 `Field(description=...)` + 响应内联 `_identity`/`_scope` → 外部 agent **零配置**，无需逐家适配
+- **可观测**：调用审计 `~/.boshi/logs/mcp_calls.jsonl`（`identity / client / tool / scope / env_*`，未传 scope 显式标注）
+- **效果**：按 ID 精确隔离实测通过（zuojia 专属记录：zuojia 命中 / default·dashi 未命中 / 全库命中）；噪声率保持 0%；四 profile（default/dashi/shizhen/zuojia）全部接入；opencode 真实握手实测 `identity=opencode`
+- **文件**：`chroma_bridge.py`、`boshi_core.py`、`boshi_mcp_server.py`、`boshi_bridge.py`、`boshi_cli.py`、`profiles.json`（新增）、`plugins/boshi/__init__.py`、`dsh/boshi-auto-memory.mjs`；文档 `docs/伯仕记忆系统v6.6_技术架构文档.md`
+- **补档（2026-09-18）**：模型加载策略——bge-m3 ONNX 惰性单例、**进程内永驻、无 TTL/卸载路径**；**重排模型未接入**（主链 0 引用）；冷热启动实测：同进程首次 **8.52s** / 后续 **0.12s** / 桥接每次新进程 **15.74s**（已知性能弱环）→ 见 v6.6 文档 §3.8、§4.4、§6.5–6.7
+
+### v6.5 — 图谱边隔离版（2026-09-13）
 - **问题**：技术类 query 召回被图谱噪声淹没——L2 全库 12020 条中 `type=relation` 的图谱自动提边占 10260 条（85.4%），真记忆仅约 11%；实测 30 条召回 21 条噪声（70%）
 - **根因**：图谱自动提边（`source=auto_extract`）与真记忆混在同一 ChromaDB collection、参与同一套语义检索；搜索排序按相似度取 top_k，边占比压倒性 → 真记忆名额被挤掉
 - **方案**：数据层默认隔离——`chroma_bridge` 新增 `_apply_graph_exclusion()`（默认加 `type != relation`）+ `_where_has_type()`（图谱模块自带 type 条件时白名单放行）；`include_graph` 开关从 `boshi_core.search/time_range` 透传到 MCP 工具；退化路径 Python 端过滤改用新写的 `_where_matches()`（支持 `$ne/$gte/$lte/$and`）
