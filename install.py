@@ -60,24 +60,41 @@ _DEPS_PROBE = (
 )
 
 
-def find_hermes_python(hermes_home: Path) -> str:
-    """Hermes **运行时**（agent 进程）的 python —— 插件依赖要装这里。
+def find_agent_env_pythons(hermes_home: Path) -> list:
+    """列出**所有**可能承载插件的 Hermes 运行时环境 python（顺序 = 优先级）。
 
-    路径随 Hermes 版本变：2026-09 起是 `hermes-agent/.venv`（uv 建、无 pip），
-    更早是 `hermes-agent/venv`；再兜底 glob 扫一层，避免升级后探测失效。
+    踩过的坑：插件依赖只装到 `hermes-agent/.venv` 不够——agent 实际跑在
+    `installs/<id>/environments/<id>/venv`（Hermes 的安装托管环境，含 mcp/pydantic），
+    两个环境都可能被 agent 使用。**一律全装**，不赌"是哪一个"。
     """
-    candidates = [
-        hermes_home / "hermes-agent" / ".venv" / "Scripts" / "python.exe",
-        hermes_home / "hermes-agent" / ".venv" / "bin" / "python",
-        hermes_home / "hermes-agent" / "venv" / "Scripts" / "python.exe",
-        hermes_home / "hermes-agent" / "venv" / "bin" / "python",
-    ]
-    candidates += sorted(hermes_home.glob("hermes-agent/*/Scripts/python.exe"))
-    candidates += sorted(hermes_home.glob("hermes-agent/*/bin/python"))
-    for c in candidates:
-        if Path(c).exists():
-            return str(c)
-    return sys.executable
+    found = []
+    for pat in (
+        "hermes-agent/.venv/Scripts/python.exe",
+        "hermes-agent/.venv/bin/python",
+        "hermes-agent/venv/Scripts/python.exe",
+        "hermes-agent/venv/bin/python",
+        "installs/*/environments/*/venv/Scripts/python.exe",
+        "installs/*/environments/*/venv/bin/python",
+        "hermes-agent/*/Scripts/python.exe",
+        "hermes-agent/*/bin/python",
+    ):
+        found += sorted(hermes_home.glob(pat))
+    seen, out = set(), []
+    for p in found:
+        try:
+            rp = str(Path(p).resolve())
+        except Exception:  # noqa: BLE001
+            continue
+        if Path(p).exists() and rp not in seen:
+            seen.add(rp)
+            out.append(str(p))
+    return out
+
+
+def find_hermes_python(hermes_home: Path) -> str:
+    """Hermes 运行时的**首选** python（兼容旧调用）。"""
+    envs = find_agent_env_pythons(hermes_home)
+    return envs[0] if envs else sys.executable
 
 
 def find_mcp_python(hermes_home: Path) -> str:
@@ -134,33 +151,22 @@ def check_plugin_deps(hermes_python: str) -> list:
     return list(PLUGIN_DEPS)
 
 
-def install_hermes_deps(hermes_home: Path, *, force: bool = False) -> bool:
-    """把伯仕的**进程内依赖**装进 Hermes 运行时 venv（幂等）。
-
-    可在 Hermes 每次升级后单独执行：`python install.py --fix-runtime`
-    （升级会换 venv / python 版本，连带卸掉这些包 → 插件静默失忆）。
-    返回 True 表示依赖齐全。
-    """
-    print("[2b/6] 检查 Hermes 运行时依赖（插件进程内 import 用）...")
-    hermes_python = find_hermes_python(hermes_home)
-    if not Path(hermes_python).exists():
-        print("   ⚠️ 未找到 Hermes 运行时 python，跳过（插件将无法召回，请手工确认）")
-        return False
-    print(f"   目标环境: {hermes_python}")
-    # 回退到伯仕 venv = 没找到 Hermes 运行时：那里天然有依赖，不能当“齐全”，否则假绿灯
+def _ensure_deps_for_env(hermes_python: str, *, force: bool = False) -> bool:
+    """把插件依赖装进**单个**运行时环境；返回该环境是否齐全。"""
+    print(f"   环境: {hermes_python}")
+    # 回退到伯仕 venv = 没定位到 Hermes 运行时：那里天然有依赖，不能当“齐全”，否则假绿灯
     try:
         if Path(hermes_python).resolve().is_relative_to(BOSHI_DIR.resolve()):
-            print("   ⚠️ 未定位到 Hermes 运行时（回退到伯仕 venv）——无法确认插件依赖")
-            print("   请用 --home 指定 HERMES_HOME，或确认 hermes-agent/.venv 是否存在")
+            print("     ⚠️ 这是伯仕自己的 venv（回退），无法确认插件依赖 → 跳过")
             return False
     except Exception:  # noqa: BLE001
         pass
 
     missing = list(PLUGIN_DEPS) if force else check_plugin_deps(hermes_python)
     if not missing:
-        print("   ✅ 依赖齐全，无需安装")
+        print("     ✅ 依赖齐全，无需安装")
         return True
-    print(f"   ℹ️ 缺失: {', '.join(missing)} → 开始安装（首次约几百 MB，稍慢）")
+    print(f"     ℹ️ 缺失: {', '.join(missing)} → 安装中（首次约几百 MB）")
 
     # 新版 Hermes venv 由 uv 管理、可能没有 pip → 优先 uv；退化 pip；再退化 ensurepip
     installed = False
@@ -169,24 +175,53 @@ def install_hermes_deps(hermes_home: Path, *, force: bool = False) -> bool:
         r = _run([uv, "pip", "install", "--python", hermes_python] + missing)
         installed = bool(r and r.returncode == 0)
         if not installed and r is not None:
-            print("   ⚠️ uv 安装失败，改用 pip：" + (r.stderr or "").strip()[:200])
+            print("     ⚠️ uv 安装失败，改用 pip：" + (r.stderr or "").strip()[:200])
     if not installed:
         r = _run([hermes_python, "-m", "pip", "install"] + missing)
         installed = bool(r and r.returncode == 0)
     if not installed:
-        print("   ℹ️ 目标环境无 pip，尝试 ensurepip 引导...")
+        print("     ℹ️ 目标环境无 pip，尝试 ensurepip 引导...")
         _run([hermes_python, "-m", "ensurepip", "--upgrade"])
         r = _run([hermes_python, "-m", "pip", "install"] + missing)
         installed = bool(r and r.returncode == 0)
 
     left = check_plugin_deps(hermes_python)
     if not left:
-        print("   ✅ Hermes 运行时依赖已补齐（插件可直接 import）")
-        print("   ⚠️ 需**重启 Hermes（gateway）**才生效：运行中进程不会加载新装模块")
+        print("     ✅ 已补齐")
         return True
-    print("   ❌ 仍有缺失: " + ", ".join(left))
-    print(f'   手工排查可试: uv pip install --python "{hermes_python}" {" ".join(left)}')
+    print("     ❌ 仍有缺失: " + ", ".join(left))
+    print(f'     手工排查可试: uv pip install --python "{hermes_python}" {" ".join(left)}')
     return False
+
+
+def install_hermes_deps(hermes_home: Path, *, force: bool = False) -> bool:
+    """把伯仕的**进程内依赖**装进**所有** Hermes 运行时环境（幂等）。
+
+    可在 Hermes 每次升级后单独执行：`python install.py --fix-runtime`
+    （升级会换 venv / python 版本，连带卸掉这些包 → 插件静默失忆且无报错）。
+    返回 True 表示可见环境都齐全。
+    """
+    print("[2b/6] 检查 Hermes 运行时依赖（插件进程内 import 用）...")
+    envs = find_agent_env_pythons(hermes_home)
+    if not envs:
+        print("   ⚠️ 未定位到任何 Hermes 运行时环境（插件将无法召回，请手工确认）")
+        return False
+
+    ok_all = True
+    changed = False
+    for py in envs:
+        before = check_plugin_deps(py)
+        if _ensure_deps_for_env(py, force=force):
+            if before:
+                changed = True
+        else:
+            ok_all = False
+    if ok_all:
+        if changed:
+            print("   ⚠️ 已补齐依赖，但需**重启 Hermes（gateway）**才生效（运行中进程不加载新模块）")
+        else:
+            print("   ✅ 全部环境依赖齐全")
+    return ok_all
 
 
 def install_model() -> None:
