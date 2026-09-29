@@ -34,3 +34,10 @@ models/
 fastembed_data/
 # 本地快照（不入库）
 memory-snapshots/
+
+# 按日期命名的快照 / 导出文件（不入库）
+chroma_db_broken_*/
+chroma_extract_*.json
+
+# 运行日志（不入库）
+logs/

@@ -1,0 +1,11 @@
+name: boshi
+version: 1.0.0
+description: "伯仕记忆系统 — Hermes 记忆 provider：持久化 + 热度调度 + 知识图谱（复用 ~/.boshi/boshi_core.py 数据层）"
+# 这些依赖不是 Hermes 核心依赖，必须由插件显式声明：
+# PM 会把它们并入当前环境，并在每次 `hermes update` 重建环境后自动重装。
+python_dependencies:
+  - "chromadb>=1.5,<2"
+  - "onnxruntime>=1.20,<2"
+  - "transformers>=4.40,<6"
+  - "numpy>=1.26,<3"
+  - "pyyaml>=6,<7"
