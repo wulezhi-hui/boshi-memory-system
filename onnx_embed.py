@@ -34,6 +34,12 @@ MODEL_DIMENSIONS = 1024
 MAX_SEQ_LEN = 512
 
 _boshi_ef_instance = None
+# 首次加载的并发保护（2026-10-10 修复）：
+# MCP server 会**并发执行**工具调用（如 boshi_save 与 boshi_search 同时来），
+# 两个线程同时 `from transformers import AutoTokenizer` 时，后到者会看到
+# "半初始化"的 transformers 模块 → 抛 `cannot import name 'AutoTokenizer'`
+# （实测：单线程调用永远正常，并发才偶发；opencode 的 save+search 成对调用正好命中）
+_ef_load_lock = None
 
 
 class _BoshiONNX:
@@ -60,16 +66,25 @@ class _BoshiONNX:
 
 
 def _get_cached_ef():
-    """惰性单例：首次调用时加载模型（约 1-3 秒）"""
-    global _boshi_ef_instance
-    if _boshi_ef_instance is None:
-        import onnxruntime as ort
-        from transformers import AutoTokenizer
+    """惰性单例：首次调用时加载模型（约 1-3 秒）。
 
-        tokenizer = AutoTokenizer.from_pretrained(str(BOSHI_MODEL_DIR))
-        session = ort.InferenceSession(str(ONNX_FILE), providers=["CPUExecutionProvider"])
-        input_names = [i.name for i in session.get_inputs()]
-        _boshi_ef_instance = _BoshiONNX(tokenizer, session, input_names)
+    **加锁**：多线程并发首次加载会因 transformers 半初始化而报
+    `cannot import name 'AutoTokenizer'`（2026-10-10 实测，MCP 并发调用触发）。
+    """
+    global _boshi_ef_instance, _ef_load_lock
+    if _boshi_ef_instance is None:
+        if _ef_load_lock is None:
+            import threading
+            _ef_load_lock = threading.Lock()
+        with _ef_load_lock:
+            if _boshi_ef_instance is None:      # 双检：等锁期间别人可能已加载好
+                import onnxruntime as ort
+                from transformers import AutoTokenizer
+
+                tokenizer = AutoTokenizer.from_pretrained(str(BOSHI_MODEL_DIR))
+                session = ort.InferenceSession(str(ONNX_FILE), providers=["CPUExecutionProvider"])
+                input_names = [i.name for i in session.get_inputs()]
+                _boshi_ef_instance = _BoshiONNX(tokenizer, session, input_names)
     return _boshi_ef_instance
 
 
