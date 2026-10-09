@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import time
+from datetime import datetime as _dt, timezone as _timezone
 from typing import Any, Dict, List, Optional
 
 PG_DSN = os.environ.get("BOSHI_PG_DSN") or \
@@ -333,6 +334,32 @@ _META_SEL = ("meta || jsonb_build_object('profile', profile, 'isLatest', is_late
 
 
 # ── 公开 API（与 chroma_bridge 同名同签名）────────────────────────
+def _norm_ts(ts) -> Optional[float]:
+    """把各种形态的时间戳统一成 Unix 秒：float/int 直接用；ISO 字符串解析；
+    无法解析 → None（调用方会补当前时间）。
+
+    必须做这一步：boshi_core.save() 传的是 `datetime.now(timezone.utc).isoformat()`
+    （**ISO 字符串**），直接 float() 会抛异常 → created_at 落 NULL → 该条记忆对
+    time_range/recent 等时间线查询永久隐形（2026-10-10 实测，插件/MCP 路径全中招）。
+    Chroma 侧等价逻辑见 `chroma_bridge._normalize_metadata`。
+    """
+    if ts is None or ts == "":
+        return None
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    s = str(ts).strip()
+    try:
+        dt = _dt.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_timezone.utc)
+        return dt.timestamp()
+    except Exception:  # noqa: BLE001
+        try:
+            return float(s)
+        except Exception:  # noqa: BLE001
+            return None
+
+
 def add_memory(content: str, metadata: dict = None, memory_id: str = None):
     """写入一条记忆。metadata 为 None 时按当前进程归属打标（与 Chroma 后端一致）。"""
     import uuid
@@ -341,7 +368,7 @@ def add_memory(content: str, metadata: dict = None, memory_id: str = None):
     mid = memory_id or str(uuid.uuid4())
     prof = meta.pop("profile", None) or _resolve_profile()
     is_latest = bool(meta.pop("isLatest", True))
-    ts = meta.pop("timestamp", None)
+    ts = _norm_ts(meta.pop("timestamp", None))
     vc = meta.pop("_version_created", None)
     topic = meta.pop("topic", None)
     source = meta.pop("source", None)
