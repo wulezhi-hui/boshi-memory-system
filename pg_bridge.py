@@ -138,40 +138,55 @@ def _diagnose_start_failure() -> None:
 
 
 def _start_server() -> None:
-    """脱离调用方进程树启动 PG（Windows 用 DETACHED_PROCESS，避免被 agent 生命周期连带杀死）。"""
-    exe = os.path.join(PG_BIN, "pg_ctl.exe" if os.name == "nt" else "pg_ctl")
+    """启动 PG。
+
+    Windows 机制事实（2026-10-10 实测，血泪）：
+    1. **不能直接启动 postgres.exe**：调用方若是管理员令牌，PG 会拒绝启动并报
+       "不能以管理员权限的用户运行 PostgreSQL 服务器" —— pg_ctl 会用**受限令牌**
+       启动 postmaster，这正是 Windows 上必须经 pg_ctl 的原因。
+    2. **pg_ctl 在 Windows 上固定经 `cmd.exe /C "postgres ... < nul >> LOG 2>&1"`
+       启动**（源码如此，无法绕过）。若 pg_ctl 自己没有控制台（DETACHED_PROCESS），
+       cmd 会**新分配一个"可见"控制台窗口**，postmaster 就挂在该控制台上。
+    3. 因此只剩两种选择：**可见窗口**（DETACHED）或**隐藏控制台**（CREATE_NO_WINDOW）。
+       这里选 CREATE_NO_WINDOW —— 无窗口（用户无感），且隐藏控制台无法被误关。
+       但两者 postmaster 都挂在 cmd 的控制台上，控制台事件仍可能打死整库
+       （2026-10-10 两次 0xC000013A）。真正彻底的做法是注册成 Windows 服务
+       （服务无控制台），需要管理员且属架构变更，**待用户决定**（见 v7.0 文档 §八）。
+    """
     log = os.path.join(PG_DATA, "pg.log")
-    cmd = [exe, "-D", PG_DATA, "-l", log, "start"]
-    kw = dict(stdin=subprocess.DEVNULL, close_fds=True)
-    # pg_ctl 自身的报错落文件（不能用 DEVNULL，否则"启动失败"永远是黑盒）。
-    # 安全：postmaster 的输出由 pg_ctl 经 -l 重定向到 pg.log，不会继承这个句柄。
+    # pg.log 被占用（孤儿进程持句柄）时退回带时间戳的日志名，避免"启动彻底失败"
     try:
-        ctl_fh = open(_ctl_log_path(), "ab", buffering=0)
-        kw["stdout"] = ctl_fh
-        kw["stderr"] = ctl_fh
+        with open(log, "ab"):
+            pass
+    except PermissionError:
+        log = os.path.join(PG_DATA, "pg-%s.log" % time.strftime("%Y%m%d-%H%M%S"))
+        _log("⚠️ pg.log 被占用，本实例日志改落 %s" % log)
+    cmd = [os.path.join(PG_BIN, "pg_ctl.exe" if os.name == "nt" else "pg_ctl"),
+           "-D", PG_DATA, "-l", log, "start"]
+    kw = dict(stdin=subprocess.DEVNULL, close_fds=True)
+    # pg_ctl 自身的报错落文件（不能丢 DEVNULL，否则"启动失败"永远是黑盒）
+    try:
+        out_fh = open(_ctl_log_path(), "ab", buffering=0)
+        kw["stdout"] = out_fh
+        kw["stderr"] = out_fh
     except Exception:  # noqa: BLE001
-        ctl_fh = None
+        out_fh = None
         kw["stdout"] = kw["stderr"] = subprocess.DEVNULL
     try:
         if os.name == "nt":
-            DETACHED_PROCESS = 0x00000008
             CREATE_NEW_PROCESS_GROUP = 0x00000200
-            # ⚠️ 绝不可加 CREATE_NO_WINDOW(0x08000000)：它会创建"隐藏控制台"，
-            #    postmaster 一旦与控制台绑定，控制台被关闭/收到 Ctrl+C 时会收到
-            #    CTRL_CLOSE_EVENT，整库被 0xC000013A 打死（2026-10-10 实测事故，
-            #    pg.log 里留下 "terminated by exception 0xC000013A" + "^C"）。
-            #    只有 DETACHED_PROCESS 才是真正的"无控制台"，免疫控制台事件。
-            subprocess.Popen(cmd, creationflags=DETACHED_PROCESS |
-                             CREATE_NEW_PROCESS_GROUP, **kw)
+            CREATE_NO_WINDOW = 0x08000000   # 隐藏控制台 → 无可见窗口
+            subprocess.Popen(cmd, creationflags=CREATE_NEW_PROCESS_GROUP |
+                             CREATE_NO_WINDOW, **kw)
         else:
             subprocess.Popen(cmd, start_new_session=True, **kw)
         _log("已发出启动命令: %s" % " ".join(cmd))
     except Exception as e:  # noqa: BLE001
         _log("启动命令执行失败: %s" % e)
     finally:
-        if ctl_fh is not None:
+        if out_fh is not None:
             try:
-                ctl_fh.close()
+                out_fh.close()
             except Exception:  # noqa: BLE001
                 pass
 
@@ -211,11 +226,25 @@ def ensure_pg_running(assume_down: bool = False) -> bool:
 
 
 def _conn():
-    """模块级单例连接；连不上时先尝试自动拉起 PG，仍失败则**响亮报错**（不静默退回 Chroma）。"""
+    """模块级单例连接；连不上时先尝试自动拉起 PG，仍失败则**响亮报错**（不静默退回 Chroma）。
+
+    注意：PG 被重启/崩过一次后，**旧的缓存连接会失效但对象未必被标记 closed** ——
+    若直接返回，调用方会一直拿到 OperationalError（进程不重启就永远好不了）。
+    所以这里对缓存连接先做一次极廉价的 `SELECT 1` 探活，失败即丢弃重建。
+    """
     import psycopg
     c = _conn_holder.get("c")
     if c is not None and not c.closed:
-        return c
+        try:
+            c.execute("SELECT 1")        # 探活（本地 socket，开销可忽略）
+            return c
+        except Exception:                # noqa: BLE001
+            try:
+                c.close()
+            except Exception:            # noqa: BLE001
+                pass
+            _conn_holder.pop("c", None)
+            c = None
     try:
         c = psycopg.connect(PG_DSN, connect_timeout=3, autocommit=True)
     except Exception as e:  # noqa: BLE001
