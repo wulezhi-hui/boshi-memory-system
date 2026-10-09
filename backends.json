@@ -1,0 +1,8 @@
+{
+  "_comment": "按 profile 指定存储后端。键 = profile 名（由 BOSHI_PROFILE 或 HERMES_HOME 推导），\"*\" = 通配键。值：chroma | pg。环境变量 BOSHI_BACKEND 优先级最高（覆盖本文件）。",
+  "_profiles": "default = Hermes 主身（当前对话）；opencode / dsh / desktop / zuojia / dashi / shizhen = 各接入方",
+  "_switch": "改这一个文件即完成按接入方切换；**进程重启后生效**（后端在 import 时解析）。未列出的 profile 走 \"*\"。",
+  "_note": "接入方切换要两头一致：这里改成 pg 的同时，接入方也可以（可选）在自己的 MCP/插件 env 里显式写 BOSHI_BACKEND=pg；env 优先。",
+  "default": "pg",
+  "*": "chroma"
+}

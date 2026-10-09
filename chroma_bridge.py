@@ -1014,7 +1014,39 @@ def get_by_id(memory_id: str):
 #  2. 只替换"公开 API"；_get_collection/_get_client 等内部辅助仍指 Chroma，
 #     供诊断/工具用（Graph 模块的裸 collection 调用尚未适配 PG，见工作日志）
 #  3. 加载失败自动退回 Chroma —— 绝不让"记忆整体不可用"这种事发生
-BACKEND = (os.environ.get("BOSHI_BACKEND") or "chroma").strip().lower()
+def _resolve_backend():
+    """决定本进程用哪个后端 → (backend, 来源说明)。
+
+    优先级：`BOSHI_BACKEND` 环境变量（显式、最高）
+          > `~/.boshi/backends.json` 的 `[当前 profile]` 键
+          > `~/.boshi/backends.json` 的 `["*"]` 通配键（建议显式写 "chroma"，避免误切）
+          > 默认 "chroma"
+
+    profile 取自 resolve_profile()（`BOSHI_PROFILE` > `HERMES_HOME` 推导 > default）：
+    「谁在用伯仕」就按谁在配置里的取值 → 可**按接入方**精细切换，接入方零改动。
+    """
+    env = (os.environ.get("BOSHI_BACKEND") or "").strip().lower()
+    if env:
+        return env, "环境变量 BOSHI_BACKEND"
+    try:
+        path = os.path.join(os.path.expanduser("~/.boshi"), "backends.json")
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f) or {}
+            try:
+                prof = resolve_profile()
+            except Exception:
+                prof = "default"
+            for key in (prof, "*"):
+                v = cfg.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v.strip().lower(), "backends.json[%s]" % key
+    except Exception:
+        pass
+    return "chroma", "默认"
+
+
+BACKEND, BACKEND_SOURCE = _resolve_backend()
 
 _PUBLIC_API = (
     "add_memory", "add_memories_batch", "search_memory", "hybrid_search",
@@ -1032,7 +1064,9 @@ if BACKEND == "pg":
                 globals()[_n] = getattr(_pgb, _n)
                 _swapped += 1
         import logging as _lg
-        _lg.getLogger(__name__).info("boshi 后端 = pg（pgvector），已接管 %d 个公开 API", _swapped)
+        _lg.getLogger(__name__).info(
+            "boshi 后端 = pg（pgvector），已接管 %d 个公开 API（来源：%s）",
+            _swapped, BACKEND_SOURCE)
     except Exception as _e:  # noqa: BLE001
         import logging as _lg
         BACKEND = "chroma"
@@ -1042,3 +1076,8 @@ if BACKEND == "pg":
 def backend_name() -> str:
     """当前生效的后端（诊断用）。"""
     return BACKEND
+
+
+def backend_source() -> str:
+    """当前后端的解析来源（环境变量 / backends.json[key] / 默认）。"""
+    return BACKEND_SOURCE
