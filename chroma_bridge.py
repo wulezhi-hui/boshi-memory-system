@@ -13,7 +13,27 @@ import chromadb
 from onnx_embed import BoshiEmbeddingFunction
 
 # ── 配置 ──────────────────────────────────────────────
-CHROMA_DIR = os.path.expanduser("~/.boshi/chroma_db")
+# 库目录**可切换**（蓝绿/影子切换用）：BOSHI_CHROMA_DIR 环境变量 > 指针文件 > 默认路径
+#   指针文件：~/.boshi/chroma_db.current（内容 = 一行目录路径）
+#   → 「改指向」= 改这一个文件；原库原封不动，回滚就是把文件改回去。
+#   → 两者都不存在时行为与从前完全一致（~/.boshi/chroma_db）。
+def _resolve_chroma_dir() -> str:
+    env = (os.environ.get("BOSHI_CHROMA_DIR") or "").strip()
+    if env:
+        return os.path.expanduser(env)
+    ptr = os.path.join(os.path.expanduser("~/.boshi"), "chroma_db.current")
+    try:
+        if os.path.isfile(ptr):
+            with open(ptr, "r", encoding="utf-8") as f:
+                line = f.readline().strip()
+            if line and os.path.isdir(os.path.expanduser(line)):
+                return os.path.expanduser(line)
+    except Exception:
+        pass
+    return os.path.expanduser("~/.boshi/chroma_db")
+
+
+CHROMA_DIR = _resolve_chroma_dir()
 # 本地 ONNX 模型路径（伯仕自带，零外部依赖）
 # 优先使用仓库内的 models/all-MiniLM-L6-v2/onnx/ 目录
 from onnx_embed import get_embedding_function as _get_embedding_function
@@ -963,3 +983,41 @@ def _get_collection():
     from chroma_bridge import _get_client, _get_embedding_function, COLLECTION_NAME
     client = _get_client()
     return client.get_or_create_collection(COLLECTION_NAME, embedding_function=_get_embedding_function())
+
+
+# ══════════════════════════════════════════════════════════════════
+# 后端切换（2026-10-10）：BOSHI_BACKEND=pg → 公开 API 交给 pg_bridge(pgvector)
+# ══════════════════════════════════════════════════════════════════
+# 设计要点：
+#  1. **默认（未设置 BOSHI_BACKEND）= 原 ChromaDB 行为，一行都不变**（可秒级回滚）
+#  2. 只替换"公开 API"；_get_collection/_get_client 等内部辅助仍指 Chroma，
+#     供诊断/工具用（Graph 模块的裸 collection 调用尚未适配 PG，见工作日志）
+#  3. 加载失败自动退回 Chroma —— 绝不让"记忆整体不可用"这种事发生
+BACKEND = (os.environ.get("BOSHI_BACKEND") or "chroma").strip().lower()
+
+_PUBLIC_API = (
+    "add_memory", "add_memories_batch", "search_memory", "hybrid_search",
+    "get_time_range", "get_recent", "get_total_count", "delete_memory",
+    "delete_memories", "update_memory", "deprecate_memory", "get_all_relations",
+    "auto_forget", "detect_conflicts", "resolve_conflict",
+)
+
+if BACKEND == "pg":
+    try:
+        import pg_bridge as _pgb
+        _swapped = 0
+        for _n in _PUBLIC_API:
+            if hasattr(_pgb, _n):
+                globals()[_n] = getattr(_pgb, _n)
+                _swapped += 1
+        import logging as _lg
+        _lg.getLogger(__name__).info("boshi 后端 = pg（pgvector），已接管 %d 个公开 API", _swapped)
+    except Exception as _e:  # noqa: BLE001
+        import logging as _lg
+        BACKEND = "chroma"
+        _lg.getLogger(__name__).error("boshi 后端 pg 加载失败，已退回 chroma：%s", _e)
+
+
+def backend_name() -> str:
+    """当前生效的后端（诊断用）。"""
+    return BACKEND

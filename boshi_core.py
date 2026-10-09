@@ -14,7 +14,13 @@ from datetime import datetime, timezone
 # ── 路径配置 ──
 BOSHI_HOME = os.path.expanduser("~/.boshi")
 MEMORY_DIR = os.path.join(BOSHI_HOME, "memory")
-CHROMA_DIR = os.path.join(BOSHI_HOME, "chroma_db")
+# 库目录显示值必须跟随真实解析（env BOSHI_CHROMA_DIR > ~/.boshi/chroma_db.current > 默认），
+# 否则 status 会显示旧路径 → 排查者误判为"还指向旧库"（2026-10-10 修）
+try:
+    from chroma_bridge import CHROMA_DIR as _RESOLVED_CHROMA_DIR
+    CHROMA_DIR = _RESOLVED_CHROMA_DIR
+except Exception:  # chroma_bridge 不可用时退回默认
+    CHROMA_DIR = os.path.join(BOSHI_HOME, "chroma_db")
 KG_PATH = os.path.join(MEMORY_DIR, "knowledge_graph.json")
 
 # ── 确保导入路径 ──
