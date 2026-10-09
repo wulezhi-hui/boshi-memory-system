@@ -100,25 +100,79 @@ def _release_lock() -> None:
         pass
 
 
+def _ctl_log_path() -> str:
+    return os.path.join(os.path.dirname(_LOG), "pg_ctl_start.log")
+
+
+def _log_ctl_output() -> None:
+    """把 pg_ctl 自己的输出附到日志（原实现丢 DEVNULL，故障时无从下手）。"""
+    try:
+        p = _ctl_log_path()
+        if not os.path.exists(p):
+            return
+        with open(p, "rb") as f:
+            data = f.read()[-1500:]
+        txt = data.decode("utf-8", "replace")
+        if "\ufffd" in txt:                      # 是 GBK 报错就换 GBK 解
+            txt = data.decode("gbk", "replace")
+        lines = [l.strip() for l in txt.strip().splitlines() if l.strip()]
+        if lines:
+            _log("pg_ctl 输出: " + " | ".join(lines[-4:]))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _diagnose_start_failure() -> None:
+    """启动失败时的定点体检：pg.log 是否被占（孤儿进程持有句柄是最常见原因）。"""
+    log = os.path.join(PG_DATA, "pg.log")
+    try:
+        with open(log, "ab"):
+            pass
+        _log("体检: pg.log 可写（不是文件占用问题）")
+    except PermissionError:
+        _log("体检: ⚠️ pg.log 被占用（Permission denied）→ 极可能有**孤儿 postgres 子进程**"
+             "持有句柄（postmaster 已死、子进程还在）。处理：taskkill /F 杀掉该 PID 后再启动")
+    except Exception as e:  # noqa: BLE001
+        _log("体检: pg.log 检查异常 %s" % e)
+
+
 def _start_server() -> None:
     """脱离调用方进程树启动 PG（Windows 用 DETACHED_PROCESS，避免被 agent 生命周期连带杀死）。"""
     exe = os.path.join(PG_BIN, "pg_ctl.exe" if os.name == "nt" else "pg_ctl")
     log = os.path.join(PG_DATA, "pg.log")
     cmd = [exe, "-D", PG_DATA, "-l", log, "start"]
-    kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-              stderr=subprocess.DEVNULL, close_fds=True)
+    kw = dict(stdin=subprocess.DEVNULL, close_fds=True)
+    # pg_ctl 自身的报错落文件（不能用 DEVNULL，否则"启动失败"永远是黑盒）。
+    # 安全：postmaster 的输出由 pg_ctl 经 -l 重定向到 pg.log，不会继承这个句柄。
+    try:
+        ctl_fh = open(_ctl_log_path(), "ab", buffering=0)
+        kw["stdout"] = ctl_fh
+        kw["stderr"] = ctl_fh
+    except Exception:  # noqa: BLE001
+        ctl_fh = None
+        kw["stdout"] = kw["stderr"] = subprocess.DEVNULL
     try:
         if os.name == "nt":
             DETACHED_PROCESS = 0x00000008
             CREATE_NEW_PROCESS_GROUP = 0x00000200
-            CREATE_NO_WINDOW = 0x08000000
+            # ⚠️ 绝不可加 CREATE_NO_WINDOW(0x08000000)：它会创建"隐藏控制台"，
+            #    postmaster 一旦与控制台绑定，控制台被关闭/收到 Ctrl+C 时会收到
+            #    CTRL_CLOSE_EVENT，整库被 0xC000013A 打死（2026-10-10 实测事故，
+            #    pg.log 里留下 "terminated by exception 0xC000013A" + "^C"）。
+            #    只有 DETACHED_PROCESS 才是真正的"无控制台"，免疫控制台事件。
             subprocess.Popen(cmd, creationflags=DETACHED_PROCESS |
-                             CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW, **kw)
+                             CREATE_NEW_PROCESS_GROUP, **kw)
         else:
             subprocess.Popen(cmd, start_new_session=True, **kw)
         _log("已发出启动命令: %s" % " ".join(cmd))
     except Exception as e:  # noqa: BLE001
         _log("启动命令执行失败: %s" % e)
+    finally:
+        if ctl_fh is not None:
+            try:
+                ctl_fh.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def ensure_pg_running(assume_down: bool = False) -> bool:
@@ -147,6 +201,8 @@ def ensure_pg_running(assume_down: bool = False) -> bool:
                 _log("PG 就绪（等待 %.1f 秒）" % (time.time() - t0))
                 return True
         _log("PG 拉起失败或超时（%.0f 秒）" % PG_START_TIMEOUT)
+        _log_ctl_output()
+        _diagnose_start_failure()
         return False
     finally:
         if got:
