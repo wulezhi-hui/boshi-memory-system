@@ -985,6 +985,27 @@ def _get_collection():
     return client.get_or_create_collection(COLLECTION_NAME, embedding_function=_get_embedding_function())
 
 
+def get_by_id(memory_id: str):
+    """按 id 取单条记忆 → {"id","content","metadata"} 或 None。
+
+    与 PG 后端同契约；供版本链/图谱等只读场景使用，
+    避免各模块自己去抓裸 collection（那样在 PG 后端下会读到错的后端）。
+    """
+    try:
+        col = _get_collection()
+        r = col.get(ids=[memory_id], include=["documents", "metadatas"])
+        ids = r.get("ids") or []
+        if not ids:
+            return None
+        docs = r.get("documents") or []
+        metas = r.get("metadatas") or []
+        return {"id": ids[0],
+                "content": (docs[0] if docs else "") or "",
+                "metadata": (metas[0] if metas else {}) or {}}
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # ══════════════════════════════════════════════════════════════════
 # 后端切换（2026-10-10）：BOSHI_BACKEND=pg → 公开 API 交给 pg_bridge(pgvector)
 # ══════════════════════════════════════════════════════════════════
@@ -999,7 +1020,7 @@ _PUBLIC_API = (
     "add_memory", "add_memories_batch", "search_memory", "hybrid_search",
     "get_time_range", "get_recent", "get_total_count", "delete_memory",
     "delete_memories", "update_memory", "deprecate_memory", "get_all_relations",
-    "auto_forget", "detect_conflicts", "resolve_conflict",
+    "auto_forget", "detect_conflicts", "resolve_conflict", "get_by_id",
 )
 
 if BACKEND == "pg":

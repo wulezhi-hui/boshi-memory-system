@@ -291,7 +291,22 @@ def add_memory(content: str, metadata: dict = None, memory_id: str = None):
     source = meta.pop("source", None)
     role = meta.pop("role", None)
     sid = meta.pop("session_id", None)
-    meta.pop("type", None)          # 关系边不入此表
+
+    # ── 图谱边路由：type=relation（或带 entity_a/entity_b）→ 写进 graph_edges 表 ──
+    # Chroma 时代边和记忆同 collection；PG 里分了表，写入必须分流，否则边会被当成记忆
+    if meta.get("type") == "relation" or ("entity_a" in meta and "entity_b" in meta):
+        ea = meta.get("entity_a", "") or ""
+        eb = meta.get("entity_b", "") or ""
+        rel = meta.get("relation", "") or ""
+        mv = _ef()([content or " "])[0]
+        with c.cursor() as cur:
+            cur.execute("""INSERT INTO boshi.graph_edges
+                           (id, entity_a, entity_b, relation, content, embedding, version_created)
+                           VALUES (%s,%s,%s,%s,%s,%s::vector,%s)
+                           ON CONFLICT (id) DO NOTHING""",
+                        (mid, ea, eb, rel, content, _vec_literal(mv), vc))
+        return mid
+
     v = _ef()([content or " "])[0]
     if ts:
         try:
@@ -328,6 +343,47 @@ def add_memories_batch(entries: list):
     return {"added": added, "failed": failed, "errors": errors}
 
 
+def _scan_type(w: dict):
+    """扫描 where，判断是否要检索「图谱边」（type=='relation'），并取出 rel_type。"""
+    want, rel_type = False, None
+
+    def walk(x):
+        nonlocal want, rel_type
+        if not isinstance(x, dict):
+            return
+        for k, v in x.items():
+            if k in ("$and", "$or") and isinstance(v, list):
+                for y in v:
+                    walk(y)
+            elif k == "type" and v == "relation":
+                want = True
+            elif k == "rel_type":
+                rel_type = v
+
+    walk(w)
+    return want, rel_type
+
+
+def _search_edges(query: str, top_k: int, rel_type: str = None):
+    """在 graph_edges 表里做语义检索（Chroma 时代边与记忆同表，PG 里必须分表查）。"""
+    c = _conn()
+    v = _vec_literal(_ef()([query or " "])[0])
+    sql = ("""SELECT id, content,
+              jsonb_build_object('type','relation','entity_a',entity_a,
+                                 'entity_b',entity_b,'relation',relation) AS meta,
+              embedding <=> %s::vector AS dist
+              FROM boshi.graph_edges""")
+    ps = [v]
+    if rel_type:
+        sql += " WHERE relation = %s"
+        ps.append(rel_type)
+    sql += " ORDER BY embedding <=> %s::vector LIMIT %s"
+    ps += [v, int(min(top_k, 200))]
+    with c.cursor() as cur:
+        cur.execute(sql, ps)
+        return [_row_to_item(r) for r in cur.fetchall()]
+
+
 def search_memory(query: str, top_k: int = 5, where: dict = None,
                   all_versions: bool = False, include_graph: bool = False,
                   scope: str = None, me: str = None):
@@ -335,6 +391,12 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
     w = dict(where or {})
     if not all_versions:
         w.setdefault("isLatest", True)
+
+    # 图谱边检索请求 → 走 graph_edges 表（与 Chroma 后端行为对齐）
+    want_rel, rel_type = _scan_type(w)
+    if want_rel:
+        return _search_edges(query, top_k, rel_type)
+
     cond, params = _where_sql(w, scope, me or _resolve_profile(), include_graph)
     v = _vec_literal(_ef()([query or " "])[0])
     sql = f"""
@@ -501,6 +563,28 @@ def deprecate_memory(memory_id: str, superseded_by: str = None):
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def get_by_id(memory_id: str):
+    """按 id 取单条记忆（先查记忆表，再查图谱边表）→ {"id","content","metadata"} 或 None。
+
+    与 chroma_bridge 同契约；图谱/版本链等只读场景走它，避免绕过后端调度。
+    """
+    c = _conn()
+    with c.cursor() as cur:
+        cur.execute("SELECT id, content, " + _META_SEL +
+                    " FROM boshi.memories WHERE id = %s", (memory_id,))
+        row = cur.fetchone()
+        if row:
+            return {"id": str(row[0]), "content": row[1] or "", "metadata": row[2] or {}}
+        cur.execute("""SELECT id, content,
+                       jsonb_build_object('type','relation','entity_a',entity_a,
+                                          'entity_b',entity_b,'relation',relation) AS meta
+                       FROM boshi.graph_edges WHERE id = %s""", (memory_id,))
+        row = cur.fetchone()
+        if row:
+            return {"id": str(row[0]), "content": row[1] or "", "metadata": row[2] or {}}
+    return None
 
 
 def get_all_relations(top_k: int = 10000) -> list:

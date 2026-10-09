@@ -177,11 +177,9 @@ def trace_version_chain(memory_id: str, max_depth: int = 20) -> List[dict]:
         [{id, content, metadata, direction: "parent"/"child"}, ...]
     """
     try:
-        from chroma_bridge import _get_client, _get_embedding_function, COLLECTION_NAME
-
-        client = _get_client()
-        ef = _get_embedding_function()
-        col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
+        # 走公开 API（后端无关）：PG 后端下自动走 pgvector —— 不再直连 Chroma collection，
+        # 否则切到 PG 后这里会读到旧后端（图谱/版本链与记忆数据分叉）。2026-10-10
+        from chroma_bridge import get_by_id
 
         chain = []
         visited = {memory_id}
@@ -189,11 +187,11 @@ def trace_version_chain(memory_id: str, max_depth: int = 20) -> List[dict]:
 
         # 向父级追溯
         for _ in range(max_depth):
-            data = col.get(ids=[current_id])
-            if not data["metadatas"] or not data["metadatas"][0]:
+            rec = get_by_id(current_id)
+            if not rec:
                 break
-            meta = data["metadatas"][0]
-            content = data["documents"][0] if data.get("documents") and data["documents"][0] else ""
+            meta = rec.get("metadata") or {}
+            content = rec.get("content") or ""
 
             chain.append({
                 "id": current_id,
