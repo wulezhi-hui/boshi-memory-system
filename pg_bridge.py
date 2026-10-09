@@ -364,15 +364,17 @@ def add_memory(content: str, metadata: dict = None, memory_id: str = None):
         return mid
 
     v = _ef()([content or " "])[0]
-    if ts:
-        try:
-            from datetime import datetime, timezone
-            created = datetime.fromtimestamp(float(ts), timezone.utc)
-        except Exception:
-            created = None
-    else:
+    from datetime import datetime, timezone
+    try:
+        if not ts:
+            # 调用方未传 timestamp 时**必须补当前时间**：否则 created_at 落 NULL，
+            # 该条记忆对 time_range / recent 等时间线查询**永久隐形**
+            # （2026-10-10 实测：PG 库里已积累 11 条 created_at=NULL 的记录）
+            ts = time.time()
+        created = datetime.fromtimestamp(float(ts), timezone.utc)
+        meta.setdefault("timestamp", float(ts))
+    except Exception:
         created = None
-        meta.setdefault("timestamp", None)
     with c.cursor() as cur:
         cur.execute("""
             INSERT INTO boshi.memories
