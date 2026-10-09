@@ -137,6 +137,26 @@ def _diagnose_start_failure() -> None:
         _log("体检: pg.log 检查异常 %s" % e)
 
 
+PG_SERVICE = os.environ.get("BOSHI_PG_SERVICE") or "boshi-pg"
+
+
+def _service_state() -> str:
+    """Windows 服务状态：RUNNING / STOPPED / START_PENDING / STOP_PENDING / absent / unknown。"""
+    if os.name != "nt":
+        return "absent"
+    try:
+        r = subprocess.run(["sc.exe", "query", PG_SERVICE], capture_output=True, timeout=15)
+        txt = ((r.stdout or b"") + (r.stderr or b"")).decode("gbk", "replace").upper()
+        if "1060" in txt:          # 指定的服务未安装
+            return "absent"
+        for st in ("START_PENDING", "STOP_PENDING", "RUNNING", "STOPPED"):
+            if st in txt:
+                return st
+        return "unknown"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
 def _start_server() -> None:
     """启动 PG。
 
@@ -150,9 +170,27 @@ def _start_server() -> None:
     3. 因此只剩两种选择：**可见窗口**（DETACHED）或**隐藏控制台**（CREATE_NO_WINDOW）。
        这里选 CREATE_NO_WINDOW —— 无窗口（用户无感），且隐藏控制台无法被误关。
        但两者 postmaster 都挂在 cmd 的控制台上，控制台事件仍可能打死整库
-       （2026-10-10 两次 0xC000013A）。真正彻底的做法是注册成 Windows 服务
-       （服务无控制台），需要管理员且属架构变更，**待用户决定**（见 v7.0 文档 §八）。
+       （2026-10-10 两次 0xC000013A）。
+    4. **2026-10-10 追加：已注册 Windows 服务 `boshi-pg`（账号 NT AUTHORITY\\NetworkService，
+       非管理员令牌 → PG 不再拒绝；服务无控制台 → 彻底免疫控制台事件，且开机自启）**。
+       因此本函数**优先走服务**：服务在跑 → 什么都不做（交给服务自愈）；服务停着 → `sc start`；
+       服务不可用/没权限 → 回退 pg_ctl 独立启动（保持旧行为，绝不至于"起不来"）。
     """
+    if os.name == "nt":
+        st = _service_state()
+        if st in ("RUNNING", "START_PENDING", "STOP_PENDING"):
+            _log("PG 服务 %s 状态=%s → 交给服务自愈，不另起实例" % (PG_SERVICE, st))
+            return
+        if st != "absent":
+            try:
+                r = subprocess.run(["sc.exe", "start", PG_SERVICE],
+                                   capture_output=True, timeout=30)
+                _log("尝试以服务方式启动 %s: rc=%d" % (PG_SERVICE, r.returncode))
+                if r.returncode == 0:
+                    return
+            except Exception as e:  # noqa: BLE001
+                _log("服务方式启动异常: %s" % e)
+            _log("服务方式未成功 → 回退 pg_ctl 独立启动")
     log = os.path.join(PG_DATA, "pg.log")
     # pg.log 被占用（孤儿进程持句柄）时退回带时间戳的日志名，避免"启动彻底失败"
     try:
