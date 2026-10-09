@@ -31,7 +31,7 @@ PG_DSN = os.environ.get("BOSHI_PG_DSN") or \
 PG_BIN = os.environ.get("BOSHI_PG_BIN", r"J:/pgsql/bin")
 PG_DATA = os.environ.get("BOSHI_PG_DATA", r"J:/pgdata")
 PG_AUTOSTART = (os.environ.get("BOSHI_PG_AUTOSTART", "1").strip() != "0")
-PG_START_TIMEOUT = float(os.environ.get("BOSHI_PG_START_TIMEOUT", "30"))
+PG_START_TIMEOUT = float(os.environ.get("BOSHI_PG_START_TIMEOUT", "90"))
 _LOCK = os.path.expanduser("~/.boshi/pg_autostart.lock")
 _LOG = os.path.expanduser("~/.boshi/logs/pg_autostart.log")
 
