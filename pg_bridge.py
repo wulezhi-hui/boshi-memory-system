@@ -15,22 +15,160 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import time
 from typing import Any, Dict, List, Optional
 
 PG_DSN = os.environ.get("BOSHI_PG_DSN") or \
     "postgresql://postgres@127.0.0.1:5432/hermes_data"
 
+# ── PG 自动拉起（钩子：任何 agent 首次访问伯仕时自愈）──────────────────
+# 设计（2026-10-10，用户选型「钩子」）：
+#   1. 所有接入方（Hermes 插件 / MCP server / 桥接 / CLI）都经过本模块 → 钩子装这里 = 100% 覆盖
+#   2. 并发安全：文件锁 + 二次确认，只让一个进程去 start，其余等就绪
+#   3. **失败响亮报错，绝不静默退回 Chroma**（否则会一半写 PG 一半写 Chroma → 数据分叉）
+#   4. 启动必须**脱离调用方进程树**，否则 agent 进程被杀会把 PG 连带杀死
+PG_BIN = os.environ.get("BOSHI_PG_BIN", r"J:/pgsql/bin")
+PG_DATA = os.environ.get("BOSHI_PG_DATA", r"J:/pgdata")
+PG_AUTOSTART = (os.environ.get("BOSHI_PG_AUTOSTART", "1").strip() != "0")
+PG_START_TIMEOUT = float(os.environ.get("BOSHI_PG_START_TIMEOUT", "30"))
+_LOCK = os.path.expanduser("~/.boshi/pg_autostart.lock")
+_LOG = os.path.expanduser("~/.boshi/logs/pg_autostart.log")
+
 _conn_holder: Dict[str, Any] = {}
 _ef_holder: Dict[str, Any] = {}
 
 
+def _log(msg: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(_LOG), exist_ok=True)
+        with open(_LOG, "a", encoding="utf-8") as f:
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
+def _try_connect(timeout: float = 2.0):
+    """尝试连接；成功返回连接对象，失败返回 None。"""
+    try:
+        import psycopg
+        return psycopg.connect(PG_DSN, connect_timeout=timeout, autocommit=True)
+    except Exception:
+        return None
+
+
+def _server_alive() -> bool:
+    c = _try_connect(2.0)
+    if c is None:
+        return False
+    try:
+        with c.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+
+def _acquire_lock(max_age: float = 60.0) -> bool:
+    """抢占启动锁；陈锁（>max_age 秒，说明上个持锁进程崩了）可接管。"""
+    try:
+        if os.path.exists(_LOCK):
+            if time.time() - os.path.getmtime(_LOCK) > max_age:
+                os.remove(_LOCK)
+            else:
+                return False
+        fd = os.open(_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+    except Exception:
+        return False
+
+
+def _release_lock() -> None:
+    try:
+        os.remove(_LOCK)
+    except Exception:
+        pass
+
+
+def _start_server() -> None:
+    """脱离调用方进程树启动 PG（Windows 用 DETACHED_PROCESS，避免被 agent 生命周期连带杀死）。"""
+    exe = os.path.join(PG_BIN, "pg_ctl.exe" if os.name == "nt" else "pg_ctl")
+    log = os.path.join(PG_DATA, "pg.log")
+    cmd = [exe, "-D", PG_DATA, "-l", log, "start"]
+    kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+              stderr=subprocess.DEVNULL, close_fds=True)
+    try:
+        if os.name == "nt":
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000
+            subprocess.Popen(cmd, creationflags=DETACHED_PROCESS |
+                             CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW, **kw)
+        else:
+            subprocess.Popen(cmd, start_new_session=True, **kw)
+        _log("已发出启动命令: %s" % " ".join(cmd))
+    except Exception as e:  # noqa: BLE001
+        _log("启动命令执行失败: %s" % e)
+
+
+def ensure_pg_running(assume_down: bool = False) -> bool:
+    """确保 PG 可用：已在跑→True；否则自动拉起并等待就绪（并发安全）。
+
+    assume_down=True 时跳过首次探测（调用方刚连失败，可省一次握手）。
+    """
+    if not PG_AUTOSTART:
+        _log("BOSHI_PG_AUTOSTART=0，跳过自动拉起")
+        return False
+    if not assume_down and _server_alive():
+        return True
+    got = _acquire_lock()
+    try:
+        if _server_alive():          # 拿锁后再确认一次：可能别的进程刚好拉起来了
+            return True
+        if got:
+            _log("PG 未运行 → 自动拉起（数据目录 %s）" % PG_DATA)
+            _start_server()
+        else:
+            _log("PG 未运行，未拿到启动锁 → 等待其它进程拉起")
+        t0 = time.time()
+        while time.time() - t0 < PG_START_TIMEOUT:
+            time.sleep(0.25)
+            if _server_alive():
+                _log("PG 就绪（等待 %.1f 秒）" % (time.time() - t0))
+                return True
+        _log("PG 拉起失败或超时（%.0f 秒）" % PG_START_TIMEOUT)
+        return False
+    finally:
+        if got:
+            _release_lock()
+
+
 def _conn():
-    """模块级单例连接（psycopg3，自动重连）。"""
+    """模块级单例连接；连不上时先尝试自动拉起 PG，仍失败则**响亮报错**（不静默退回 Chroma）。"""
     import psycopg
     c = _conn_holder.get("c")
-    if c is None or c.closed:
-        c = psycopg.connect(PG_DSN, autocommit=True)
-        _conn_holder["c"] = c
+    if c is not None and not c.closed:
+        return c
+    try:
+        c = psycopg.connect(PG_DSN, connect_timeout=3, autocommit=True)
+    except Exception as e:  # noqa: BLE001
+        if not ensure_pg_running(assume_down=True):
+            raise RuntimeError(
+                "伯仕 PG 后端不可用：连接 %s 失败，且自动拉起未成功。\n"
+                "  排查：① 查看自动拉起日志 %s ② 手动运行 J:\\pgsql\\pg_start.cmd "
+                "③ 临时绕过：去掉环境变量 BOSHI_BACKEND（回 Chroma）" % (PG_DSN, _LOG)) from e
+        c = psycopg.connect(PG_DSN, connect_timeout=5, autocommit=True)
+    _conn_holder["c"] = c
     return c
 
 
