@@ -395,9 +395,13 @@ def _row_to_item(row) -> dict:
             "metadata": meta, "score": float(dist) if dist is not None else 0.0}
 
 
-# 返回给调用方的 metadata 必须与 Chroma 后端同形：把拆成列的 profile/isLatest 拼回去
-_META_SEL = ("meta || jsonb_build_object('profile', profile, 'isLatest', is_latest) "
-             "AS meta")
+# 返回给调用方的 metadata 必须与 Chroma 后端同形：把拆成列的 profile/isLatest 拼回去，
+# **并且总是补出 timestamp**：优先取 created_at 列（权威），回落到 meta 里的旧值。
+# 缺了这步，凡是 meta 里没写 timestamp 的记录，调用方按 metadata.timestamp 排序/展示时
+# 就会"没有时间"（2026-10-10 实测：dsh 侧正是踩到这个缺口）
+_META_SEL = ("meta || jsonb_build_object('profile', profile, 'isLatest', is_latest, "
+             "'timestamp', COALESCE(EXTRACT(EPOCH FROM created_at), "
+             "NULLIF(meta->>'timestamp', '')::float8)) AS meta")
 
 
 # ── 公开 API（与 chroma_bridge 同名同签名）────────────────────────
