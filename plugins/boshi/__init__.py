@@ -135,18 +135,48 @@ class BoshiMemoryProvider(MemoryProvider):
         return "boshi"
 
     def is_available(self) -> bool:
-        """检查 ~/.boshi 是否已安装（boshi_core.py + chroma_db 目录）。"""
-        has_code = (BOSHI_HOME / "boshi_core.py").exists()
-        has_db = (BOSHI_HOME / "chroma_db").is_dir()
-        return has_code and has_db
+        """后端感知的可用性检查（2026-10-10 修，事故驱动）。
+
+        - `backend = pg`     → 要求 `psycopg` 可导入。**缺它会让所有 PG 查询静默失败**：
+          prefetch 拿不到记忆 → 🦄 图标消失、记忆也不写入（异常被吞在 debug 级）
+        - `backend = chroma` → 检查 `chroma_db` 目录（原逻辑）
+
+        注意：**不在这里探测数据库是否在线** —— PG 由 Windows 服务 / 钩子按需拉起，
+        在这里判"不可用"会让 provider 被停用、图标消失。
+        """
+        if not (BOSHI_HOME / "boshi_core.py").exists():
+            return False
+        try:
+            if str(BOSHI_HOME) not in sys.path:
+                sys.path.insert(0, str(BOSHI_HOME))
+            import chroma_bridge
+            if chroma_bridge.backend_name() == "pg":
+                import psycopg  # noqa: F401  （PG 后端的运行时必需依赖）
+                return True
+            return (BOSHI_HOME / "chroma_db").is_dir()
+        except Exception:
+            return False
 
     def unavailable_reason(self) -> str:
         reasons = []
         if not (BOSHI_HOME / "boshi_core.py").exists():
             reasons.append("未找到 ~/.boshi/boshi_core.py")
-        if not (BOSHI_HOME / "chroma_db").is_dir():
-            reasons.append("未找到 ~/.boshi/chroma_db/ 目录")
-        return "；".join(reasons) if reasons else "伯仕记忆系统未安装"
+        try:
+            if str(BOSHI_HOME) not in sys.path:
+                sys.path.insert(0, str(BOSHI_HOME))
+            import chroma_bridge
+            if chroma_bridge.backend_name() == "pg":
+                try:
+                    import psycopg  # noqa: F401
+                except Exception:
+                    reasons.append(
+                        "PG 后端需要 psycopg，但当前 Python 环境没装"
+                        "（装法：uv pip install --python <hermes venv>/Scripts/python.exe \"psycopg[binary]\"）")
+            elif not (BOSHI_HOME / "chroma_db").is_dir():
+                reasons.append("未找到 ~/.boshi/chroma_db/ 目录")
+        except Exception as e:  # noqa: BLE001
+            reasons.append("无法解析伯仕后端：%s" % e)
+        return "；".join(reasons)   # 可用时返回空串（原来会误报"未安装"）
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return []  # 本地 provider，无需额外配置
@@ -348,7 +378,7 @@ class BoshiMemoryProvider(MemoryProvider):
                     self._prefetch_cache = ""
                 self._prefetch_time = time.time()
             except Exception as e:
-                logger.debug("boshi queue_prefetch failed: %s", e)
+                logger.warning("boshi queue_prefetch 失败（本轮不会有记忆注入、🦄 图标也不会出现）: %s", e)
                 self._prefetch_cache = ""
                 self._prefetch_time = 0.0
 
@@ -454,7 +484,7 @@ class BoshiMemoryProvider(MemoryProvider):
                 return ""
             return "## 伯仕记忆召回\n" + "\n".join(lines[:8])
         except Exception as e:
-            logger.debug("boshi prefetch failed: %s", e)
+            logger.warning("boshi prefetch 失败（本轮无记忆召回、🦄 图标不会出现）: %s", e)
             return ""
 
     def recall_status(self) -> Optional[RecallStatus]:
@@ -519,7 +549,7 @@ class BoshiMemoryProvider(MemoryProvider):
                     },
                 )
         except Exception as e:
-            logger.debug("boshi sync_turn failed: %s", e)
+            logger.warning("boshi sync_turn 写入失败（这轮对话没进记忆库）: %s", e)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """会话结束时提炼任务结论（改进1：结论提炼）。
@@ -610,7 +640,7 @@ class BoshiMemoryProvider(MemoryProvider):
                 },
             )
         except Exception as e:
-            logger.debug("boshi on_memory_write failed: %s", e)
+            logger.warning("boshi on_memory_write 镜像失败（内置记忆没同步进伯仕）: %s", e)
 
     # ------------------------------------------------------------------
     # 工具（context-only：手动检索交给 MCP 的 boshi_search 等）

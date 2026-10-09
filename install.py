@@ -50,7 +50,7 @@ def get_hermes_home() -> Path:
 # ⚠️ Hermes 每次运行时换代（换 venv / 换 python 版本）都会连带卸掉它们——症状是
 #    插件**静默失忆**（不召回、不写入、日志还照样显示 registered/activated），
 #    只能靠 L2 写入量（source=hermes_plugin）发现。安装脚本须能自愈这一点。
-PLUGIN_DEPS = ["chromadb", "onnxruntime", "transformers"]
+PLUGIN_DEPS = ["chromadb", "onnxruntime", "transformers", "psycopg[binary]"]
 # 不用 pip show 探测——新版 Hermes venv 由 uv 管理，可能根本没有 pip
 _DEPS_PROBE = (
     "import importlib.util as u, sys;"
@@ -125,7 +125,7 @@ def deploy_code() -> None:
 def install_deps() -> None:
     """安装 Python 依赖到伯仕 venv。"""
     print("[2/6] 安装 Python 依赖到 ~/.boshi/venv...")
-    deps = ["chromadb", "mcp>=2.0.0", "onnxruntime", "transformers", "pyyaml"]
+    deps = ["chromadb", "mcp>=2.0.0", "onnxruntime", "transformers", "pyyaml", "psycopg[binary]"]
     pip = [str(BOSHI_VENV / "Scripts" / "pip.exe"), "install"]
     for d in deps:
         subprocess.run(pip + [d], check=False)
