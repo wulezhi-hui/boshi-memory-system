@@ -211,6 +211,17 @@ class BoshiMemoryProvider(MemoryProvider):
             logger.warning("boshi provider initialize failed: %s", e)
             self._core = None
 
+        # 起步自检：真跑一次检索，把"依赖缺失 / 后端不可用"这类**静默失忆**在会话一开始就暴露。
+        # 2026-10-10 事故：Hermes venv 缺 psycopg → 查询全炸在惰性 import 上，
+        # 异常被吞 → 无召回、🦄 图标不出现、sync_turn 不写库，而启动日志全绿。
+        if self._core is not None:
+            try:
+                self._core.search("__boshi_selfcheck__", top_k=1)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "boshi 起步自检失败：记忆读/写很可能不可用（图标不出现、对话不入库）。"
+                    "错误：%s", e)
+
     def shutdown(self) -> None:
         self._core = None
         self._prefetch_cache = ""
