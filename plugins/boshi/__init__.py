@@ -39,6 +39,63 @@ logger = logging.getLogger(__name__)
 # 伯仕部署目录（与 boshi_core.py / boshi_mcp_server.py 一致）
 BOSHI_HOME = Path.home() / ".boshi"
 
+# ── 诊断日志（2026-10-10 排查"🦄 图标不出现"时加；BOSHI_DIAG_LOG=0 可关闭）──
+# 为什么需要：召回/写入都在 try/except 里，失败默认静默；而"图标出不出现"取决于
+# ① prefetch 是否有内容 ② recall_status 是否非 None —— 只有把这两个事实打出来才能定位。
+_DIAG = os.environ.get("BOSHI_DIAG_LOG", "1") != "0"
+_diag_seen: set = set()
+
+
+def _diag(msg: str, *args) -> None:
+    if _DIAG:
+        logger.info("boshi[诊断] " + msg, *args)
+
+
+def _diag_once(key: str, msg: str, *args) -> None:
+    if _DIAG and key not in _diag_seen:
+        _diag_seen.add(key)
+        logger.info("boshi[诊断] " + msg, *args)
+
+
+def _ensure_runtime_deps() -> bool:
+    """确保伯仕数据层需要的第三方依赖可导入（PG 后端要 psycopg，Chroma 后端要 chromadb）。
+
+    背景（2026-10-10 事故）：WebUI 的会话 worker 跑在**裸的 tools python** 上
+    （`hermes/tools/python-3.14.7...`，site-packages 为空），于是 psycopg/chromadb
+    都找不到 → `is_available()` 返回 False → **整个记忆 provider 被停用**：
+    无召回、🦄 图标不出现、对话不入库，而启动日志看不出异常。
+
+    修法：把**与当前解释器同版本**的 Hermes venv site-packages 挂到 sys.path 末尾
+    （版本必须匹配，否则原生扩展 ABI 不符会崩；挂载失败会自动回滚）。
+    """
+    try:
+        import psycopg  # noqa: F401
+        return True
+    except Exception:  # noqa: BLE001
+        pass
+    home = os.environ.get("HERMES_HOME") or str(Path.home() / "AppData" / "Local" / "hermes")
+    ver = "python%d.%d" % sys.version_info[:2]
+    cands = []
+    for base in (Path(home) / "hermes-agent" / ".venv", Path(home) / "hermes-agent" / "venv"):
+        cands.append(base / ("Lib/site-packages" if os.name == "nt" else "lib/%s/site-packages" % ver))
+    for p in cands:
+        if not p.is_dir() or str(p) in sys.path:
+            continue
+        sys.path.append(str(p))          # append：不抢当前环境已有的包
+        try:
+            import psycopg  # noqa: F401
+            _diag_once("deps", "当前环境缺依赖 → 已挂载 %s（psycopg=%s、chromadb 等随其可用）",
+                       p, getattr(psycopg, "__version__", "?"))
+            return True
+        except Exception:  # noqa: BLE001
+            try:
+                sys.path.remove(str(p))  # 回滚，避免污染
+            except ValueError:
+                pass
+    _diag_once("deps", "当前环境缺 psycopg，且未找到可用的备选 site-packages（候选：%s）",
+               "、".join(str(c) for c in cands))
+    return False
+
 # 助手结论中常见的"纯工具噪音"标记：这些前缀/模式表示该输出主要是
 # 工具回显（JSON/状态码/路径列表），不是面向用户的结论，不值得入库。
 _TOOL_NOISE_MARKERS = (
@@ -145,16 +202,22 @@ class BoshiMemoryProvider(MemoryProvider):
         在这里判"不可用"会让 provider 被停用、图标消失。
         """
         if not (BOSHI_HOME / "boshi_core.py").exists():
+            _diag_once("avail", "is_available=False（缺 ~/.boshi/boshi_core.py）")
             return False
+        _ensure_runtime_deps()   # 裸环境（WebUI worker）先补齐 psycopg/chromadb 等
         try:
             if str(BOSHI_HOME) not in sys.path:
                 sys.path.insert(0, str(BOSHI_HOME))
             import chroma_bridge
             if chroma_bridge.backend_name() == "pg":
                 import psycopg  # noqa: F401  （PG 后端的运行时必需依赖）
+                _diag_once("avail", "is_available=True（backend=pg，psycopg=%s）", psycopg.__version__)
                 return True
-            return (BOSHI_HOME / "chroma_db").is_dir()
-        except Exception:
+            ok = (BOSHI_HOME / "chroma_db").is_dir()
+            _diag_once("avail", "is_available=%s（backend=chroma）", ok)
+            return ok
+        except Exception as e:  # noqa: BLE001
+            _diag_once("avail", "is_available=False（异常：%s）→ provider 会被停用，图标必然不出现", e)
             return False
 
     def unavailable_reason(self) -> str:
@@ -190,6 +253,8 @@ class BoshiMemoryProvider(MemoryProvider):
         home = str(BOSHI_HOME)
         if home not in sys.path:
             sys.path.insert(0, home)
+        # 裸环境（WebUI 会话 worker 用的是空 site-packages 的 tools python）先补齐依赖
+        _ensure_runtime_deps()
 
         # 尝试导入 boshi_core（会触发 chromadb 等依赖加载）
         try:
@@ -468,9 +533,12 @@ class BoshiMemoryProvider(MemoryProvider):
         改进3：缓存带 TTL（300秒），避免 Hermes 8 秒超时被跳过。
         """
         if is_trivial_prompt(query) or self._core is None:
+            _diag("prefetch 提前退出：trivial=%s, _core 已连=%s → 本轮无召回、无图标",
+                  is_trivial_prompt(query), self._core is not None)
             return ""
         # 改进3：有缓存且 5 分钟内 → 毫秒级返回，不触发超时
         if self._prefetch_cache and time.time() - self._prefetch_time < 300:
+            _diag("prefetch 命中缓存：count=%s，%d 字符 → 图标应显示", self._prefetch_count, len(self._prefetch_cache))
             return self._prefetch_cache
         # 首轮/缓存过期：同步检索兜底（保证每轮都有记忆注入）
         try:
@@ -491,7 +559,9 @@ class BoshiMemoryProvider(MemoryProvider):
                 lines.append(f"- [hist] {h}")
             self._prefetch_count += len(hist)
             self._prefetch_time = time.time()
+            _diag("prefetch 实时检索：count=%s，%d 行内容", self._prefetch_count, len(lines))
             if not lines:
+                _diag("prefetch 检索结果为空 → 无召回注入、🦄 图标不出现")
                 return ""
             return "## 伯仕记忆召回\n" + "\n".join(lines[:8])
         except Exception as e:
@@ -501,7 +571,12 @@ class BoshiMemoryProvider(MemoryProvider):
     def recall_status(self) -> Optional[RecallStatus]:
         """向 UI 展示上一轮召回条数。"""
         if self._prefetch_count > 0:
-            return RecallStatus("boshi", self._prefetch_count, glyph="🦄")
+            st = RecallStatus("boshi", self._prefetch_count, glyph="🦄")
+            _diag("recall_status 已交给 UI：%s %s — recalled %s memories"
+                  "（若界面仍无显示，问题在 UI 渲染层，不在记忆系统）",
+                  st.glyph, st.provider_label, st.count)
+            return st
+        _diag("recall_status 返回 None（count=0）→ 图标不会出现")
         return None
 
     # ------------------------------------------------------------------
