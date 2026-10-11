@@ -96,6 +96,25 @@ def _ensure_runtime_deps() -> bool:
                "、".join(str(c) for c in cands))
     return False
 
+# ── 召回质量过滤（2026-10-11 用户反馈：召回里混进"好了""在h盘"这类超短碎片）──
+# 规则：去空白后短于阈值（默认 5 字符）→ 丢弃；去掉标点/数字/空白后没有实质字词 → 丢弃。
+#   （实测噪声样本："好了"2 / "在h盘"3 / "开搞"2 / "启动了"3 / "开始"2 → 阈值 5 全覆盖；
+#     "重启网关了"(5) 这类仍保留，避免误伤有效短信息）
+# 只作用于**召回注入**（prefetch），不影响显式检索工具（boshi_search 仍返回全部）。
+# 可用 BOSHI_RECALL_MIN_LEN 调整阈值。
+_RECALL_MIN_LEN = int(os.environ.get("BOSHI_RECALL_MIN_LEN", "5"))
+
+
+def _worth_recalling(text: str) -> bool:
+    """该条内容是否值得注入召回上下文（滤掉超短/无信息量碎片）。"""
+    import re
+    s = (text or "").strip()
+    if len(s) < _RECALL_MIN_LEN:
+        return False
+    core = re.sub(r"[\s\W\d_]+", "", s, flags=re.UNICODE)   # 去掉空白/标点/数字后剩下的实词
+    return len(core) >= 2
+
+
 # 助手结论中常见的"纯工具噪音"标记：这些前缀/模式表示该输出主要是
 # 工具回显（JSON/状态码/路径列表），不是面向用户的结论，不值得入库。
 _TOOL_NOISE_MARKERS = (
@@ -430,14 +449,14 @@ class BoshiMemoryProvider(MemoryProvider):
                 lines = []
                 for x in results:
                     content = x.get("content", "")
-                    if not content:
-                        continue
+                    if not content or not _worth_recalling(content):
+                        continue          # 2026-10-11 过滤超短碎片
                     score = x.get("score", 0)
                     src = x.get("source", "")
                     lines.append(f"- [{score:.2f}|{src}] {content}")
 
                 # 改进2：历史会话补充召回
-                hist = self._search_session_history(query)
+                hist = [h for h in self._search_session_history(query) if _worth_recalling(h)]
                 for h in hist:
                     lines.append(f"- [hist] {h}")
 
@@ -446,7 +465,7 @@ class BoshiMemoryProvider(MemoryProvider):
                 if expanded_lines:
                     lines.extend(expanded_lines[:3])  # 最多添加3条扩展结果
 
-                self._prefetch_count = len(results) + len(hist)
+                self._prefetch_count = sum(1 for x in results if _worth_recalling(x.get("content") or "")) + len(hist)
                 self._prefetch_query = query
                 if lines:
                     self._prefetch_cache = "## 伯仕记忆召回\n" + "\n".join(lines[:10])
@@ -544,17 +563,17 @@ class BoshiMemoryProvider(MemoryProvider):
         try:
             result = self._core.search(query, top_k=5, source="all")
             results = result.get("results", [])
-            self._prefetch_count = len(results)
+            self._prefetch_count = sum(1 for x in results if _worth_recalling(x.get("content") or ""))
             self._prefetch_query = query
             lines = []
             for x in results:
                 content = x.get("content", "")
-                if not content:
-                    continue
+                if not content or not _worth_recalling(content):
+                    continue          # 2026-10-11 过滤超短碎片
                 score = x.get("score", 0)
                 src = x.get("source", "")
                 lines.append(f"- [{score:.2f}|{src}] {content}")
-            hist = self._search_session_history(query)
+            hist = [h for h in self._search_session_history(query) if _worth_recalling(h)]
             for h in hist:
                 lines.append(f"- [hist] {h}")
             self._prefetch_count += len(hist)
