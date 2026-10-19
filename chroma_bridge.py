@@ -1082,3 +1082,88 @@ def backend_name() -> str:
 def backend_source() -> str:
     """当前后端的解析来源（环境变量 / backends.json[key] / 默认）。"""
     return BACKEND_SOURCE
+
+
+# ══════════════════════════════════════════════════════════════════
+# 写入镜像（2026-10-19）：chroma 后端下，写入同时落一份进 PG
+# ══════════════════════════════════════════════════════════════════
+# 规则来源：用户定稿「全量记忆 PG 里也要有一份」——任何入口都不得只写 Chroma。
+# 三重保障：
+#   1. backends.json 所有 profile（含 "*"）一律 pg          → 正常路径本来就落 PG
+#   2. 本镜像：万一某进程显式 BOSHI_BACKEND=chroma（老插件/MCP 残留 env），
+#      写入照样镜像进 PG                                    → 兜住残留配置
+#   3. pg_sync.py 可离线对账（Chroma → PG 单向补齐）
+# 设计约束：
+#   - **失败绝不阻断主写入**（Chroma 成功即返回，镜像异常只记日志）
+#   - 开关 BOSHI_MIRROR_PG=0 可关（默认开）
+#   - 仅在 BACKEND == "chroma" 时生效（pg 后端本身就是目标，不需要镜像）
+#   - 失败日志：~/.boshi/logs/mirror-errors.log
+def _mirror_log(msg: str) -> None:
+    try:
+        _d = os.path.join(os.path.expanduser("~/.boshi"), "logs")
+        os.makedirs(_d, exist_ok=True)
+        with open(os.path.join(_d, "mirror-errors.log"), "a", encoding="utf-8") as _f:
+            _f.write("%s %s\n" % (_time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
+def _mirror_enabled() -> bool:
+    return (os.environ.get("BOSHI_MIRROR_PG") or "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+if BACKEND == "chroma" and _mirror_enabled():
+
+    # >0 = 镜像静默中：chroma 的 update_memory 内部会调用全局 add_memory，
+    # 不静默就会把同一次更新镜像两遍（实测多出一条孤儿新版本），故由 update 包装器临时置位
+    _MIRROR_QUIET = [0]
+
+    def _make_mirror(_name):
+        _orig = globals().get(_name)
+        if not callable(_orig):
+            return None
+
+        def _wrapped(*a, **kw):
+            _r = _orig(*a, **kw)
+            if _MIRROR_QUIET[0]:
+                return _r
+            try:
+                import pg_bridge as _pgb
+                getattr(_pgb, _name)(*a, **kw)
+            except Exception as _e:  # noqa: BLE001
+                _mirror_log("%s 镜像 PG 失败: %r" % (_name, _e))
+            return _r
+
+        _wrapped.__name__ = _name
+        _wrapped.__doc__ = getattr(_orig, "__doc__", None)
+        _wrapped.__wrapped__ = _orig
+        return _wrapped
+
+    # 签名完全一致的写操作：直接透传
+    for _n in ("add_memory", "add_memories_batch", "delete_memory",
+               "delete_memories", "deprecate_memory"):
+        _w = _make_mirror(_n)
+        if _w is not None:
+            globals()[_n] = _w
+
+    # update_memory：交给 pg_bridge 的同名实现（它自己做 append + 旧版本 isLatest=false），
+    # 期间静默内部 add_memory 的镜像，避免"一条更新在 PG 里写两遍"
+    _orig_update = globals().get("update_memory")
+    if callable(_orig_update):
+
+        def update_memory(memory_id, new_content, new_metadata=None):  # noqa: F811
+            _MIRROR_QUIET[0] += 1
+            try:
+                _new_id = _orig_update(memory_id, new_content, new_metadata)
+            finally:
+                _MIRROR_QUIET[0] -= 1
+            try:
+                import pg_bridge as _pgb
+                _pgb.update_memory(memory_id, new_content, new_metadata)
+            except Exception as _e:  # noqa: BLE001
+                _mirror_log("update_memory 镜像 PG 失败: %r" % (_e,))
+            return _new_id
+
+        update_memory.__doc__ = getattr(_orig_update, "__doc__", None)
+        update_memory.__wrapped__ = _orig_update

@@ -3,8 +3,13 @@
   "_profiles": "default = Hermes 主身（当前对话）；opencode / dsh / desktop / zuojia / dashi / shizhen = 各接入方",
   "_switch": "改这一个文件即完成按接入方切换；**进程重启后生效**（后端在 import 时解析）。未列出的 profile 走 \"*\"。",
   "_note": "接入方切换要两头一致：这里改成 pg 的同时，接入方也可以（可选）在自己的 MCP/插件 env 里显式写 BOSHI_BACKEND=pg；env 优先。",
+  "_rule": "2026-10-19 定稿：所有 profile 一律 pg（含 \"*\" 通配）——全量记忆必须在 PG 里有一份，不再有\"某入口只写 Chroma\"的分叉。chroma 仅作历史备份与回滚用。",
   "default": "pg",
   "dsh": "pg",
   "opencode": "pg",
-  "*": "chroma"
+  "desktop": "pg",
+  "zuojia": "pg",
+  "dashi": "pg",
+  "shizhen": "pg",
+  "*": "pg"
 }
