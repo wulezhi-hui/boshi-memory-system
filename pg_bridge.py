@@ -297,7 +297,7 @@ def _conn():
             raise RuntimeError(
                 "伯仕 PG 后端不可用：连接 %s 失败，且自动拉起未成功。\n"
                 "  排查：① 查看自动拉起日志 %s ② 手动运行 J:\\pgsql\\pg_start.cmd "
-                "③ 临时绕过：去掉环境变量 BOSHI_BACKEND（回 Chroma）" % (PG_DSN, _LOG)) from e
+                "③ 临时绕过：显式设 BOSHI_BACKEND=chroma（回 Chroma）" % (PG_DSN, _LOG)) from e
         c = psycopg.connect(PG_DSN, connect_timeout=5, autocommit=True)
     _conn_holder["c"] = c
     return c
@@ -452,6 +452,21 @@ def add_memory(content: str, metadata: dict = None, memory_id: str = None):
     source = meta.pop("source", None)
     role = meta.pop("role", None)
     sid = meta.pop("session_id", None)
+    # P2：槽位。slots 以 JSON 字符串随 metadata 传进来（Chroma 侧只收标量），
+    # 落 PG 时进独立 jsonb 列，**不回填进 meta**，避免每条检索结果都驮着 ~1KB 槽位。
+    _slots = meta.pop("slots", None)
+    _raw_len = meta.pop("raw_len", None)
+    if isinstance(_slots, str):
+        try:
+            _slots = json.loads(_slots)
+        except Exception:
+            _slots = None
+    elif not isinstance(_slots, dict):
+        _slots = None
+    try:
+        _raw_len = int(_raw_len) if _raw_len is not None else None
+    except Exception:
+        _raw_len = None
 
     # ── 图谱边路由：type=relation（或带 entity_a/entity_b）→ 写进 graph_edges 表 ──
     # Chroma 时代边和记忆同 collection；PG 里分了表，写入必须分流，否则边会被当成记忆
@@ -484,11 +499,12 @@ def add_memory(content: str, metadata: dict = None, memory_id: str = None):
         cur.execute("""
             INSERT INTO boshi.memories
               (id, content, embedding, profile, source, topic, role, session_id,
-               meta, is_latest, created_at, version_created)
-            VALUES (%s,%s,%s::vector,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s)
+               meta, is_latest, created_at, version_created, slots, raw_len)
+            VALUES (%s,%s,%s::vector,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s)
             RETURNING id
         """, (mid, content, _vec_literal(v), prof, source, topic, role, sid,
-              json.dumps(meta, ensure_ascii=False), is_latest, created, vc))
+              json.dumps(meta, ensure_ascii=False), is_latest, created, vc,
+              json.dumps(_slots, ensure_ascii=False) if _slots else None, _raw_len))
         return str(cur.fetchone()[0])      # ← 与 chroma_bridge 契约一致：返回 id 字符串
 
 
@@ -672,6 +688,59 @@ def _doc_tokens(text: str) -> list:
 _KW_LOCK = threading.Lock()
 _KW_CACHE: dict = {}          # (cond, params) → 索引；只留最近几个 scope
 
+_SLOTS_MOD = None
+
+
+def _slots_mod():
+    """按文件路径加载 ~/.boshi/slots.py（避免 `import slots` 撞上同名第三方模块）。"""
+    global _SLOTS_MOD
+    if _SLOTS_MOD is not None:
+        return _SLOTS_MOD
+    import importlib.util as _ilu
+    import os as _os
+    p = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "slots.py")
+    spec = _ilu.spec_from_file_location("boshi_slots", p)
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _SLOTS_MOD = mod
+    return mod
+
+
+def _doc_text(content: str, slots_json) -> str:
+    """BM25 文档文本。默认**恒用原文**，slots 只当元数据（2026-10-19 A3 实测结论）。
+
+    A3 对照（8 query × auto/rrf，详见 v7.1 §8.4）：
+      · 槽位文本替代全文 → top1 仅 7/16 与 baseline 相同、top5 重叠 2.56/5，
+        auto top5 里 user 角色 0→15（明显退化：BM25 长度归一奖励短 doc，
+        三十来字的用户小问被顶到第一）；
+      · guard 0.6（丢失超 40% 原文就回退）15/16、additive（全文+槽位值）14/16，
+        两者都只是打平 baseline，无一 query 变好。
+    机制：槽位把长 assistant 文档压成 statement + 槽位值，BM25 的长度归一化
+    反过来奖励短文档 → 这层压缩对排序是净负收益。故 slots 留在库里供 P2+
+    字段级匹配用，不进 BM25 文档。
+
+    回退开关（仅供日后实验，默认 content）：BOSHI_KW_DOC=content|guard|additive|slots
+    """
+    c = content or ""
+    mode = (os.environ.get("BOSHI_KW_DOC") or "content").strip().lower()
+    if mode == "content" or not slots_json:
+        return c
+    try:
+        txt = _slots_mod().doc_text(c, slots_json)
+    except Exception:
+        return c
+    if not txt:
+        return c
+    if mode == "additive":
+        return c if txt in c else (c + "\n" + txt)
+    if mode == "guard":
+        try:
+            g = float(os.environ.get("BOSHI_KW_GUARD") or 0.6)
+        except Exception:
+            g = 0.6
+        return c if len(txt) < g * len(c) else txt
+    return txt
+
 
 def _kw_index(c, cond: str, params: list) -> dict:
     """按 cond 建进程内 BM25 索引（倒排 + df + avgdl），带签名失效。
@@ -694,19 +763,22 @@ def _kw_index(c, cond: str, params: list) -> dict:
             return ent
 
         with c.cursor() as cur:
-            cur.execute(f"SELECT id, content, {_META_SEL} FROM boshi.memories WHERE {cond}", params)
+            cur.execute(f"SELECT id, content, slots, {_META_SEL} FROM boshi.memories WHERE {cond}", params)
             rows = cur.fetchall()
 
-        docs: list = []        # (id, content, meta, dl)
+        docs: list = []        # (id, content, meta, dl, 检索用文本)
         postings: dict = {}    # token → [(doc_idx, tf)]
         total_dl = 0
-        for idx, (rid, content, meta) in enumerate(rows):
+        for idx, (rid, content, sl, meta) in enumerate(rows):
+            # P2：有 slots 的记录，入索引的是「statement + 槽位值」而不是全文。
+            # 全文只用于对外返回（content 不动），避免长原文里的半截 token 制造假匹配。
+            dtxt = _doc_text(content, sl)
             tf: dict = {}
-            for t in _doc_tokens(content):
+            for t in _doc_tokens(dtxt):
                 tf[t] = tf.get(t, 0) + 1
             dl = sum(tf.values())
             total_dl += dl
-            docs.append((rid, content, meta, dl))
+            docs.append((rid, content, meta, dl, dtxt))
             for t, f in tf.items():
                 postings.setdefault(t, []).append((idx, f))
 
@@ -809,14 +881,14 @@ def _kw_channel(c, toks: list, k: int, cond: str, params: list) -> list:
         rel = s / top
         if rel < _KW_MIN:
             continue
-        rid, content, meta, _dl = docs[idx]
+        rid, content, meta, _dl, dtxt = docs[idx]
         it = _row_to_item((rid, content, meta, None))
         it["kw"] = round(rel, 3)
         # kw_abs：**绝对** idf 加权覆盖率（0~1，分母=全部主 token 的 w*idf）。
         # 与 kw（相对 top1 归一）不同，它表达「这条文档到底对上了多少查询要义」，
         # 可跨文档比较、可与向量 sim 直接加权求和。top1 归一化会把「弱命中里的
         # 第一名」抬成 1.0，做加权融合时会把噪声顶上去。
-        it["kw_abs"] = round(_kw_abs(content, prim, widf_total, _dl, avgdl), 3)
+        it["kw_abs"] = round(_kw_abs(dtxt, prim, widf_total, _dl, avgdl), 3)
         out.append(it)
     return out
 
