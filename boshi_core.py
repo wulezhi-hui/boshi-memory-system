@@ -83,12 +83,18 @@ def search(query: str, top_k: int = 5, source: str = "all",
     cb = _get_chroma()
 
     if source == "vector":
+        # 注意：后端（pg）的 search_memory 默认 fusion=auto，命中型号/数字等锚点时
+        # 会融合关键词通道。这里把每条实际走的通道如实标出来，别一律写 "vector"。
         results = cb.search_memory(query, top_k=top_k, include_graph=include_graph,
                                    scope=scope, me=me)
+        src_count: dict = {}
         for r in results:
             r["score"] = round(1.0 - r.get("score", 0), 4)
-            r["source"] = "vector"
-        return {"query": query, "total": len(results), "results": results, "sources": {"vector": len(results)}}
+            ch = r.get("channels") or []
+            tag = "fused" if len(ch) > 1 else ("kw" if ch == ["kw"] else "vector")
+            r["source"] = tag
+            src_count[tag] = src_count.get(tag, 0) + 1
+        return {"query": query, "total": len(results), "results": results, "sources": src_count}
 
     elif source == "hybrid":
         result = cb.hybrid_search(query, top_k=top_k, include_graph=include_graph,
@@ -208,9 +214,21 @@ def status() -> dict:
     cb = _get_chroma()
     total = cb.get_total_count()
     kg_info = {"nodes": 0, "edges": 0}
+    # 优先用当前后端自己的图谱计数（pg 后端走 PG 表），别拿 chroma 侧的历史快照糊弄。
+    if hasattr(cb, "get_graph_count"):
+        try:
+            kg_info = cb.get_graph_count()
+        except Exception:
+            pass
+    if not kg_info.get("edges"):
+        try:
+            kg = _get_kg()
+            kg_info = kg.stats()
+        except Exception:
+            pass
+    backend = ""
     try:
-        kg = _get_kg()
-        kg_info = kg.stats()
+        backend = "%s(%s)" % (cb.backend_name(), cb.backend_source())
     except Exception:
         pass
     return {
@@ -218,6 +236,7 @@ def status() -> dict:
         "version": "6.0",
         "total_memories": total,
         "knowledge_graph": kg_info,
+        "backend": backend,
         "chroma_dir": CHROMA_DIR,
     }
 

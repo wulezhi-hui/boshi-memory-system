@@ -1053,6 +1053,7 @@ _PUBLIC_API = (
     "get_time_range", "get_recent", "get_total_count", "delete_memory",
     "delete_memories", "update_memory", "deprecate_memory", "get_all_relations",
     "auto_forget", "detect_conflicts", "resolve_conflict", "get_by_id",
+    "get_graph_count",
 )
 
 if BACKEND == "pg":

@@ -4,8 +4,12 @@
 `BOSHI_BACKEND=pg` 时自动接管（见 chroma_bridge.py 末尾的切换块）。
 
 ⚠️ 约定（必须与 Chroma 后端一致，别改）：
-- `search_memory` / `hybrid_search` 返回的 `score` = **余弦距离**（越小越近，0..2）
+- `search_memory` / `hybrid_search` 返回的 `score` = **距离**（越小越近，0..2）
   —— boshi_core 会做 `1 - score` 转成相似度、再降序排序
+- 距离语义分两种（2026-10-19 P0 起）：
+  · 默认 `fusion=rrf`（向量 + 关键词 RRF 融合）→ score 是**伪距离** `1-sim`，
+    sim = 0.45+0.55*rrf_norm，单调且落在 0.7~1.0 习惯区间，排序意义不变
+  · `BOSHI_SEARCH_FUSION=vector` 或 `fusion="vector"` → 纯余弦距离（旧行为，回滚用）
 - 记忆条目存 `boshi.memories`（非图谱），图谱边存 `boshi.graph_edges`
   → 「type=relation 的隔离」在 PG 里是**天然的表隔离**，不再需要 where 补丁
 
@@ -14,8 +18,11 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import subprocess
+import threading
 import time
 from datetime import datetime as _dt, timezone as _timezone
 from typing import Any, Dict, List, Optional
@@ -540,9 +547,347 @@ def _search_edges(query: str, top_k: int, rel_type: str = None):
         return [_row_to_item(r) for r in cur.fetchall()]
 
 
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
+_ASCII_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.+\-]{1,}")
+_NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+# 关键词通道参数（P0）。BOSHI_SEARCH_FUSION=vector 可一键回滚到纯向量。
+_RRF_K = int(os.environ.get("BOSHI_RRF_K", "60"))
+_KW_MIN = float(os.environ.get("BOSHI_KW_MIN", "0.05"))  # 相对分门槛（相对本轮 top1）
+_KW_MAX_TOKENS = 16
+_KW_BM25_K1 = float(os.environ.get("BOSHI_BM25_K1", "1.2"))
+_KW_BM25_B = float(os.environ.get("BOSHI_BM25_B", "0.50"))
+_KW_TTL = float(os.environ.get("BOSHI_KW_TTL", "180"))   # 索引最长复用秒数
+_KW_CACHE_MAX = int(os.environ.get("BOSHI_KW_CACHE_MAX", "4"))
+# 「字面锚点」：型号(qwen3.6-27b)、端口(17891)、版本(0.7.23)、英文标识、两位以上数字。
+# 有锚点时字面匹配比嵌入可靠；纯中文自然语言则相反（见 _has_anchor 注释）。
+_ANCHOR_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.+\-]{1,}|\d{2,}")
+# kw_abs 的 CJK 部分匹配地板：文档只对上多字词的一部分（"显存"之于"显存不足"）时
+# 给 _KW_PARTIAL 的信用，其余按 bigram 覆盖比例补足到 1.0。
+_KW_PARTIAL = float(os.environ.get("BOSHI_KW_PARTIAL", "0.85"))
+# kw_abs 的长度阻尼系数（BM25 同形）：0 = 关闭（纯覆盖率，长文占便宜）
+_KW_LENB = float(os.environ.get("BOSHI_KW_LENB", "0.5"))
+
+
+def _has_anchor(query: str) -> bool:
+    return bool(_ANCHOR_RE.search(query or ""))
+
+
+def _kw_tokens(query: str) -> list:
+    """query → [(token, weight)]。
+
+    权重设计：**区分度越高权重越大**
+      - 型号/端口/参数名（ASCII、数字）：3.0 / 2.5 —— 这类词语义模型最不可靠
+        （实测 "Qwen3.6-27B QLoRA" 纯向量召回全是 Qwen3.8/35B，型号被吃掉了）
+      - 中文整段（连续汉字，2 字及以上）：3.0
+      - 中文 bigram：1.0（兜住"整段不匹配但词根匹配"的情况）
+
+    token 里出现 % / _ 会污染 LIKE，直接剔除；长度 <2 的丢弃（单字噪声过大）。
+    """
+    q = query or ""
+    toks: list = []
+    seen = set()
+
+    def add(t: str, w: float):
+        t = (t or "").strip()
+        if len(t) < 2:
+            return
+        low = t.lower()
+        if low in seen:
+            return
+        seen.add(low)
+        toks.append((low, float(w)))
+
+    for m in _ASCII_RE.finditer(q):
+        add(_norm_ascii(m.group(0)), 3.0)
+    for m in _NUM_RE.finditer(q):
+        add(m.group(0), 2.5)
+    for seg in _CJK_RE.findall(q):
+        n = len(seg)
+        if n >= 2:
+            add(seg, 3.0)
+            if n >= 3:
+                for i in range(min(n - 1, 6)):
+                    add(seg[i:i + 2], 1.0)
+    return toks[:_KW_MAX_TOKENS]
+
+
+def _norm_ascii(tok: str) -> str:
+    """ASCII token 归一：去掉 `_ - . / ,`，让 IQ4_XS / iq4xs / IQ4-XS 互相命中。
+
+    实测 "IQ4XS 解码速度" 关键词通道零命中，因为库里写的是 `IQ4_XS`、`UD-IQ4_XS`。
+    型号写法在语料里不统一（下划线/连字符/粘连），归一后才能对齐。
+    """
+    return tok.replace("_", "").replace("-", "").replace(".", "").replace("/", "").replace(",", "")
+
+
+def _vec_channel(c, q: str, k: int, cond: str, params: list, v=None) -> list:
+    """向量通道（纯余弦，与旧实现完全一致）。v 可传入已算好的查询向量。"""
+    if v is None:
+        v = _vec_literal(_ef()([q or " "])[0])
+    sql = f"""
+        SELECT id, content, {_META_SEL}, embedding <=> %s::vector AS dist
+        FROM boshi.memories
+        WHERE {cond}
+        ORDER BY embedding <=> %s::vector
+        LIMIT %s
+    """
+    with c.cursor() as cur:
+        cur.execute(sql, [v] + params + [v, int(k)])
+        return [_row_to_item(r) for r in cur.fetchall()]
+
+
+def _cosine_for_ids(c, v: str, ids: list) -> dict:
+    """给「只被关键词通道捞到」的文档补真实余弦相似度。
+
+    不补的话它们在融合里 v=0（只是没进向量 Top-N），会被「向量通道里排名靠后但
+    v 非零」的文档白占便宜，融合分也不可比。
+    """
+    if not ids:
+        return {}
+    with c.cursor() as cur:
+        cur.execute("SELECT id, 1 - (embedding <=> %s::vector)::float8 "
+                    "FROM boshi.memories WHERE id = ANY(%s::uuid[])", [v, list(ids)])
+        return {str(r[0]): float(r[1] or 0.0) for r in cur.fetchall()}
+
+
+def _doc_tokens(text: str) -> list:
+    """文档侧分词（与 _kw_tokens 的 query 侧对齐）。
+
+    中文不引分词器，用「连续汉字整段 + bigram」：整段命中最准，bigram 兜词根。
+    单字不入索引（噪声大且把 avgdl 拉爆）。
+    """
+    low = (text or "").lower()
+    toks: list = []
+    toks.extend(t for t in (_norm_ascii(x) for x in _ASCII_RE.findall(low)) if len(t) >= 2)
+    toks.extend(_NUM_RE.findall(low))
+    for seg in _CJK_RE.findall(low):
+        n = len(seg)
+        if n >= 2:
+            toks.append(seg)
+            if n >= 3:
+                toks.extend(seg[i:i + 2] for i in range(n - 1))
+    return toks
+
+
+_KW_LOCK = threading.Lock()
+_KW_CACHE: dict = {}          # (cond, params) → 索引；只留最近几个 scope
+
+
+def _kw_index(c, cond: str, params: list) -> dict:
+    """按 cond 建进程内 BM25 索引（倒排 + df + avgdl），带签名失效。
+
+    为什么要换掉原来的 SQL ILIKE 覆盖率（实测 2026-10-19）：
+      1) 覆盖率在「所有 token 都命中」处饱和 → 多个文档并列 1.00，排序退化成
+         created_at DESC，正确但较旧的那条被新文档挤掉；
+      2) 没有 IDF → 「显存」这种超高频词与 `tensor-split` 同权；
+      3) 没有长度归一 → 长文里零星命中一段就进候选，把短而准的文档稀释。
+    BM25 一次给齐 tf 饱和 / IDF / 长度归一；6029 条 × ~320 字符全量入内存约
+    几十 MB，签名查询（count + max(created_at)）每次 ~10ms，重建才付一次分词成本。
+    """
+    key = (cond, tuple(params))
+    with _KW_LOCK:
+        with c.cursor() as cur:
+            cur.execute(f"SELECT count(*), max(created_at) FROM boshi.memories WHERE {cond}", params)
+            n_now, mx = cur.fetchone()
+        ent = _KW_CACHE.get(key)
+        if ent and ent["sig"] == (n_now, mx) and time.time() - ent["t"] < _KW_TTL:
+            return ent
+
+        with c.cursor() as cur:
+            cur.execute(f"SELECT id, content, {_META_SEL} FROM boshi.memories WHERE {cond}", params)
+            rows = cur.fetchall()
+
+        docs: list = []        # (id, content, meta, dl)
+        postings: dict = {}    # token → [(doc_idx, tf)]
+        total_dl = 0
+        for idx, (rid, content, meta) in enumerate(rows):
+            tf: dict = {}
+            for t in _doc_tokens(content):
+                tf[t] = tf.get(t, 0) + 1
+            dl = sum(tf.values())
+            total_dl += dl
+            docs.append((rid, content, meta, dl))
+            for t, f in tf.items():
+                postings.setdefault(t, []).append((idx, f))
+
+        n = len(docs)
+        ent = {
+            "sig": (n_now, mx), "t": time.time(),
+            "docs": docs, "postings": postings,
+            "avgdl": (total_dl / n) if n else 0.0,
+            "vocab": len(postings),
+        }
+        if len(_KW_CACHE) >= _KW_CACHE_MAX:
+            _KW_CACHE.clear()
+        _KW_CACHE[key] = ent
+        return ent
+
+
+def _kw_abs(content: str, prim: list, widf_total: float,
+            dl: float = None, avgdl: float = None) -> float:
+    """绝对关键词命中度（0~1）：主 token 的 idf 加权覆盖率，CJK 多字词给部分信用。
+
+    为什么不用「精确 token 命中」：库里没有分词器，中文按「整段 + bigram」入索引。
+    查 "ComfyUI 显存不足" 时，正确的那条写的是「…查显存, 无关推理服务…」——没有
+    "显存不足" 这个精确串，精确匹配下它只能拿 1/2 的主词分，被「显存不足」字面
+    命中的无关文档压过。所以对 len>=3 的中文主词，只要命中其中任一 bigram 就给
+    _KW_PARTIAL 的信用，命中越多越接近 1.0。
+    """
+    low = (content or "").lower()
+    # token 在索引里是归一化形式（IQ4_XS→iq4xs），所以原文也要按同样规则归一后再比，
+    # 否则「库里写下划线写法」的文档在这里会被判成零命中（实测 IQ4XS 排序崩掉的原因）。
+    low_n = _norm_ascii(low)
+    hit = 0.0
+    for tok, w, idf in prim:
+        if tok in low or tok in low_n:
+            hit += w * idf
+            continue
+        if len(tok) >= 3 and _CJK_RE.fullmatch(tok):
+            grams = [tok[i:i + 2] for i in range(len(tok) - 1)]
+            m = sum(1 for g in grams if g in low)
+            if m:
+                hit += w * idf * (_KW_PARTIAL + (1.0 - _KW_PARTIAL) * m / len(grams))
+    cov = min(1.0, hit / widf_total) if widf_total else 0.0
+    # 长度阻尼：substring 命中不看文档长度，长文里「顺带提到两个词一次」就能拿满
+    # 覆盖率，把真正讲这件事的短记录压下去（实测「如实回答，分三层说…」这种长文
+    # 在 ComfyUI 显存不足 上霸榜）。用与 BM25 同形的饱和因子折回，b 可调。
+    if cov and dl and avgdl and _KW_LENB > 0:
+        cov /= 1.0 + _KW_LENB * max(0.0, dl / avgdl - 1.0)
+    return max(0.0, min(1.0, cov))
+
+
+def _kw_channel(c, toks: list, k: int, cond: str, params: list) -> list:
+    """关键词通道：进程内 BM25 打分，返回与向量通道同构的候选（按分降序）。
+
+    `kw` 字段是**相对本轮 top1 的归一化分**（0~1），便于观测；排序只依赖原始分。
+    """
+    if not toks:
+        return []
+    ent = _kw_index(c, cond, params)
+    docs, postings = ent["docs"], ent["postings"]
+    if not docs:
+        return []
+    n = len(docs)
+    avgdl = ent["avgdl"] or 1.0
+    k1, b = _KW_BM25_K1, _KW_BM25_B
+
+    scores: dict = {}
+    widf_total = 0.0
+    hits: dict = {}
+    prim: list = []
+    for tok, w in toks:
+        pl = postings.get(tok)
+        df = len(pl) if pl else 0
+        idf = math.log(1.0 + (n - df + 0.5) / (df + 0.5))
+        if w >= 2.5:
+            widf_total += w * idf
+            prim.append((tok, w, idf))
+        if not pl:
+            continue
+        for idx, tf in pl:
+            dl = docs[idx][3]
+            denom = tf + k1 * (1.0 - b + b * dl / avgdl)
+            scores[idx] = scores.get(idx, 0.0) + w * idf * (tf * (k1 + 1.0)) / denom
+            if w >= 2.5:
+                d = hits.setdefault(idx, {"hit": 0.0, "cov": 0.0})
+                d["hit"] += w * idf
+                d["cov"] += w
+    if not scores:
+        return []
+    # 协调因子（coord）：只有主 token（整数段/型号/数字，w>=2.5）参与。
+    # 纯 BM25 里「命中一个极稀有词」就能压过「命中两个常见词」——实测
+    # "佛教微调 数据集" 会被只含"数据集"的文档霸榜。乘上主词覆盖率把
+    # 「两三个词都对上」的文档提上来，bigram 不参与分母（否则短查询被稀释）。
+    pr = {i: (hits.get(i) or {}).get("cov", 0.0) for i in scores}
+    scores = {i: s * (pr[i] / (sum(w for _, w in toks if w >= 2.5) or 1.0))
+              for i, s in scores.items()}
+
+    ranked = sorted(scores.items(), key=lambda x: -x[1])[:int(k)]
+    top = ranked[0][1] or 1.0
+    out = []
+    for idx, s in ranked:
+        rel = s / top
+        if rel < _KW_MIN:
+            continue
+        rid, content, meta, _dl = docs[idx]
+        it = _row_to_item((rid, content, meta, None))
+        it["kw"] = round(rel, 3)
+        # kw_abs：**绝对** idf 加权覆盖率（0~1，分母=全部主 token 的 w*idf）。
+        # 与 kw（相对 top1 归一）不同，它表达「这条文档到底对上了多少查询要义」，
+        # 可跨文档比较、可与向量 sim 直接加权求和。top1 归一化会把「弱命中里的
+        # 第一名」抬成 1.0，做加权融合时会把噪声顶上去。
+        it["kw_abs"] = round(_kw_abs(content, prim, widf_total, _dl, avgdl), 3)
+        out.append(it)
+    return out
+
+
+def _rrf_merge(vec_items: list, kw_items: list, top_k: int, k: int = None) -> list:
+    """RRF（Reciprocal Rank Fusion）融合两路候选。
+
+    score = Σ 1/(k + rank)。契约要求返回**距离**（越小越好，见模块文档），
+    故把融合分归一化成 pseudo-sim 后再取 1-sim：
+        sim = 0.45 + 0.55 * rrf/max_rrf      （top1 双路命中 → 1.0；单路 top1 → 0.725）
+    该变换单调，不改变排序，只是让对外展示的"相关度"落在旧的 0.7~1.0 习惯区间。
+    """
+    k = k or _RRF_K
+    pool: dict = {}
+    for rank, it in enumerate(vec_items, 1):
+        d = pool.setdefault(it["id"], {"item": it, "rrf": 0.0, "ch": []})
+        d["rrf"] += 1.0 / (k + rank)
+        d["ch"].append("vec")
+    for rank, it in enumerate(kw_items, 1):
+        d = pool.setdefault(it["id"], {"item": it, "rrf": 0.0, "ch": []})
+        d["rrf"] += 1.0 / (k + rank)
+        d["ch"].append("kw")
+        if "kw" in it:
+            d["item"].setdefault("metadata", {})
+    max_rrf = 2.0 / (k + 1)
+    out = []
+    for d in pool.values():
+        sim = 0.45 + 0.55 * min(d["rrf"] / max_rrf, 1.0)
+        it = d["item"]
+        it["score"] = round(1.0 - sim, 6)
+        it["channels"] = d["ch"]
+        out.append(it)
+    out.sort(key=lambda x: x["score"])
+    return out[:int(top_k)]
+
+
+def _score_merge(vec_items: list, kw_items: list, top_k: int,
+                 wv: float = 0.45, wk: float = 0.55) -> list:
+    """加权分融合：sim = wv*(1-dist) + wk*kw_abs，再映射到 0.6~1.0 展示区间。
+
+    与 RRF 的分工：RRF 只看名次，两个通道各排第 30 的文档能压过单通道第 1
+    （RRF 数学上如此，实测「退休 养老金」的金标被压出 top5）；加权分看的是
+    「离得多近 + 字面对上多少」，单通道第 1 只要绝对分高就守得住。
+    """
+    wsum = (wv + wk) or 1.0
+    pool: dict = {}
+    for it in vec_items:
+        pool.setdefault(it["id"], {"item": it, "v": max(0.0, 1.0 - it["score"]),
+                                   "k": 0.0, "ch": []})["ch"].append("vec")
+    for it in kw_items:
+        d = pool.setdefault(it["id"], {"item": it, "v": 0.0, "k": 0.0, "ch": []})
+        if d["v"] == 0.0 and it.get("_cos"):
+            d["v"] = max(0.0, float(it["_cos"]))       # 关键词独有文档补的真实余弦
+            d["item"] = it
+        d["k"] = float(it.get("kw_abs") or 0.0)
+        d["ch"].append("kw")
+    out = []
+    for d in pool.values():
+        f = (wv * d["v"] + wk * d["k"]) / wsum          # 0~1
+        it = d["item"]
+        it["score"] = round(1.0 - (0.60 + 0.40 * min(f, 1.0)), 6)   # 单调，展示仍落 0.6~1.0
+        it["channels"] = d["ch"]
+        it["fused"] = round(f, 4)
+        out.append(it)
+    out.sort(key=lambda x: x["score"])
+    return out[:int(top_k)]
+
+
 def search_memory(query: str, top_k: int = 5, where: dict = None,
                   all_versions: bool = False, include_graph: bool = False,
-                  scope: str = None, me: str = None):
+                  scope: str = None, me: str = None, fusion: str = None):
     c = _conn()
     w = dict(where or {})
     if not all_versions:
@@ -554,20 +899,37 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
         return _search_edges(query, top_k, rel_type)
 
     cond, params = _where_sql(w, scope, me or _resolve_profile(), include_graph)
-    v = _vec_literal(_ef()([query or " "])[0])
-    sql = f"""
-        SELECT id, content, {_META_SEL}, embedding <=> %s::vector AS dist
-        FROM boshi.memories
-        WHERE {cond}
-        ORDER BY embedding <=> %s::vector
-        LIMIT %s
-    """
-    with c.cursor() as cur:
-        cur.execute(sql, [v] + params + [v, int(min(top_k, 100))])
-        rows = cur.fetchall()
-    out = [_row_to_item(r) for r in rows]
+    mode = (fusion or os.environ.get("BOSHI_SEARCH_FUSION", "auto")).lower()
+    k_each = int(min(max(int(top_k) * 4, 20), 100))
+
+    qv = _vec_literal(_ef()([query or " "])[0])
+    vec_items = _vec_channel(c, query, k_each, cond, params, v=qv)
+    if mode == "vector":
+        items = vec_items[:int(top_k)]
+    else:
+        toks = _kw_tokens(query)
+        # auto：纯中文自然语言查询走纯向量（BM25 不辨否定/语义，实测会把
+        # 「不是佛教微调，是通用的」顶到第一）；含字面锚点（型号/端口/版本号/
+        # 数字）时才开关键词通道 —— 那正是纯向量最容易翻车的场景。
+        if not toks or (mode == "auto" and not _has_anchor(query)):
+            items = vec_items[:int(top_k)]
+        else:
+            kw_items = _kw_channel(c, toks, k_each, cond, params)
+            if not kw_items:                       # 关键词零命中 → 退回纯向量（旧行为）
+                items = vec_items[:int(top_k)]
+            elif mode == "rrf":
+                items = _rrf_merge(vec_items, kw_items, top_k)
+            else:
+                seen = {x["id"] for x in vec_items}
+                miss = [str(x["id"]) for x in kw_items if x["id"] not in seen]
+                cmap = _cosine_for_ids(c, qv, miss)
+                for it in kw_items:
+                    if it["id"] not in seen:
+                        it["_cos"] = cmap.get(str(it["id"]), 0.0)
+                items = _score_merge(vec_items, kw_items, top_k)
 
     if include_graph:      # 需要图谱联想时，并入边表结果（与 Chroma 后端行为对齐）
+        v = _vec_literal(_ef()([query or " "])[0])
         with c.cursor() as cur:
             cur.execute("""
                 SELECT id, content, jsonb_build_object('type','relation',
@@ -575,10 +937,10 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
                        embedding <=> %s::vector AS dist
                 FROM boshi.graph_edges ORDER BY embedding <=> %s::vector LIMIT %s
             """, (v, v, int(min(top_k, 100))))
-            out += [_row_to_item(r) for r in cur.fetchall()]
-        out.sort(key=lambda x: x["score"])
-        out = out[:top_k]
-    return out
+            items = items + [_row_to_item(r) for r in cur.fetchall()]
+        items.sort(key=lambda x: x["score"])
+        items = items[:top_k]
+    return items
 
 
 def hybrid_search(query: str, top_k: int = 5, where: dict = None,
@@ -658,13 +1020,32 @@ def get_recent(n: int = 10, scope: str = None, me: str = None,
 
 
 def get_total_count() -> int:
+    """记忆条数（只数 memories）。
+
+    历史 bug：这里曾返回 memories + graph_edges，`boshi_cli.py status` 于是把 6 千条
+    记忆 + 6.5 万条关系边报成「记忆总数 71241」，与 chroma 时代同一个错（collection
+    里混进了 relation 文档）。关系边另有 get_graph_count() 单独报。
+    """
     c = _conn()
     with c.cursor() as cur:
         cur.execute("SELECT count(*) FROM boshi.memories")
         m = cur.fetchone()[0]
+    return int(m)
+
+
+def get_graph_count() -> dict:
+    """知识图谱规模：边数 = graph_edges 行数，节点数 = 边两端实体去重后的个数。"""
+    c = _conn()
+    with c.cursor() as cur:
         cur.execute("SELECT count(*) FROM boshi.graph_edges")
         e = cur.fetchone()[0]
-    return int(m + e)
+        cur.execute(
+            "SELECT count(*) FROM ("
+            "  SELECT entity_a AS ent FROM boshi.graph_edges"
+            "  UNION SELECT entity_b FROM boshi.graph_edges) t"
+        )
+        n = cur.fetchone()[0]
+    return {"nodes": int(n), "edges": int(e)}
 
 
 def delete_memory(memory_id: str):

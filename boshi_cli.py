@@ -43,13 +43,13 @@ def _fmt_search(result: dict):
     sources = result.get("sources", {})
     if sources:
         parts = []
-        if sources.get("vector"):
-            parts.append(f"语义{sources['vector']}")
-        if sources.get("keyword"):
-            parts.append(f"关键词{sources['keyword']}")
-        if sources.get("graph"):
-            parts.append(f"图谱{sources['graph']}")
-        print(f"📊 来源: {' + '.join(parts)}")
+        # 后端返回的 sources 键不定：vector / kw / fused / hybrid / keyword / graph
+        _label = {"vector": "语义", "vec": "语义", "keyword": "关键词", "kw": "关键词",
+                  "fused": "融合", "hybrid": "混合", "graph": "图谱"}
+        for k, n in sources.items():
+            if n:
+                parts.append(f"{_label.get(k, k)}{n}")
+        print(f"📊 来源: {' + '.join(parts) if parts else '—'}")
     print(f"📋 共 {result['total']} 条结果:\n")
     for i, r in enumerate(result["results"], 1):
         score = r.get("score", 0)
@@ -81,6 +81,8 @@ def _fmt_status(result: dict):
     print(f"  记忆总数: {result.get('total_memories', 0)}")
     kg = result.get("knowledge_graph", {})
     print(f"  知识图谱: {kg.get('nodes', 0)} 节点 / {kg.get('edges', 0)} 边")
+    if result.get("backend"):
+        print(f"  检索后端: {result['backend']}")
     print(f"  数据目录: {result.get('chroma_dir', '未知')}")
 
 
