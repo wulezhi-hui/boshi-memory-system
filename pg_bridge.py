@@ -580,6 +580,15 @@ _ANCHOR_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.+\-]{1,}|\d{2,}")
 # kw_abs 的 CJK 部分匹配地板：文档只对上多字词的一部分（"显存"之于"显存不足"）时
 # 给 _KW_PARTIAL 的信用，其余按 bigram 覆盖比例补足到 1.0。
 _KW_PARTIAL = float(os.environ.get("BOSHI_KW_PARTIAL", "0.85"))
+# 关键词通道的候选池上限（P0 修 A7「池污染」）。
+# 0 = 跟随 k_each（旧行为）；默认 20 = 与 top_k 解耦，固定 20 条。
+# 为什么：BM25 原始分尾部是噪声，池子随 top_k 变大时这些长尾文档带着中等
+# kw_abs 挤进融合（融合用绝对分，不做池内归一），把真金标顶出去——实测
+# top1/top3/top5 = 21/30/32 (k=5) → 21/26/29 (k=20)，纯粹「要得多反而更差」。
+# 固定 20 后 5/10/20/50/100 五档指标完全一致（21/30/32）。
+# 曾试过「截断尺子改成 kw_abs」（与融合同一把尺子）：k=5 时 27/29，更差——
+# 因为小池子里放进高 kw_abs/低 BM25 的长尾文档就是引噪，问题在池子大小不在尺子。
+_KW_POOL_CAP = int(os.environ.get("BOSHI_KW_POOL_CAP", "20") or 0)
 # kw_abs 的长度阻尼系数（BM25 同形）：0 = 关闭（纯覆盖率，长文占便宜）
 _KW_LENB = float(os.environ.get("BOSHI_KW_LENB", "0.5"))
 
@@ -875,6 +884,8 @@ def _kw_channel(c, toks: list, k: int, cond: str, params: list) -> list:
               for i, s in scores.items()}
 
     ranked = sorted(scores.items(), key=lambda x: -x[1])[:int(k)]
+    if not ranked:
+        return []
     top = ranked[0][1] or 1.0
     out = []
     for idx, s in ranked:
@@ -973,6 +984,8 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
     cond, params = _where_sql(w, scope, me or _resolve_profile(), include_graph)
     mode = (fusion or os.environ.get("BOSHI_SEARCH_FUSION", "auto")).lower()
     k_each = int(min(max(int(top_k) * 4, 20), 100))
+    # kw 通道候选数与 top_k 解耦（见 _KW_POOL_CAP 注释：池污染导致「要得多反而更差」）
+    k_kw = min(k_each, _KW_POOL_CAP) if _KW_POOL_CAP > 0 else k_each
 
     qv = _vec_literal(_ef()([query or " "])[0])
     vec_items = _vec_channel(c, query, k_each, cond, params, v=qv)
@@ -986,7 +999,7 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
         if not toks or (mode == "auto" and not _has_anchor(query)):
             items = vec_items[:int(top_k)]
         else:
-            kw_items = _kw_channel(c, toks, k_each, cond, params)
+            kw_items = _kw_channel(c, toks, k_kw, cond, params)
             if not kw_items:                       # 关键词零命中 → 退回纯向量（旧行为）
                 items = vec_items[:int(top_k)]
             elif mode == "rrf":
