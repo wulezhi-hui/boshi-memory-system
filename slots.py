@@ -34,6 +34,14 @@ RE_CMD = re.compile(
     r"(?:^|\n)\s{0,4}\$?\s?((?:python|pip|uv|git|curl|wget|netstat|schtasks|nvidia-smi"
     r"|llama-server|ollama|psql|docker|node|npm)\b[^\n]{0,160})")
 RE_EP = re.compile(r"(?:\b\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})\b")
+# 裸端口：中文里最常见的写法是「端口 8199」「8199 做反推」「监听 8648」，
+# 只有 IP:port 那种英文写法时才带点号。2026-10-19 实测漏抓，补关键词邻近的裸端口。
+RE_EP_KW = re.compile(r"(?:端口|端口号|监听|port|PORT|listen)")
+# 端口值只在关键词所在分句里找，避免把同一行后面的 build 号/上下文也算成端口
+_RE_CLAUSE = re.compile(r"[^。；;，,\n]{0,40}")
+# 裸数字：只在明确量词后取（build 11118 / ctx 131072 / 上下文 131072），
+# 不做全库裸整数，否则日期、ID、随机数全进倒排。
+RE_NUM_KW = re.compile(r"(?:build|ctx|上下文长度|上下文|阈值|上限)[^\d\n]{0,4}(\d{2,7})(?![\d.])")
 # 版本号：v1.2 / 1.2.3；负向断言挡住 IP 片段与带单位的数字
 RE_VER = re.compile(r"(?<![\w.])(v?\d+\.\d+(?:\.\d+)?)(?![\d.\w])")
 RE_UNIT_TAIL = re.compile(r"^\s?(?:GB|MB|KB|MiB|GiB|ms|s|tok/s|t/s|°C|%)")
@@ -58,6 +66,8 @@ _SENT_CAP = 200       # statement 截断
 _ITEM_CAP = 180       # 句子级槽位单条截断
 _LIST_CAP = 8         # 每个槽位最多留多少条
 _STMT_MIN = 24        # statement 首选长度下限（太短的首句对检索没价值）
+# 这些词后面跟的小数是「参数值」不是版本号（阈值 0.85 / 阻尼 0.5 / 温度 0.7）
+_VER_VALUE_CTX = ("阈值", "参数", "系数", "阻尼", "温度", "比例", "概率", "权重", "占比", "得分", "分数")
 
 _RE_MD_HEAD = re.compile(r"^\s*#{1,6}\s")
 _RE_RULE = re.compile(r"^\s*[-=_*~]{3,}\s*$")
@@ -170,6 +180,17 @@ def _dedup(seq: List[str], cap: int = _LIST_CAP) -> List[str]:
     return out[:cap]
 
 
+def _ports(text: str) -> List[str]:
+    """端口：IP:port 直接取；中文口语「端口 8199、8200 做…」在关键词所在分句内扫描裸端口。"""
+    out = list(RE_EP.findall(text))
+    for m in RE_EP_KW.finditer(text):
+        # 只取关键词往后的同一分句，避免把后面的 build 号/上下文长度也算成端口
+        tail = text[m.start():m.start() + 40].split("\n")[0]
+        tail = re.split(r"[。；;，,]", tail)[0]
+        out.extend(re.findall(r"(?<![\d.])(\d{2,5})(?![\d.])", tail))
+    return out
+
+
 def _versions(text: str) -> List[str]:
     out = []
     for m in RE_VER.finditer(text):
@@ -178,6 +199,11 @@ def _versions(text: str) -> List[str]:
         if RE_UNIT_TAIL.match(tail):        # `47.6 MB` 的 47.6 不是版本
             continue
         if tok.count(".") == 1 and len(tok.split(".")[0]) > 3:   # 太长的整数段多半是 IP/数字
+            continue
+        if m.start(1) and text[m.start(1) - 1] in "=＝~":        # `_KW_LENB=0.5` 是参数值不是版本
+            continue
+        ctx = re.split(r"[，,。；;、]", text[max(0, m.start(1) - 12):m.start(1)])[-1].strip()
+        if any(w in ctx for w in _VER_VALUE_CTX):   # 「阈值 0.85」「阻尼 0.5」是参数值
             continue
         out.append(tok)
     return out
@@ -190,8 +216,8 @@ def extract(text: str) -> Dict[str, Any]:
     out["files"] = _dedup(RE_WIN.findall(t) + RE_POSIX.findall(t) + RE_REL.findall(t))
     out["commands"] = _dedup([m.group(1).strip() for m in RE_CMD.finditer(t)])
     out["flags"] = _dedup(RE_FLAG.findall(t))
-    out["numbers"] = _dedup(RE_NUM.findall(t))
-    out["ports"] = _dedup(RE_EP.findall(t))
+    out["numbers"] = _dedup(RE_NUM.findall(t) + RE_NUM_KW.findall(t))
+    out["ports"] = _dedup(_ports(t))
     out["versions"] = _dedup(_versions(t))
 
     sents = _sentences(t)
