@@ -1079,6 +1079,26 @@ def _fm_hits(qfields: dict, cand: dict) -> list:
     return hits
 
 
+# 端口关键词两侧：文档侧常见写法是「端口 8199」（关键词在前，slots.py 已覆盖），
+# 而人提问常说「8199 端口怎么配」（数字在前）。对称补一条前置扫描，
+# 只用于 query 侧扩展，不改文档抽提语义（改抽提器要重跑全量回填，blast radius 更大）。
+_RE_PORT_LOOKAHEAD = re.compile(
+    r"(?<![\d.])(\d{2,5})(?=[^\d。；;，,\n]{0,6}(?:端口|端口号|监听|port|PORT))")
+
+
+def _fm_query_extra(query: str) -> dict:
+    """query 侧字面量补充扫描（只补「端口数字在前」这一种真实口语写法）。"""
+    out: dict = {}
+    try:
+        ports = [p for p in _RE_PORT_LOOKAHEAD.findall(query or "")
+                 if 1 <= int(p) <= 65535]
+    except Exception:
+        ports = []
+    if ports:
+        out["ports"] = ports
+    return out
+
+
 def _field_match(c, query: str, items: list, top_k: int) -> list:
     """按「query 字段 ∩ 候选同名字段」抬升排序（P2+）。
 
@@ -1098,6 +1118,14 @@ def _field_match(c, query: str, items: list, top_k: int) -> list:
         for v in (q.get(k) or []):
             nv = _fm_norm(v)
             if nv:
+                qfields[k].append(nv)
+    # 抽提器是为长文档写的（「端口 8199」），人提问常写成「8199 端口」→ 补 query 侧
+    for k, vs in _fm_query_extra(query).items():
+        if k not in qfields:
+            continue
+        for v in vs:
+            nv = _fm_norm(v)
+            if nv and nv not in qfields[k]:
                 qfields[k].append(nv)
     qfields = {k: v for k, v in qfields.items() if v}
     if not qfields:

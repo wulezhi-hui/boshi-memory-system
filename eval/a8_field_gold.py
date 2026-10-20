@@ -68,7 +68,8 @@ for slot, limit in (("ports", 14), ("versions", 14), ("flags", 12)):
         CASES.append((q, cid[:8], slot, lit))
     print(f"{slot}: {len([x for x in CASES if x[2] == slot])} 条")
 
-os.environ.pop("BOSHI_FIELD_MATCH", None)
+# P2+ 默认已开（2026-10-20）→ 基线必须显式关，不能靠 pop 吃默认值
+os.environ["BOSHI_FIELD_MATCH"] = "0"
 
 
 def run(tag):
