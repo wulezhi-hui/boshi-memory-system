@@ -84,13 +84,16 @@ def _normalize_metadata(metadata: dict) -> dict:
     return result
 
 
-def add_memory(content: str, metadata: dict = None, memory_id: str = None):
+def add_memory(content: str, metadata: dict = None, memory_id: str = None,
+               upsert: bool = False):
     """
     添加一条记忆到 ChromaDB。
     参数：
         content: 记忆内容（纯文本）
         metadata: 附加元数据（支持 isLatest 字段控制版本可见性）
         memory_id: 自定义ID，不传则自动生成
+        upsert: P3（2026-10-20）同 (profile, session_id, topic) 只保留 1 条有效行，
+                旧行 isLatest=false 并给新行打 supersedes；session_id/topic 缺一即退化
     返回：
         memory_id
 
@@ -116,6 +119,23 @@ def add_memory(content: str, metadata: dict = None, memory_id: str = None):
     # 其余按当前进程 profile 打标（除非调用方已显式指定）
     if meta.get("type") != "relation":
         meta.setdefault("profile", resolve_profile())
+
+    # P3 事实层 upsert（与 pg_bridge.add_memory(upsert=True) 语义一致）：
+    # Chroma 侧只能"查旧行 → 改 metadata → 追加新行"，没有事务；
+    # 回滚后端只为 API 契约对齐，并发保护由调用方（单写入者）保证。
+    _sid, _topic = meta.get("session_id"), meta.get("topic")
+    if upsert and _sid and _topic and meta.get("type") != "relation":
+        try:
+            old = col.get(where={"$and": [{"session_id": _sid}, {"topic": _topic},
+                                          {"isLatest": True}]},
+                          include=["metadatas"])
+            old_ids = list(old.get("ids") or [])
+            if old_ids:
+                col.update(ids=old_ids, metadatas=[{"isLatest": False}] * len(old_ids))
+                meta["supersedes"] = old_ids[0] if len(old_ids) == 1 else old_ids
+        except Exception as ex:  # noqa: BLE001  降级为普通 add，别丢这次写入
+            import logging as _lg
+            _lg.getLogger(__name__).warning("chroma upsert 降级为 add: %s", ex)
 
     # 记录版本时间
     import time as _time_module
@@ -1010,20 +1030,27 @@ def get_by_id(memory_id: str):
 # 后端切换（2026-10-10）：BOSHI_BACKEND=pg → 公开 API 交给 pg_bridge(pgvector)
 # ══════════════════════════════════════════════════════════════════
 # 设计要点：
-#  1. **默认（未设置 BOSHI_BACKEND）= 原 ChromaDB 行为，一行都不变**（可秒级回滚）
+#  1. **代码默认 = pg**（2026-10-19 定稿）。BOSHI_BACKEND=chroma 或
+#     backends.json 给某 profile 写 "chroma" 才回滚（秒级、单进程生效）
 #  2. 只替换"公开 API"；_get_collection/_get_client 等内部辅助仍指 Chroma，
 #     供诊断/工具用（Graph 模块的裸 collection 调用尚未适配 PG，见工作日志）
-#  3. 加载失败自动退回 Chroma —— 绝不让"记忆整体不可用"这种事发生
+#  3. pg 加载失败自动退回 Chroma 并打 error —— 绝不让"记忆整体不可用"这种事发生
 def _resolve_backend():
     """决定本进程用哪个后端 → (backend, 来源说明)。
 
     优先级：`BOSHI_BACKEND` 环境变量（显式、最高）
           > `~/.boshi/backends.json` 的 `[当前 profile]` 键
-          > `~/.boshi/backends.json` 的 `["*"]` 通配键（建议显式写 "chroma"，避免误切）
-          > 默认 "chroma"
+          > `~/.boshi/backends.json` 的 `["*"]` 通配键
+          > **代码默认 "pg"**
 
     profile 取自 resolve_profile()（`BOSHI_PROFILE` > `HERMES_HOME` 推导 > default）：
     「谁在用伯仕」就按谁在配置里的取值 → 可**按接入方**精细切换，接入方零改动。
+
+    ★ 默认值定在代码里（2026-10-19 用户定稿）：
+      读写记忆全部落 PG，Chroma 只作 Hermes 自带的历史全量库，不被写入、不被回补。
+      默认值写在代码里而不是 backends.json —— 配置文件会被重装/升级重置，
+      一旦回落到 chroma 就是**静默丢记忆**（没人会收到通知）。代码里的默认值带不走。
+      回滚：显式 `BOSHI_BACKEND=chroma` 或 backends.json 给某 profile 写 "chroma"。
     """
     env = (os.environ.get("BOSHI_BACKEND") or "").strip().lower()
     if env:
@@ -1043,7 +1070,7 @@ def _resolve_backend():
                     return v.strip().lower(), "backends.json[%s]" % key
     except Exception:
         pass
-    return "chroma", "默认"
+    return "pg", "代码默认"
 
 
 BACKEND, BACKEND_SOURCE = _resolve_backend()
@@ -1089,9 +1116,9 @@ def backend_source() -> str:
 # ══════════════════════════════════════════════════════════════════
 # 规则来源：用户定稿「全量记忆 PG 里也要有一份」——任何入口都不得只写 Chroma。
 # 三重保障：
-#   1. backends.json 所有 profile（含 "*"）一律 pg          → 正常路径本来就落 PG
-#   2. 本镜像：万一某进程显式 BOSHI_BACKEND=chroma（老插件/MCP 残留 env），
-#      写入照样镜像进 PG                                    → 兜住残留配置
+#   1. 代码默认 pg（_resolve_backend 末行）→ 正常路径本来就落 PG，配置文件丢了也不变
+#   2. 本镜像：万一某进程显式 BOSHI_BACKEND=chroma（回滚/老插件/MCP 残留 env），
+#      写入照样镜像进 PG                                    → 兜住回滚窗口
 #   3. pg_sync.py 可离线对账（Chroma → PG 单向补齐）
 # 设计约束：
 #   - **失败绝不阻断主写入**（Chroma 成功即返回，镜像异常只记日志）

@@ -222,13 +222,13 @@ def create_server():
         description="向伯仕记忆系统存入一条记忆/事实。适合保存用户偏好、项目决策、重要信息等。",
     )
     def boshi_save(content: str, topic: str = "external", metadata: Optional[dict] = None,
-                   profile: Optional[str] = None,
+                   profile: Optional[str] = None, upsert: bool = False,
                    ctx: Optional[Context] = None) -> str:
-        """存入记忆：content 记忆内容；topic 主题标签默认 external；metadata 附加元数据（可选）；profile 归属标识（可选，一般无需传——伯仕会按 MCP 握手自动识别调用方标识；显式传入可覆盖）"""
+        """存入记忆：content 记忆内容；topic 主题标签默认 external；metadata 附加元数据（可选）；profile 归属标识（可选，一般无需传——伯仕会按 MCP 握手自动识别调用方标识；显式传入可覆盖）；upsert=true 表示同 (归属, session_id, topic) 只保留 1 条有效记录（用于反复刷新的会话事实，metadata 需带 session_id）"""
         _ident = profile or _caller_identity(ctx)
         _audit("boshi_save", _ident, "写入(归属自动打标)", content, ctx=ctx)
         result = save(content=content, topic=topic, metadata=metadata,
-                      profile=_ident)
+                      profile=_ident, upsert=upsert)
         return json.dumps(_with_meta(result, ctx, "self(写入归属自动打标)"), ensure_ascii=False, indent=2)
 
     @server.tool(

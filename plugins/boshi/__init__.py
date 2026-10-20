@@ -825,6 +825,7 @@ class BoshiMemoryProvider(MemoryProvider):
                     "role": "assistant",
                     "stage": "session_end",
                 },
+                upsert=True,   # P3：同会话事实层只留 1 条有效记录（旧行降级 is_latest=false）
             )
             logger.info(
                 "boshi on_session_end: saved task_conclusion (user=%d asst=%d)",
@@ -971,6 +972,7 @@ class BoshiMemoryProvider(MemoryProvider):
                             "role": "assistant",
                             "stage": "pre_compress",
                         },
+                        upsert=True,   # P3：同上
                     )
                 except Exception as e:
                     logger.debug("boshi on_pre_compress conclusion save failed: %s", e)

@@ -154,7 +154,7 @@ def current_profile() -> str:
 
 
 def save(content: str, topic: str = "external", metadata: dict = None,
-         profile: str = None) -> dict:
+         profile: str = None, upsert: bool = False) -> dict:
     """
     存入一条记忆。
 
@@ -164,6 +164,9 @@ def save(content: str, topic: str = "external", metadata: dict = None,
         metadata: 附加元数据
         profile:  记忆归属标识（默认由当前 HERMES_HOME/BOSHI_PROFILE 推导，
                   即写入方所属 profile/agent）
+        upsert:   P3（2026-10-20）同 (profile, session_id, topic) 只留 1 条有效记录。
+                  用于事实层（如每会话结论）反复刷新；metadata 里必须带 session_id，
+                  否则自动退化为普通追加。
 
     返回:
         {"success": True, "memory_id": str, "content_preview": str}
@@ -177,7 +180,7 @@ def save(content: str, topic: str = "external", metadata: dict = None,
         meta["profile"] = profile
     # profile 未显式给出时，由 chroma_bridge.add_memory 按当前进程归属打标
 
-    memory_id = cb.add_memory(content=content, metadata=meta)
+    memory_id = cb.add_memory(content=content, metadata=meta, upsert=upsert)
 
     # 知识图谱联动（2026-08-19 接线）：自动提取实体并建立关系边。
     # 失败不阻断主流程（图谱只是增强层）。

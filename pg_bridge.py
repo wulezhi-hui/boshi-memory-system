@@ -457,8 +457,16 @@ def _norm_ts(ts) -> Optional[float]:
             return None
 
 
-def add_memory(content: str, metadata: dict = None, memory_id: str = None):
-    """写入一条记忆。metadata 为 None 时按当前进程归属打标（与 Chroma 后端一致）。"""
+def add_memory(content: str, metadata: dict = None, memory_id: str = None,
+               upsert: bool = False):
+    """写入一条记忆。metadata 为 None 时按当前进程归属打标（与 Chroma 后端一致）。
+
+    upsert=True（P3，2026-10-20）：同 `(profile, session_id, topic)` 下已有有效行时，
+    先把旧行 `is_latest=false`、写新行 `is_latest=true`，并给新行 meta 打
+    `supersedes=<旧 id>`。**不物理覆盖**，沿用 v5.8「不可变日志 + isLatest」约定，
+    这样"每会话恰好 1 条事实记录"对读路径成立，历史仍可追溯。
+    `session_id` 或 `topic` 任一为空 → 自动退化为普通 add（避免无会话的写入互相顶掉）。
+    """
     import uuid
     c = _conn()
     meta = dict(metadata or {})
@@ -519,6 +527,29 @@ def add_memory(content: str, metadata: dict = None, memory_id: str = None):
         except Exception:      # 抽提是增强项，坏了绝不能阻断写入
             _slots = None
 
+    # ── P3 事实层 upsert：加锁 → 旧行降级 → 写新行 → 解锁 ────────────────
+    # 用**会话级** advisory lock（`_conn()` 是 autocommit，事务级 `pg_advisory_xact_lock`
+    # 会在语句结束立刻释放，等于没锁）。锁粒度 = (profile, session_id, topic)，
+    # 保证同会话同主题的并发送写不会各插一条都标 is_latest。
+    _upsert_lock = None
+    if upsert and sid and topic:
+        _upsert_lock = "boshi.upsert:%s|%s|%s" % (prof, sid, topic)
+        with c.cursor() as cur:
+            cur.execute("SELECT pg_advisory_lock(hashtext(%s)::bigint)", (_upsert_lock,))
+        try:
+            with c.cursor() as cur:
+                cur.execute("""UPDATE boshi.memories SET is_latest = false
+                               WHERE profile = %s AND session_id = %s AND topic = %s
+                                 AND is_latest
+                               RETURNING id""", (prof, sid, topic))
+                _old_ids = [str(r[0]) for r in (cur.fetchall() or [])]
+            if _old_ids:
+                meta["supersedes"] = _old_ids[0] if len(_old_ids) == 1 else _old_ids
+        except Exception:
+            with c.cursor() as cur:
+                cur.execute("SELECT pg_advisory_unlock(hashtext(%s)::bigint)", (_upsert_lock,))
+            raise
+
     v = _ef()([content or " "])[0]
     from datetime import datetime, timezone
     try:
@@ -531,17 +562,26 @@ def add_memory(content: str, metadata: dict = None, memory_id: str = None):
         meta.setdefault("timestamp", float(ts))
     except Exception:
         created = None
-    with c.cursor() as cur:
-        cur.execute("""
-            INSERT INTO boshi.memories
-              (id, content, embedding, profile, source, topic, role, session_id,
-               meta, is_latest, created_at, version_created, slots, raw_len)
-            VALUES (%s,%s,%s::vector,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s)
-            RETURNING id
-        """, (mid, content, _vec_literal(v), prof, source, topic, role, sid,
-              json.dumps(meta, ensure_ascii=False), is_latest, created, vc,
-              json.dumps(_slots, ensure_ascii=False) if _slots else None, _raw_len))
-        return str(cur.fetchone()[0])      # ← 与 chroma_bridge 契约一致：返回 id 字符串
+    try:
+        with c.cursor() as cur:
+            cur.execute("""
+                INSERT INTO boshi.memories
+                  (id, content, embedding, profile, source, topic, role, session_id,
+                   meta, is_latest, created_at, version_created, slots, raw_len)
+                VALUES (%s,%s,%s::vector,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s)
+                RETURNING id
+            """, (mid, content, _vec_literal(v), prof, source, topic, role, sid,
+                  json.dumps(meta, ensure_ascii=False), is_latest, created, vc,
+                  json.dumps(_slots, ensure_ascii=False) if _slots else None, _raw_len))
+            return str(cur.fetchone()[0])      # ← 与 chroma_bridge 契约一致：返回 id 字符串
+    finally:
+        if _upsert_lock:
+            try:
+                with c.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(hashtext(%s)::bigint)",
+                                (_upsert_lock,))
+            except Exception:      # 解锁失败不能盖掉写入结果；连接复用时 _conn() 会探活重建
+                pass
 
 
 def add_memories_batch(entries: list):
