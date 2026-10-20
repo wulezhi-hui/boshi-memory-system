@@ -153,5 +153,49 @@ class KwAbsAllTest(unittest.TestCase):
         self.assertNotIn("kw_abs_all", out[0])
 
 
+class KwRelBlendTest(unittest.TestCase):
+    """弱证据下掺入关键词通道相对分（2026-10-23，§11.23）。
+
+    病灶：`_score_merge` 只读 kw_abs。改写式 query 的 gold 常只对上两三个
+    bigram（kw_abs 低），但它在关键词通道里是第 1 名——绝对分把它埋掉。
+    `BOSHI_KW_REL_BLEND=b` 时：k = kw_abs + b*kw（kw 为通道内 top1 归一）。
+    """
+
+    @staticmethod
+    def items():
+        # rank1：kw_abs 低但相对分满格；rank2：绝对覆盖率高
+        return [
+            {"id": "reltop", "content": "a", "metadata": {}, "score": 0.0,
+             "kw_abs": 0.2, "kw": 1.0, "_weak": True},
+            {"id": "abstop", "content": "b", "metadata": {}, "score": 0.0,
+             "kw_abs": 0.5, "kw": 0.4, "_weak": True},
+        ]
+
+    def setUp(self):
+        self._old = pg_bridge._KW_REL_BLEND
+        pg_bridge._KW_REL_BLEND = 0.0
+
+    def tearDown(self):
+        pg_bridge._KW_REL_BLEND = self._old
+
+    def test_off_by_default_keeps_abs_order(self):
+        self.assertEqual(pg_bridge._score_merge([], self.items(), 5)[0]["id"], "abstop")
+
+    def test_on_promotes_channel_leader(self):
+        pg_bridge._KW_REL_BLEND = 1.0
+        out = pg_bridge._score_merge([], self.items(), 5)
+        self.assertEqual(out[0]["id"], "reltop")
+        # k = 0.2 + 1.0*1.0 = 1.20；f = (0.70*0 + 0.30*1.20)/1.0
+        self.assertAlmostEqual(out[0]["fused"], 0.36, places=4)
+
+    def test_strong_query_untouched(self):
+        # 主 token 命中（无 _weak）时即使开了 blend 也不掺相对分
+        pg_bridge._KW_REL_BLEND = 0.4
+        strong = [dict(it, _weak=False) for it in self.items()]
+        out = pg_bridge._score_merge([], strong, 5)
+        self.assertEqual(out[0]["id"], "abstop")          # 绝对分仍占优
+        self.assertAlmostEqual(out[0]["fused"], 0.275, places=4)   # 0.55*0.5
+
+
 if __name__ == "__main__":
     unittest.main()

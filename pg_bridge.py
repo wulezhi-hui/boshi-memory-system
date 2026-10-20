@@ -714,6 +714,12 @@ _KW_WEAK_WV = float(os.environ.get("BOSHI_KW_WEAK_WV", "0.70"))
 _KW_WEAK_WK = float(os.environ.get("BOSHI_KW_WEAK_WK", "0.30"))
 # 弱证据下 kw_abs 改用「库内真实存在的 token」做分母（1=开，默认开）。
 _KW_ABS_ALL = (os.environ.get("BOSHI_KW_ABS_ALL", "1") != "0")
+# 相对分掺入（2026-10-23）：`kw_abs` 是绝对 idf 覆盖率，改写式 query 的 gold
+# 只对上几个 bigram、覆盖率低，但**在关键词通道里名次靠前**（A9 实测
+# 8b027120 名次 1、eec4f527 5、f6c71ce8 10），却被只读 kw_abs 的融合顶出去。
+# 故弱证据 query 的 k 值 = kw_abs + b*kw（kw 是通道内 top1 归一的相对分）。
+# A9 离线网格：b=0.3~0.5 都把 paraphrase 从 3/4/10 提到 4/5/11~12，b=0.4 最佳。
+_KW_REL_BLEND = float(os.environ.get("BOSHI_KW_REL_BLEND", "0") or 0)
 
 
 def _has_anchor(query: str) -> bool:
@@ -1119,6 +1125,8 @@ def _score_merge(vec_items: list, kw_items: list, top_k: int,
     """
     if kw_items and any(it.get("_weak") for it in kw_items) and (wv, wk) == (0.45, 0.55):
         wv, wk = _KW_WEAK_WV, _KW_WEAK_WK
+    # 弱证据 query：只在通道内名次好、绝对覆盖率低的 gold 才需要相对分兜底
+    qweak = _KW_REL_BLEND > 0 and any(it.get("_weak") for it in kw_items)
     wsum = (wv + wk) or 1.0
     pool: dict = {}
     for it in vec_items:
@@ -1130,6 +1138,8 @@ def _score_merge(vec_items: list, kw_items: list, top_k: int,
             d["v"] = max(0.0, float(it["_cos"]))       # 关键词独有文档补的真实余弦
             d["item"] = it
         d["k"] = float(it.get("kw_abs") or 0.0)
+        if qweak:
+            d["k"] += _KW_REL_BLEND * float(it.get("kw") or 0.0)
         d["ch"].append("kw")
     out = []
     for d in pool.values():
