@@ -23,6 +23,10 @@ from cases_a9 import CASES
 tag = sys.argv[1] if len(sys.argv) > 1 else "run"
 MODES = ("auto", "score", "vector")
 SCOPE = os.environ.get("A9_SCOPE", "all")
+# 可复现评测：评测期间插件仍在往库里写本节工作摘要（会污染纯中文 query 的 kw 候选），
+# 给定 A9_ASOF（Unix 秒或 ISO）即只看该时刻之前写入的记忆，跨轮名次才可比。
+ASOF = os.environ.get("A9_ASOF")
+WHERE = {"created_at": {"$lte": ASOF}} if ASOF else None
 
 c = pg_bridge._conn()
 body = {}
@@ -50,7 +54,8 @@ if bad:
     sys.exit(1)
 print(f"自检通过：{len(CASES)} 条，anchor 全在 gold 内，且全部无锚点")
 
-pg_bridge.search_memory("预热 嵌入 模型", top_k=3, fusion="vector", scope=SCOPE)
+pg_bridge.search_memory("预热 嵌入 模型", top_k=3, fusion="vector", scope=SCOPE,
+                        where=WHERE)
 
 rows = []
 stat = {k: {m: {"top1": 0, "top3": 0, "top5": 0} for m in MODES}
@@ -58,7 +63,8 @@ stat = {k: {m: {"top1": 0, "top3": 0, "top5": 0} for m in MODES}
 for kind, gid, anchor, q in CASES:
     rec = {"kind": kind, "q": q, "gold": gid, "anchor": anchor}
     for mode in MODES:
-        items = pg_bridge.search_memory(q, top_k=5, fusion=mode, scope=SCOPE)
+        items = pg_bridge.search_memory(q, top_k=5, fusion=mode, scope=SCOPE,
+                                        where=WHERE)
         ids = [str(it["id"])[:8] for it in items]
         rank = (ids.index(gid) + 1) if gid in ids else None
         ch = [it.get("channels") for it in items]
@@ -88,7 +94,7 @@ for r in rows:
     d = "=" if a == s else ("↑" if (s and (not a or s < a)) else "↓")
     print(f"{r['kind'][:4]} {r['gold']} auto={a} score={s} {d}  {r['q'][:30]}")
 
-out = {"tag": tag, "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+out = {"tag": tag, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "asof": ASOF,
        "n": len(CASES), "scope": SCOPE, "stat": stat, "cases": rows}
 p = os.path.join(HERE, "logs", f"a9_{tag}.json")
 with open(p, "w", encoding="utf-8") as f:

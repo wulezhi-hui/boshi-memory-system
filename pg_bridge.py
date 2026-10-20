@@ -334,6 +334,25 @@ def _cond(key: str, val) -> tuple:
         return ("is_latest = %s", [bool(val)])
     if key == "profile":
         return ("profile IS NOT DISTINCT FROM %s", [val])
+    if key in ("created_at", "createdAt"):
+        # 真列（不在 meta 里）。值是 Unix 秒或 ISO 串；用于时间窗口检索/可复现评测
+        # （评测期间自身还在往库里写，不带截止时间就无法跨轮比较名次）
+        def _ts(x):
+            try:
+                return float(x)
+            except (TypeError, ValueError):
+                import datetime as _dt
+                return _dt.datetime.fromisoformat(str(x)).timestamp()
+        if isinstance(val, dict):
+            for op, sqlop in (("$gte", ">="), ("$lte", "<="),
+                              ("$gt", ">"), ("$lt", "<")):
+                if op in val:
+                    return ("created_at %s to_timestamp(%%s)" % sqlop, [_ts(val[op])])
+            for op, sqlop in (("$eq", "="), ("$ne", "IS DISTINCT FROM")):
+                if op in val:
+                    return ("created_at %s to_timestamp(%%s)" % sqlop, [_ts(val[op])])
+            return ("TRUE", [])
+        return ("created_at = to_timestamp(%s)", [_ts(val)])
     if key == "type":
         # 图谱边已分表；这里只处理"排除 relation"的常见诉求
         if isinstance(val, dict) and "$ne" in val:
@@ -1253,10 +1272,15 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
         items = vec_items[:int(pool_k)]
     else:
         toks = _kw_tokens(query)
-        # auto：纯中文自然语言查询走纯向量（BM25 不辨否定/语义，实测会把
-        # 「不是佛教微调，是通用的」顶到第一）；含字面锚点（型号/端口/版本号/
-        # 数字）时才开关键词通道 —— 那正是纯向量最容易翻车的场景。
-        if not toks or (mode == "auto" and not _has_anchor(query)):
+        # auto：默认纯中文自然语言查询也走关键词通道（2026-10-20 乐之拍板放开）。
+        # 早先关门的原因是 BM25 不辨否定/语义（「不是佛教微调，是通用的」会把佛教
+        # 微调顶到第一），但 coord 退化保护 + 弱证据降权之后，纯中文 query 的 kw
+        # 证据一定是 bigram 级弱证据（降权 0.70/0.30），A9 实测 overlap top5
+        # 6→12、top1 0→4，而 A5 带锚点场景逐条不变。
+        # 需要回退旧行为：BOSHI_AUTO_KW_NOANCHOR=0（纯中文只走向量）。
+        _auto_kw_noanchor = os.environ.get("BOSHI_AUTO_KW_NOANCHOR", "1") == "1"
+        if not toks or (mode == "auto" and not _auto_kw_noanchor
+                        and not _has_anchor(query)):
             items = vec_items[:int(pool_k)]
         else:
             kw_items = _kw_channel(c, toks, k_kw, cond, params)
