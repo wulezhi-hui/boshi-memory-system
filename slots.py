@@ -44,6 +44,20 @@ _RE_CLAUSE = re.compile(r"[^。；;，,\n]{0,40}")
 RE_NUM_KW = re.compile(r"(?:build|ctx|上下文长度|上下文|阈值|上限)[^\d\n]{0,4}(\d{2,7})(?![\d.])")
 # 版本号：v1.2 / 1.2.3；负向断言挡住 IP 片段与带单位的数字
 RE_VER = re.compile(r"(?<![\w.])(v?\d+\.\d+(?:\.\d+)?)(?![\d.\w])")
+# 四段版本号（2026-10-20 补）：`0.1.44.1` 这类 4 段号上面最多只到 3 段抓不到，实测全库有 209 行含 4 段号。
+# 两条规则分开，因为**无 v 前缀的 4 段号与 IP 语法完全不可区分**（`0.1.44.1` vs `172.16.0.219`）：
+#   RE_VER4_V —— 有 v 前缀不可能是 IP，无条件收；
+#   RE_VER4   —— 裸 4 段：任一节 >255 就不可能是 IP，直接收；全是合法 IP 节（≤255）时只认版本语境。
+RE_VER4_V = re.compile(r"(?<![\w.])(v\d+\.\d+\.\d+\.\d+)(?![\d.\w])")
+RE_VER4 = re.compile(r"(?<![\w.])(\d+\.\d+\.\d+\.\d+)(?![\d.\w])")
+# 裸 4 段号赖以成立的版本语境词（近邻 ±12 字符内出现）
+_VER4_CTX = ("版本", "版号", "升到", "升级", "降级", "回滚", "发布", "固件", "内核", "更新到")
+# 英文语境词必须整词匹配：子串匹配会把 `api_server`/`ProxyServer` 里的 ver 当成版本线索
+_VER4_CTX_RE = re.compile(r"(?<![A-Za-z])(?:version|build|ver)(?![A-Za-z])")
+# 出现这些说明是在说 IP/网络，不是版本
+_IP_CTX = ("IP", "地址", "网段", "掩码", "网关", "监听", "端口", "ping", "ssh", "http://", "https://", "主机", "访问")
+# 私有/回环/保留段开头：现实里不会有版本号长成这样（`0.1.44.1` 的 0.1 不受影响）
+_PRIVATE_IP = re.compile(r"^(?:127\.|10\.|0\.0\.|255\.)|^172\.(?:1[6-9]|2\d|3[01])\.|^192\.168\.")
 RE_UNIT_TAIL = re.compile(r"^\s?(?:GB|MB|KB|MiB|GiB|ms|s|tok/s|t/s|°C|%)")
 
 DECIDE = ("决定", "改为", "选用", "采用", "不再", "放弃", "换成", "定下来", "结论是", "结论：")
@@ -273,21 +287,35 @@ def _ports(text: str) -> List[str]:
 
 
 def _versions(text: str) -> List[str]:
-    out = []
-    for m in RE_VER.finditer(text):
-        tok = m.group(1)
-        tail = text[m.end():m.end() + 4]
-        if RE_UNIT_TAIL.match(tail):        # `47.6 MB` 的 47.6 不是版本
-            continue
-        if tok.count(".") == 1 and len(tok.split(".")[0]) > 3:   # 太长的整数段多半是 IP/数字
-            continue
-        if m.start(1) and text[m.start(1) - 1] in "=＝~":        # `_KW_LENB=0.5` 是参数值不是版本
-            continue
-        ctx = re.split(r"[，,。；;、]", text[max(0, m.start(1) - 12):m.start(1)])[-1].strip()
-        if any(w in ctx for w in _VER_VALUE_CTX):   # 「阈值 0.85」「阻尼 0.5」是参数值
-            continue
-        out.append(tok)
-    return out
+    found = []          # (start, tok) —— 最后按出现位置排序，保持原文顺序
+    for pat, bare4 in ((RE_VER, False), (RE_VER4_V, False), (RE_VER4, True)):
+        for m in pat.finditer(text):
+            tok = m.group(1)
+            s = m.start(1)
+            tail = text[m.end(1):m.end(1) + 4]
+            if RE_UNIT_TAIL.match(tail):        # `47.6 MB` 的 47.6 不是版本
+                continue
+            segs = tok.split(".")
+            if len(segs) == 2 and len(segs[0]) > 3:   # 太长的整数段多半是 IP/数字
+                continue
+            if s and text[s - 1] in "=＝~":        # `_KW_LENB=0.5` 是参数值不是版本
+                continue
+            ctx = re.split(r"[，,。；;、]", text[max(0, s - 12):s])[-1].strip()
+            after = text[m.end(1):m.end(1) + 12]
+            if any(w in ctx for w in _VER_VALUE_CTX):   # 「阈值 0.85」「阻尼 0.5」是参数值
+                continue
+            if bare4 and all(len(x) <= 3 and int(x) <= 255 for x in segs):
+                # 裸 4 段且每节都是合法 IP 节 → 语法上与 IP 无法区分，只认版本语境
+                if _PRIVATE_IP.match(tok):
+                    continue
+                win = ctx + after
+                if any(w in win for w in _IP_CTX):
+                    continue
+                if not (any(w in win for w in _VER4_CTX) or _VER4_CTX_RE.search(win)):
+                    continue
+            found.append((s, tok))
+    found.sort()
+    return [t for _, t in found]
 
 
 def extract(text: str) -> Dict[str, Any]:

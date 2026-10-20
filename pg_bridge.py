@@ -1164,6 +1164,29 @@ _FM_STEP = float(os.environ.get("BOSHI_FM_STEP", "0.10"))    # 每命中一个�
 _FM_MAX = float(os.environ.get("BOSHI_FM_MAX", "0.30"))       # 抬升上限
 _FM_POOL = int(os.environ.get("BOSHI_FM_POOL", "3"))          # 候选池 = top_k × N
 
+# 线上打点：按天×字段聚合，供 eval/fm_stats_report.py 读（表在首次写入时懒建）
+_FM_STATS_READY = False
+_FM_STATS_DDL = """
+CREATE TABLE IF NOT EXISTS boshi.fm_stats (
+    day date NOT NULL,
+    field text NOT NULL,
+    queries bigint NOT NULL DEFAULT 0,
+    hits bigint NOT NULL DEFAULT 0,
+    gain_sum double precision NOT NULL DEFAULT 0,
+    top1_changed bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, field)
+)
+"""
+_FM_STATS_UPSERT = """
+INSERT INTO boshi.fm_stats AS s (day, field, queries, hits, gain_sum, top1_changed)
+VALUES (CURRENT_DATE, %s, 1, %s, %s, %s)
+ON CONFLICT (day, field) DO UPDATE SET
+    queries = s.queries + 1,
+    hits = s.hits + EXCLUDED.hits,
+    gain_sum = s.gain_sum + EXCLUDED.gain_sum,
+    top1_changed = s.top1_changed + EXCLUDED.top1_changed
+"""
+
 
 def _fm_norm(v: str) -> str:
     """字段值归一：小写、去空白、去首尾标点。只做形态归一，不改字。"""
@@ -1172,12 +1195,32 @@ def _fm_norm(v: str) -> str:
     return s.strip("，。、；;:：,.'\"()[]")
 
 
+_RE_VER_STRIP = re.compile(r"^[vV]\s*")
+
+
+def _fm_ver(v: str) -> str:
+    """版本号归一：去前导 `v`、压空白、去尾标点。只做形态归一，不改数字。"""
+    return _RE_VER_STRIP.sub("", _fm_norm(v))
+
+
 def _fm_hits(qfields: dict, cand: dict) -> list:
-    """返回命中的字段名列表。同字段双向包含即算命中（`0.1.44.1` ⊂ `0.1.44.1 `）。"""
+    """返回命中的字段名列表。同字段双向包含即算命中（`127.0.0.1:8199` ⊃ `8199`）。
+
+    `versions` 例外：必须**精确相等**，不做双向包含。原因（2026-10-21 A5 实测）：
+    旧抽提器把 `v0.1.44.1` 截成 `v0.1.44`，新抽提器抽全段，query 抽到 `0.1.44.1` 时
+    按包含判定只剩「截断值 ⊂ 真值」单向命中——真答案因自己也含该值被抬同时，
+    截断的邻居也被抬，反把 gold 挤到 top5 外；而精确比较两边都不命中，排序回到
+    未启用字段匹配时的样子（净收益不丢，A8 的 4 条转好全部来自 ports/flags）。
+    """
     hits = []
     for key, qvals in qfields.items():
         cvals = [_fm_norm(x) if isinstance(x, str) else _fm_norm(str(x))
                  for x in (cand.get(key) or [])]
+        if key == "versions":
+            cver = {_fm_ver(x) for x in cvals if x}
+            if any(qv and _fm_ver(qv) in cver for qv in qvals):
+                hits.append(key)
+            continue
         for qv in qvals:
             if any(qv and cv and (qv in cv or cv in qv) for cv in cvals):
                 hits.append(key)
@@ -1269,8 +1312,11 @@ def _field_match(c, query: str, items: list, top_k: int) -> list:
         it["field_hits"] = hits
         it["field_gain"] = round(gain, 4)
     _fm_trace(query, qfields, items, top_k)
+    pre_top1 = str(items[0]["id"]) if items else None
     items.sort(key=lambda x: x["score"])
-    return items[:int(top_k)]
+    top = items[:int(top_k)]
+    _fm_stats(c, qfields, top, pre_top1)
+    return top
 
 
 def _fm_trace(query: str, qfields: dict, items: list, top_k: int) -> None:
@@ -1302,6 +1348,35 @@ def _fm_trace(query: str, qfields: dict, items: list, top_k: int) -> None:
                   "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
+        pass
+
+
+def _fm_stats(c, qfields: dict, top: list, pre_top1: str = None) -> None:
+    """P2+ 线上打点（默认开，`BOSHI_FM_STATS=0` 关）：按天×字段累计命中与抬升效果。
+
+    目的：`_FM_W` 的字段权重目前是拍的（ports/versions/flags 1.0、files 0.8），
+    有了这张表就能用真实流量算「命中率 / 平均抬升 / 改变 top1 的比率」，
+    以后调权看数据而不是看直觉。
+
+    只记聚合计数（每 query 每个字段一行 upsert，最多 4 行），走的是 `_conn()` 的
+    autocommit 连接，不占事务；任何异常都吞掉——打点永远不许拖累检索。
+    """
+    if os.environ.get("BOSHI_FM_STATS", "1") != "1" or not qfields or not top:
+        return
+    try:
+        global _FM_STATS_READY
+        if not _FM_STATS_READY:
+            c.execute(_FM_STATS_DDL)
+            _FM_STATS_READY = True
+        t1 = top[0]
+        changed = int(bool(pre_top1) and str(t1.get("id")) != str(pre_top1))
+        t1_hits = t1.get("field_hits") or []
+        for key in qfields:
+            hit_items = [it for it in top if key in (it.get("field_hits") or [])]
+            gain = sum(float(it.get("field_gain") or 0.0) for it in hit_items)
+            c.execute(_FM_STATS_UPSERT,
+                      (key, len(hit_items), round(gain, 4), int(changed and key in t1_hits)))
+    except Exception:  # noqa: BLE001
         pass
 
 

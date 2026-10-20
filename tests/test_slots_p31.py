@@ -43,9 +43,12 @@ class TestListItemsAreSeparate(unittest.TestCase):
     def test_列表块不再整体算一句(self):
         sents = slots._sentences(REAL_LIST_BLOCK)
         self.assertEqual(len(sents), 3, sents)
-        self.assertTrue(sents[0].startswith("- **2. 你那个新窗口的日志**"))
+        # 列表记号（"- " / "1. "）在切句后被剥掉（2026-10-20 22:5x，commit 974c20d）：
+        # 槽位值要进 BM25，留着 "- " 只会把记号和相邻词粘成一个假 token；
+        # 剥记号后仍是原文连续子串，不破坏「只搬运不生成」不变式。
+        self.assertTrue(sents[0].startswith("**2. 你那个新窗口的日志**"), sents[0])
         self.assertIn("切到", sents[1])
-        self.assertTrue(sents[2].startswith("- 13:18 复测"))
+        self.assertTrue(sents[2].startswith("13:18 复测"), sents[2])
 
     def test_切到不再算决策_整块不该进decisions(self):
         out = slots.extract(REAL_LIST_BLOCK)

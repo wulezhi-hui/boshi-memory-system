@@ -72,5 +72,30 @@ class HitsTest(unittest.TestCase):
         self.assertEqual(pg_bridge._fm_norm(""), "")
 
 
+class VersionExactTest(unittest.TestCase):
+    """版本字段不做双向包含：`0.1.43` / `0.1.43.1` / `v0.1.43.1` 的判定边界。"""
+
+    def test_v_prefix_is_same_version(self):
+        self.assertEqual(pg_bridge._fm_hits({"versions": ["0.1.44.1"]},
+                                            {"versions": ["v0.1.44.1"]}), ["versions"])
+        self.assertEqual(pg_bridge._fm_ver("V0.1.44.1"), "0.1.44.1")
+
+    def test_truncated_is_not_same_version(self):
+        # 旧抽提器截断出的 `v0.1.44` 不能命中 `0.1.44.1`
+        self.assertEqual(pg_bridge._fm_hits({"versions": ["0.1.44.1"]},
+                                            {"versions": ["v0.1.44"]}), [])
+
+    def test_prefix_shorter_is_not_hit(self):
+        self.assertEqual(pg_bridge._fm_hits({"versions": ["0.1.43"]},
+                                            {"versions": ["0.1.43.1"]}), [])
+        self.assertEqual(pg_bridge._fm_hits({"versions": ["7.2"]},
+                                            {"versions": ["7.2.0"]}), [])
+
+    def test_port_still_uses_containment(self):
+        # 端口保持双向包含（`127.0.0.1:8199` ⊃ `8199`），只有 versions 收紧
+        self.assertEqual(pg_bridge._fm_hits({"ports": ["8199"]},
+                                            {"ports": ["127.0.0.1:8199"]}), ["ports"])
+
+
 if __name__ == "__main__":
     unittest.main()

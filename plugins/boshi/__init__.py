@@ -836,10 +836,14 @@ class BoshiMemoryProvider(MemoryProvider):
             if sid_fact:
                 try:
                     _fact = _boshi_session_fact()
-                    new_items: Dict[str, List[str]] = {}
-                    for _m in (u_slots_meta, a_slots_meta):
-                        for _k, _v in _fact.items_from_slots(_m).items():
-                            new_items.setdefault(_k, []).extend(_v)
+                    new_items: Dict[str, List[str]] = dict(
+                        _fact.items_from_slots(u_slots_meta))
+                    # P3.1（2026-10-20，2026-10-21 恢复）：**只采用户侧**。助手侧的话
+                    # 天然充满「我建议 / 下一步 / 可以切到」这类词，采进来等于把
+                    # 「菜单」记成「点好的菜」——13:19 首条事实层就是助手列的选项被
+                    # 判成决策、我的待办提议被判成本会话待办。助手内容仍在
+                    # assistant_conclusion 里，一个字都不丢，只是不进事实层。
+                    # （经验层 P1③ 不受此限：教训两侧都可能给，见下面第 4 步。）
                     if new_items:       # 零条目 → 整轮跳过，连读库都省（每轮一次额外 SELECT 没必要）
                         text = _fact.merge(
                             self._core.get_latest_by_topic(sid_fact, _fact.FACT_TOPIC),

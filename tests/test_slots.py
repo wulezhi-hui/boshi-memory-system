@@ -104,6 +104,39 @@ class TestNegativeCases(unittest.TestCase):
         self.assertEqual(r["versions"], [])
 
 
+class TestFourSegmentVersion(unittest.TestCase):
+    """四段版本号（2026-10-20 补）：`0.1.44.1` 必须进 versions，同时不能把 IP 放进来。"""
+
+    def test_bare_four_seg_with_version_context(self):
+        r = slots.extract("版本 0.1.44.1 已发布，修了闪退。")
+        self.assertIn("0.1.44.1", r["versions"])
+
+    def test_v_prefixed_four_seg(self):
+        r = slots.extract("升级到 v0.1.40.4 之后就好了。")
+        self.assertIn("v0.1.40.4", r["versions"])
+
+    def test_four_seg_with_segment_over_255(self):
+        # 任一节 >255 不可能是 IP，按版本收
+        r = slots.extract("10.0.19041.3636 是 Win10 build。")
+        self.assertIn("10.0.19041.3636", r["versions"])
+
+    def test_private_ip_not_version(self):
+        for text in ("绑到 0.0.0.0 供局域网访问。",
+                     "ProxyServer = 127.0.0.1:17891，指向 0dcloud。",
+                     "网段 192.168.1.20 和 172.16.0.219 都是内网。"):
+            self.assertEqual(slots.extract(text)["versions"], [], text)
+
+    def test_bare_four_seg_without_context_rejected(self):
+        # 无版本语境时，与 IP 不可区分的裸 4 段号不收（1.2.3.4 就是反例本身）
+        r = slots.extract("这两者 1.2.3.4 在语法上不可区分。")
+        self.assertEqual(r["versions"], [])
+
+    def test_server_word_not_version_context(self):
+        # `api_server` / `ProxyServer` 里的 ver 不能当版本线索
+        r = slots.extract("vllm.entrypoints.openai.api_server --host 0.0.0.0")
+        self.assertEqual(r["versions"], [])
+
+
 class TestExtraction(unittest.TestCase):
     def setUp(self):
         self.r = slots.extract(T1)
