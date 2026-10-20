@@ -608,6 +608,10 @@ _KW_PARTIAL = float(os.environ.get("BOSHI_KW_PARTIAL", "0.85"))
 _KW_POOL_CAP = int(os.environ.get("BOSHI_KW_POOL_CAP", "20") or 0)
 # kw_abs 的长度阻尼系数（BM25 同形）：0 = 关闭（纯覆盖率，长文占便宜）
 _KW_LENB = float(os.environ.get("BOSHI_KW_LENB", "0.5"))
+# 弱证据降权（2026-10-20）：关键词通道只剩 bigram 证据时（主 token 全 df=0），
+# 与向量通道等权融合会把噪声顶进 top5，故把 wk 从 0.55 降到 0.30。
+_KW_WEAK_WV = float(os.environ.get("BOSHI_KW_WEAK_WV", "0.70"))
+_KW_WEAK_WK = float(os.environ.get("BOSHI_KW_WEAK_WK", "0.30"))
 
 
 def _has_anchor(query: str) -> bool:
@@ -873,6 +877,7 @@ def _kw_channel(c, toks: list, k: int, cond: str, params: list) -> list:
     widf_total = 0.0
     hits: dict = {}
     prim: list = []
+    main_hit_n = 0                 # 主 token 里「库内真有」的个数（coord 的可行性前提）
     for tok, w in toks:
         pl = postings.get(tok)
         df = len(pl) if pl else 0
@@ -880,6 +885,8 @@ def _kw_channel(c, toks: list, k: int, cond: str, params: list) -> list:
         if w >= 2.5:
             widf_total += w * idf
             prim.append((tok, w, idf))
+            if df:
+                main_hit_n += 1
         if not pl:
             continue
         for idx, tf in pl:
@@ -896,9 +903,18 @@ def _kw_channel(c, toks: list, k: int, cond: str, params: list) -> list:
     # 纯 BM25 里「命中一个极稀有词」就能压过「命中两个常见词」——实测
     # "佛教微调 数据集" 会被只含"数据集"的文档霸榜。乘上主词覆盖率把
     # 「两三个词都对上」的文档提上来，bigram 不参与分母（否则短查询被稀释）。
-    pr = {i: (hits.get(i) or {}).get("cov", 0.0) for i in scores}
-    scores = {i: s * (pr[i] / (sum(w for _, w in toks if w >= 2.5) or 1.0))
-              for i, s in scores.items()}
+    #
+    # 退化保护（2026-10-20）：纯中文整句提问时，整段汉字被当成一个 3.0 权重的
+    # 主 token，它几乎不可能作为 token 存在于 postings（df=0），于是 pr 全为 0
+    # → 所有候选分被乘成 0 → `_KW_MIN` 把候选全砍掉 → 关键词通道静默失效
+    # （实测 A9：「群晖硬盘显示已损毁但检测是好的怎么办」raw 295 候选，coord 后
+    # 非零 0/295）。此时 coord 的信息量恒为 0（大家覆盖率都是 0），它只毁掉
+    # bigram 信号，所以只在「至少一个主 token 命中」时施加。
+    weak = main_hit_n == 0         # 关键词证据只剩 bigram（见 _KW_WEAK_WV/WK）
+    if main_hit_n:
+        pr = {i: (hits.get(i) or {}).get("cov", 0.0) for i in scores}
+        scores = {i: s * (pr[i] / (sum(w for _, w in toks if w >= 2.5) or 1.0))
+                  for i, s in scores.items()}
 
     ranked = sorted(scores.items(), key=lambda x: -x[1])[:int(k)]
     if not ranked:
@@ -917,6 +933,7 @@ def _kw_channel(c, toks: list, k: int, cond: str, params: list) -> list:
         # 可跨文档比较、可与向量 sim 直接加权求和。top1 归一化会把「弱命中里的
         # 第一名」抬成 1.0，做加权融合时会把噪声顶上去。
         it["kw_abs"] = round(_kw_abs(dtxt, prim, widf_total, _dl, avgdl), 3)
+        it["_weak"] = weak          # 供 _score_merge 判权（融合后即被 pop）
         out.append(it)
     return out
 
@@ -948,6 +965,7 @@ def _rrf_merge(vec_items: list, kw_items: list, top_k: int, k: int = None) -> li
         it = d["item"]
         it["score"] = round(1.0 - sim, 6)
         it["channels"] = d["ch"]
+        it.pop("_weak", None)                    # 内部标记不外泄
         out.append(it)
     out.sort(key=lambda x: x["score"])
     return out[:int(top_k)]
@@ -960,7 +978,14 @@ def _score_merge(vec_items: list, kw_items: list, top_k: int,
     与 RRF 的分工：RRF 只看名次，两个通道各排第 30 的文档能压过单通道第 1
     （RRF 数学上如此，实测「退休 养老金」的金标被压出 top5）；加权分看的是
     「离得多近 + 字面对上多少」，单通道第 1 只要绝对分高就守得住。
+
+    弱证据降权（2026-10-20）：纯中文 query 的关键词通道只剩 bigram 证据
+    （候选带 `_weak=True`），此时 kw_abs 表达的是「零星 2 字切片对上」，与
+    整词命中不可同日而语。等权融合实测把 gold 挤出 top5（A9 paraphrase
+    56d59b74），故按 _KW_WEAK_WV/_KW_WEAK_WK 降权——不是关掉通道。
     """
+    if kw_items and any(it.get("_weak") for it in kw_items) and (wv, wk) == (0.45, 0.55):
+        wv, wk = _KW_WEAK_WV, _KW_WEAK_WK
     wsum = (wv + wk) or 1.0
     pool: dict = {}
     for it in vec_items:
@@ -980,6 +1005,7 @@ def _score_merge(vec_items: list, kw_items: list, top_k: int,
         it["score"] = round(1.0 - (0.60 + 0.40 * min(f, 1.0)), 6)   # 单调，展示仍落 0.6~1.0
         it["channels"] = d["ch"]
         it["fused"] = round(f, 4)
+        it.pop("_weak", None)                    # 内部标记不外泄
         out.append(it)
     out.sort(key=lambda x: x["score"])
     return out[:int(top_k)]
