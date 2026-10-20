@@ -74,11 +74,13 @@ os.environ["BOSHI_FIELD_MATCH"] = "0"
 
 def run(tag):
     st = {"top1": 0, "top3": 0, "top5": 0}
-    miss = []
+    miss, ranks, tops = [], [], []
     for q, gold, slot, lit in CASES:
         items = pg_bridge.search_memory(q, top_k=5, fusion="auto", scope="all")
         ids = [str(it["id"])[:8] for it in items]
         rank = (ids.index(gold) + 1) if gold in ids else None
+        ranks.append(rank)
+        tops.append(ids[0] if ids else None)
         if rank == 1:
             st["top1"] += 1
         if rank and rank <= 3:
@@ -89,18 +91,43 @@ def run(tag):
             miss.append((q, gold, slot))
     n = len(CASES)
     print(f"{tag:16s} n={n} top1={st['top1']}/{n} top3={st['top3']} top5={st['top5']}")
-    return st, miss
+    return st, miss, ranks, tops
 
 
-base_st, base_miss = run("fm off")
+base_st, base_miss, base_rank, base_top = run("fm off")
 os.environ["BOSHI_FIELD_MATCH"] = "1"
-fm_st, fm_miss = run("fm on")
+fm_st, fm_miss, fm_rank, fm_top = run("fm on")
 for m in fm_miss[:8]:
     print("  miss:", m)
-print("\n逐条转好/变差：")
-for (q, gold, slot, lit), b, f in zip(CASES, [], []):
-    pass
+
+# ---- 逐条归因：fm 到底把谁抬上来、有没有把 gold 踩下去（误抬） ----
+fixed, broken, keep, neither = [], [], [], []
+for i, (q, gold, slot, lit) in enumerate(CASES):
+    b = base_rank[i] == 1
+    f = fm_rank[i] == 1
+    rec = {"q": q, "gold": gold, "slot": slot, "lit": lit,
+           "off_rank": base_rank[i], "on_rank": fm_rank[i],
+           "off_top1": base_top[i], "on_top1": fm_top[i]}
+    if not b and f:
+        fixed.append(rec)
+    elif b and not f:
+        broken.append(rec)          # ← 误抬：fm 把 gold 从 top1 挤掉了
+    elif b and f:
+        keep.append(rec)
+    else:
+        neither.append(rec)
+
+print(f"\n归因：保持 {len(keep)} / 转好 {len(fixed)} / 变差(误抬) {len(broken)} / 均未中 {len(neither)}")
+for r in broken:
+    print(f"  [误抬] {r['slot']:8s} gold={r['gold']} off_rank={r['off_rank']} on_rank={r['on_rank']}"
+          f"  off_top1={r['off_top1']} on_top1={r['on_top1']}  q={r['q'][:60]}")
+for r in fixed:
+    print(f"  [转好] {r['slot']:8s} gold={r['gold']} {r['off_rank']}→1  q={r['q'][:60]}")
+
 json.dump({"n": len(CASES), "off": base_st, "on": fm_st,
+           "attrib": {"keep": len(keep), "fixed": len(fixed),
+                      "broken": len(broken), "neither": len(neither)},
+           "detail": {"keep": keep, "fixed": fixed, "broken": broken, "neither": neither},
            "cases": [{"q": q, "gold": g, "slot": s, "lit": l} for q, g, s, l in CASES]},
           open(os.path.join(HERE, "logs", "a8_field_gold.json"), "w", encoding="utf-8"),
           ensure_ascii=False, indent=1)

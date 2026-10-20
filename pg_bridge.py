@@ -1162,8 +1162,41 @@ def _field_match(c, query: str, items: list, top_k: int) -> list:
         it["score"] = round(1.0 - min(1.0, sim + gain), 6)
         it["field_hits"] = hits
         it["field_gain"] = round(gain, 4)
+    _fm_trace(query, qfields, items, top_k)
     items.sort(key=lambda x: x["score"])
     return items[:int(top_k)]
+
+
+def _fm_trace(query: str, qfields: dict, items: list, top_k: int) -> None:
+    """P2+ 打点：记录「抬升有没有改变名次」，用于事后审计线上误抬（默认关）。
+
+    `BOSHI_FM_TRACE=1` 才写；只在 query 带字面量（qfields 非空）时被调用，
+    频率低（每千条 query 个位数），一次 append 开销可忽略。
+    记录的是**排序前**的顺序（items 尚未 sort），所以能算出 pre/post top1 差异。
+    """
+    if os.environ.get("BOSHI_FM_TRACE", "0") != "1":
+        return
+    try:
+        pre = [(str(it["id"])[:8], round(float(it.get("score") or 0), 6)) for it in items]
+        order = sorted(range(len(items)), key=lambda i: float(items[i].get("score") or 0))
+        post = [pre[i][0] for i in order[:5]]
+        rec = {
+            "ts": _dt.now(_timezone.utc).astimezone().isoformat(timespec="seconds"),
+            "query": (query or "")[:200],
+            "fields": qfields,
+            "top_k": int(top_k),
+            "cand": len(items),
+            "hit_n": sum(1 for it in items if it.get("field_hits")),
+            "pre_top": [p[0] for p in pre[:5]],
+            "post_top": post,
+            "top1_changed": bool(post and pre and post[0] != pre[0][0]),
+            "top1_hit": bool(items[order[0]].get("field_hits")) if order else False,
+        }
+        with open(os.path.join(os.path.dirname(_LOG), "fm_trace.jsonl"),
+                  "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 def search_memory(query: str, top_k: int = 5, where: dict = None,
