@@ -132,6 +132,7 @@ _TOOL_NOISE_MARKERS = (
 
 
 _SLOTS_MOD = None
+_FACT_MOD = None
 
 
 def _boshi_slots():
@@ -149,6 +150,25 @@ def _boshi_slots():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     _SLOTS_MOD = mod
+    return mod
+
+
+def _boshi_session_fact():
+    """按文件路径加载 ~/.boshi/session_fact.py（P3 事实层滚动累积，零模型）。
+
+    同样避免 `import session_fact` 这种可能撞名的裸导入；按路径加载也便于
+    `tests/` 直接单测同一个文件，两边跑的是同一份逻辑。
+    """
+    global _FACT_MOD
+    if _FACT_MOD is not None:
+        return _FACT_MOD
+    import importlib.util
+
+    p = BOSHI_HOME / "session_fact.py"
+    spec = importlib.util.spec_from_file_location("boshi_session_fact", str(p))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _FACT_MOD = mod
     return mod
 
 
@@ -724,9 +744,13 @@ class BoshiMemoryProvider(MemoryProvider):
             #    能从 state.db 找回原文（9%），其余永久损失。槽位照旧抽（端口/路径/
             #    参数值），BM25 文档仍用原文，不改排序口径。
             #    `BOSHI_WRITE_SLOTS=0` → 回滚到旧行为（截断 500 + 无槽位）。
+            #    P3（2026-10-20）：抽提结果提到 `u_slots_meta` / `a_slots_meta` 两个
+            #    外层变量，供第 3 步（会话事实层）复用，避免同一段文本抽两遍。
+            u_slots_meta: Dict[str, Any] = {}
+            a_slots_meta: Dict[str, Any] = {}
             if user_content and not is_trivial_prompt(user_content):
                 content = user_content.strip()
-                slots_meta = _slots_meta(content)
+                slots_meta = u_slots_meta = _slots_meta(content)
                 if not _write_slots_enabled() and len(content) > 500:
                     content = content[:500] + "…"   # 回滚路径：与改造前完全一致
                 self._core.save(
@@ -749,7 +773,7 @@ class BoshiMemoryProvider(MemoryProvider):
             #    回到旧行为（截断 800 + 无槽位）。
             asst = (assistant_content or "").strip()
             if asst and _is_capture_worthy_conclusion(asst):
-                slots_meta = _slots_meta(asst)
+                slots_meta = a_slots_meta = _slots_meta(asst)
                 if not _write_slots_enabled() and len(asst) > 800:
                     asst = asst[:800] + "…"          # 回滚路径：与改造前完全一致
                 self._core.save(
@@ -762,6 +786,39 @@ class BoshiMemoryProvider(MemoryProvider):
                         **slots_meta,
                     },
                 )
+            # 3) 会话事实层（P3，2026-10-20）：零模型门控 + 滚动累积
+            #    只在当轮抽到「决策 / 待办」条目时才写；没抽到 → 整轮跳过。
+            #    门控是必要的：无条件每轮写，事实层就是 conversation 的复制品，
+            #    只会把库滚脏、把检索位占满。
+            #    写 topic=session_fact，按 (session_id, topic) upsert：旧行
+            #    is_latest=false 留痕（v5.8 不可变日志），读路径只看到最新一条。
+            #    内容 = 本会话累积的决策/待办清单，全部是 slots 抽到的**原文片段**，
+            #    零 LLM、零生成（乐之铁律）。
+            sid_fact = session_id or self._session_id
+            if sid_fact:
+                try:
+                    _fact = _boshi_session_fact()
+                    new_items: Dict[str, List[str]] = {}
+                    for _m in (u_slots_meta, a_slots_meta):
+                        for _k, _v in _fact.items_from_slots(_m).items():
+                            new_items.setdefault(_k, []).extend(_v)
+                    if new_items:       # 零条目 → 整轮跳过，连读库都省（每轮一次额外 SELECT 没必要）
+                        text = _fact.merge(
+                            self._core.get_latest_by_topic(sid_fact, _fact.FACT_TOPIC),
+                            new_items)
+                        if text:    # None = 内容未变（条目全在旧正文里）→ 不写新版本
+                            self._core.save(
+                                text,
+                                topic=_fact.FACT_TOPIC,
+                                metadata={
+                                    "source": "hermes_plugin",
+                                    "session_id": sid_fact,
+                                    "role": "system",
+                                },
+                                upsert=True,
+                            )
+                except Exception as e:      # 事实层是增强项，坏了不能拖累主写入
+                    logger.debug("boshi session_fact 写入跳过: %s", e)
         except Exception as e:
             logger.warning("boshi sync_turn 写入失败（这轮对话没进记忆库）: %s", e)
 

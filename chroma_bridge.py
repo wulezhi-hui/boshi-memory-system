@@ -149,6 +149,16 @@ def add_memory(content: str, metadata: dict = None, memory_id: str = None,
     return memory_id
 
 
+def get_latest_by_topic(session_id: str, topic: str, profile: str = None):
+    """取 `(profile, session_id, topic)` 当前有效行的正文（P3 事实层滚动累积用）。
+
+    **仅 PG 后端有实现**：本名在 `_PUBLIC_API` 里，BACKEND=pg 时会被
+    `pg_bridge.get_latest_by_topic` 覆盖。Chroma 回滚后端这里是 None —— 事实层在
+    chroma 上退化为「每轮覆盖、不累积」（仍只留 1 条有效行，只是正文不含历史条目）。
+    """
+    return None
+
+
 def add_memories_batch(entries: list):
     """
     批量添加记忆（自动分批，每批 100 条，间隔 3 秒）。
@@ -1080,7 +1090,7 @@ _PUBLIC_API = (
     "get_time_range", "get_recent", "get_total_count", "delete_memory",
     "delete_memories", "update_memory", "deprecate_memory", "get_all_relations",
     "auto_forget", "detect_conflicts", "resolve_conflict", "get_by_id",
-    "get_graph_count",
+    "get_graph_count", "get_latest_by_topic",
 )
 
 if BACKEND == "pg":

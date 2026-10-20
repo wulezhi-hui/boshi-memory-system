@@ -200,6 +200,19 @@ def save(content: str, topic: str = "external", metadata: dict = None,
     }
 
 
+def get_latest_by_topic(session_id: str, topic: str, profile: str = None):
+    """取 `(profile, session_id, topic)` 当前有效行的正文；没有则 None。
+
+    P3（2026-10-20）事实层滚动累积用：`session_fact` 每轮要读回上一版正文再
+    并入本轮抽到的决策/待办。失败一律返回 None —— 调用方（插件 sync_turn）
+    按「首次写入」处理，绝不因为读不回来就丢掉本轮内容。
+    """
+    try:
+        return _get_chroma().get_latest_by_topic(session_id, topic, profile)
+    except Exception:
+        return None
+
+
 def delete(memory_id: str) -> dict:
     """删除一条记忆。返回 {"success": True, "deleted": memory_id}"""
     cb = _get_chroma()

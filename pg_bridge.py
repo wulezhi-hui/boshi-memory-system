@@ -584,6 +584,27 @@ def add_memory(content: str, metadata: dict = None, memory_id: str = None,
                 pass
 
 
+def get_latest_by_topic(session_id: str, topic: str, profile: str = None):
+    """取 `(profile, session_id, topic)` 当前有效行（is_latest=true）的正文。
+
+    P3（2026-10-20）：只为**事实层滚动累积**服务——`session_fact` 每轮要把
+    「本轮新抽到的决策/待办」并进上一版正文，先得读回上一版。不参与检索路径，
+    因此不走 RRF / 不加分，找不到就返回 None（首次写入的正常情形）。
+    """
+    if not session_id or not topic:
+        return None
+    prof = profile or _resolve_profile()
+    c = _conn()
+    with c.cursor() as cur:
+        cur.execute("""SELECT content FROM boshi.memories
+                       WHERE profile = %s AND session_id = %s AND topic = %s
+                         AND is_latest
+                       ORDER BY created_at DESC NULLS LAST
+                       LIMIT 1""", (prof, session_id, topic))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
 def add_memories_batch(entries: list):
     """与 chroma_bridge 契约一致：{"added": n, "failed": m, "errors": [...]}"""
     added = failed = 0
