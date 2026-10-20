@@ -51,18 +51,24 @@ DECIDE = ("决定", "改为", "选用", "采用", "不再", "放弃", "换成", 
 # 被否掉的：`就按`（“就按排错三步抓”是流程不是决策）、`切成`（“切成小块”是切割动作）、
 # `保留`/`方案`/`口径`/`只用`（宽正则里占 40%+ 命中，但绝大多数不是决策）。
 DECIDE_RE = (
-    re.compile(r"我建议"),
-    re.compile(r"切(?:换)?到"),
     re.compile(r"改用"),
-    # 「参数已经定了」「直接定了」「定为 X」；挡掉「判定为可疑」「认定为」
-    re.compile(r"(?<![判认指规])定为|已经?定了|直接定了"),
+    # 「参数已经定了」「直接定了」「定为 X」「A 方案定了」；
+    # 挡掉「判定为可疑」「指定了路径」「规定了格式」「固定了」——这些「定了」不是取舍。
+    re.compile(r"(?<![判认指规固])定为|(?<![指认规判固])定了"),
 )
+# P3.1 拿掉的两条（实测 13:19 首条事实层就坏在这两条上）：
+#   `我建议`——助手列选项的固定句式，不是决策（「我建议用 A」= 菜单）；
+#   `切(?:换)?到`——「手动切到 bili-deepseek 就能继续用」是备选方案。
+# 真取舍词留在 DECIDE 元组里（决定/改为/选用/采用/放弃/不再/换成/定下来/结论是）。
 OPEN_Q = ("待", "未合并", "未解决", "需要确认", "TODO", "下一步", "还需", "还没")
 LESSON = ("铁律", "教训", "坑", "注意", "必须", "禁止", "踩过", "别忘")
 ENV = ("端口", "显存", "CUDA", "Python", "版本不", "机器", "系统是")
 _SKIP_PREFIX = ("|", "---", "```")
 
 _SENT_CAP = 200       # statement 截断
+_RE_BULLET = re.compile(r"^\s*(?:[-*+•]|\d+[.)、]|[（(]\d+[)）])\s*\S")  # 列表项起始行
+# 出现这些词说明「还没决定」，不是决策（「还没决定用哪个」曾被记成决策）
+_DECIDE_NEG = ("还没决定", "未决定", "没定", "尚未决定", "待定", "不确定", "没想好")
 _ITEM_CAP = 180       # 句子级槽位单条截断
 _LIST_CAP = 8         # 每个槽位最多留多少条
 _STMT_MIN = 24        # statement 首选长度下限（太短的首句对检索没价值）
@@ -130,19 +136,47 @@ def _blocks(text: str) -> List[str]:
     return blocks
 
 
+def _split_items(seg: str) -> List[str]:
+    """块内按「列表项起始行」再切：一行一条，正文行仍与下文合并。
+
+    修的是 P3.1 实测的脏数据：markdown 无序列表
+    ```
+    - 第2条：日志路径…
+    - 第3条：手动切到 bili-deepseek 就能用
+    ```
+    以前整块算「一句」，关键词出现在第 3 条，截断却从块首数 180 字 →
+    第 2 条的日志路径被当成决策内容存进事实层。列表项天然是独立语义单元，
+    按行切开后关键词只带走它自己那一行；而「当前状态一句话：」这类引出行
+    （不以列表符开头）仍与下文合并，不会退回旧版 statement 全是引子的毛病。
+    """
+    items: List[str] = []
+    cur: List[str] = []
+    for line in (seg or "").splitlines():
+        if _RE_BULLET.match(line):
+            if cur:
+                items.append("\n".join(cur))
+                cur = []
+        if line.strip():
+            cur.append(line)
+    if cur:
+        items.append("\n".join(cur))
+    return items
+
+
 def _sentences(text: str) -> List[str]:
-    """切句：块内按句末标点切，**不按换行切**。
+    """切句：块内先按列表项切，再按句末标点切，**正文不按换行切**。
 
     不按 `\\n` 切是因为 `当前状态一句话：` 这种引出行会被切成独立片段，旧版
     statement 平均只有 38.6 字、一半是这类引子。块内合并后，冒号引出行自然
-    和下文连成一句；标题行则作为硬边界，不会污染句子。
+    和下文连成一句；标题行、列表项行作为硬边界，不会污染句子。
     """
     out: List[str] = []
     for seg in _blocks(text):
-        for p in re.split(r"(?<=[。！？；])", seg):
-            p = p.strip("\n \t")
-            if p:
-                out.append(p)
+        for item in _split_items(seg):
+            for p in re.split(r"(?<=[。！？；])", item):
+                p = p.strip("\n \t")
+                if p:
+                    out.append(p)
     return out
 
 
@@ -152,6 +186,46 @@ def _clip(s: str, cap: int = _ITEM_CAP) -> str:
         return s
     cut = max(s.rfind(c, 0, cap) for c in "，、；：,;")
     return s[:cut] if cut >= cap // 2 else s[:cap]
+
+
+def _clip_at(s: str, pos: int, cap: int = _ITEM_CAP) -> str:
+    """以命中词为锚截取（P3.1）。
+
+    `_clip` 永远从**开头**数 180 字，长句里关键词在末尾时等于把无关的前半段
+    存成了决策（实测首条事实层就是这么坏的）。这里以命中位置为锚取窗口，
+    仍然只做截取、不改一个字，返回值仍是原文的连续子串。
+    """
+    if len(s) <= cap:
+        return s
+    start = max(0, min(pos - cap // 3, len(s) - cap))
+    win = s[start:start + cap]
+    cut = max(win.rfind(c) for c in "，、；：,;")
+    if cut >= cap // 2:          # 后半段里能收到分句标点 → 提前收尾，别切半个词
+        win = win[:cut]
+    return win.strip()
+
+
+def _hit_pos(s: str, keys=(), regexes=()) -> int:
+    """命中词在句中的最早位置（多个关键词取最左）。没命中返回 0。"""
+    pos = [s.find(k) for k in keys if k and k in s]
+    for r in regexes:
+        m = r.search(s)
+        if m:
+            pos.append(m.start())
+    return min(pos) if pos else 0
+
+
+def _clause_at(s: str, pos: int) -> str:
+    """取命中位置所在的**分句**（逗号/句号/换行切），用于局部否定判断。
+
+    整句判断会把「A 方案定了，Y 还没定」这种一句里既决策又待办的话整体否掉
+    （实测：真决策被丢弃，只剩待办）。否定词只看命中词所在那一小段。
+    """
+    seps = "，,。；;！？\n"
+    start = max((s.rfind(c, 0, pos) for c in seps), default=-1) + 1
+    ends = [s.find(c, pos) for c in seps if s.find(c, pos) != -1]
+    end = min(ends) if ends else len(s)
+    return s[start:end]
 
 
 def _statement(sents: List[str]) -> str:
@@ -224,15 +298,20 @@ def extract(text: str) -> Dict[str, Any]:
     for s in sents:
         if len(s) < 6 or any(s.startswith(k) for k in _SKIP_PREFIX):
             continue
+        # 决策：命中词锚定截取（关键词在长句末尾时不再只留下无关的开头），
+        # 且「还没决定 / 待定」不算决策——它是待办，交给下面的 OPEN_Q。
+        # 否定判断只看命中词所在分句：一句里「A 定了，B 还没定」两件事都要留住。
+        hit = _hit_pos(s, DECIDE, DECIDE_RE)
         if (any(k in s for k in DECIDE) or any(r.search(s) for r in DECIDE_RE)) \
+                and not any(n in _clause_at(s, hit) for n in _DECIDE_NEG) \
                 and len(out["decisions"]) < 3:
-            out["decisions"].append(_clip(s))
+            out["decisions"].append(_clip_at(s, hit))
         if any(k in s for k in OPEN_Q) and len(out["open_questions"]) < 3:
-            out["open_questions"].append(_clip(s))
+            out["open_questions"].append(_clip_at(s, _hit_pos(s, OPEN_Q)))
         if any(k in s for k in LESSON) and len(out["reusable_experience"]) < 3:
-            out["reusable_experience"].append(_clip(s))
+            out["reusable_experience"].append(_clip_at(s, _hit_pos(s, LESSON)))
         if any(k in s for k in ENV) and len(out["boundary_envs"]) < 3:
-            out["boundary_envs"].append(_clip(s))
+            out["boundary_envs"].append(_clip_at(s, _hit_pos(s, ENV)))
 
     for k in SLOT_KEYS:
         out[k] = _dedup(out[k])
