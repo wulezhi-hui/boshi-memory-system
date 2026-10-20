@@ -103,6 +103,8 @@ def _ensure_runtime_deps() -> bool:
 # 只作用于**召回注入**（prefetch），不影响显式检索工具（boshi_search 仍返回全部）。
 # 可用 BOSHI_RECALL_MIN_LEN 调整阈值。
 _RECALL_MIN_LEN = int(os.environ.get("BOSHI_RECALL_MIN_LEN", "5"))
+# 每 query 召回缓存 TTL（秒）。设 0 等价于不缓存。
+_PCACHE_TTL = int(os.environ.get("BOSHI_PCACHE_TTL", "300"))
 
 
 def _worth_recalling(text: str) -> bool:
@@ -127,6 +129,53 @@ _TOOL_NOISE_MARKERS = (
     "工具结果",
     "已执行",
 )
+
+
+_SLOTS_MOD = None
+
+
+def _boshi_slots():
+    """按文件路径加载 ~/.boshi/slots.py（P2 零模型槽位抽提器）。
+
+    不用 `import slots`：那是第三方同名模块的高危名字；按路径加载可控且不污染 sys.path。
+    """
+    global _SLOTS_MOD
+    if _SLOTS_MOD is not None:
+        return _SLOTS_MOD
+    import importlib.util
+
+    p = BOSHI_HOME / "slots.py"
+    spec = importlib.util.spec_from_file_location("boshi_slots", str(p))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _SLOTS_MOD = mod
+    return mod
+
+
+def _write_slots_enabled() -> bool:
+    """P2 写入模式开关：True=原文全存+抽槽位；False=回滚到旧的截断行为。
+
+    关键：**截断与否只看这个开关**，不看抽提结果。抽提失败（slots 为空）只是
+    少一份结构化元数据，不该顺带把原文砍掉——那样零槽位的那 12% 长文会被
+    静默截断，直接违背 P2「原文全存」的目标（2026-10-19 复核发现并修正）。
+    """
+    return os.environ.get("BOSHI_WRITE_SLOTS", "1") != "0"
+
+
+def _slots_meta(text: str) -> Dict[str, Any]:
+    """P2：抽槽位并返回写库 metadata 片段（slots=JSON 字符串 + raw_len）。
+
+    `BOSHI_WRITE_SLOTS=0` → 返回 {}，调用方回落到旧行为（截断 800 + 不写槽位），
+    即一键回滚，不需要改代码。抽提失败同样返回 {}，绝不阻断记忆写入。
+    """
+    if not _write_slots_enabled():
+        return {}
+    try:
+        mod = _boshi_slots()
+        return mod.to_meta(mod.extract(text), len(text))
+    except Exception as e:            # 抽提是增强项，坏了不能影响主流程
+        logger.debug("slots 抽提失败（跳过，按旧逻辑写入）: %s", e)
+        return {}
 
 
 def _is_capture_worthy_conclusion(text: str) -> bool:
@@ -199,6 +248,10 @@ class BoshiMemoryProvider(MemoryProvider):
         self._prefetch_count = 0
         self._prefetch_query = ""
         self._prefetch_time = 0.0  # 缓存写入时间戳
+        # 每 query 一份召回缓存（2026-10-19 新增）：原先只有一个槽位、5 分钟内
+        # 不校验 query 就直接返回——同一会话里第 2 轮起拿到的都是第 1 轮问题的
+        # 召回结果。改为按 query 指纹缓存（LRU 8 条，TTL 300s）。
+        self._pcache: Dict[str, tuple] = {}
         # 压缩提炼去重：记录上次 on_pre_compress 已提炼的消息 id 集合
         self._compressed_msg_ids: set = set()
 
@@ -426,6 +479,34 @@ class BoshiMemoryProvider(MemoryProvider):
             logger.debug("boshi _search_session_history failed: %s", e)
             return []
 
+    # ---- 每 query 召回缓存（LRU 8 × TTL 300s）---------------------------
+    @staticmethod
+    def _qkey(query: str) -> str:
+        """query 指纹：忽略空白与大小写差异，避免同一句话的细微排版不同而重复检索。"""
+        import hashlib
+        norm = "".join((query or "").split()).lower()
+        return hashlib.md5(norm.encode("utf-8", "ignore")).hexdigest()
+
+    def _pcache_get(self, query: str):
+        """命中返回 (text, count)，过期返回 None。"""
+        k = self._qkey(query)
+        item = self._pcache.get(k)
+        if not item:
+            return None
+        ts, text, count = item
+        if time.time() - ts > _PCACHE_TTL:
+            self._pcache.pop(k, None)
+            return None
+        return text, count
+
+    def _pcache_put(self, query: str, text: str, count: int) -> None:
+        if not query:
+            return
+        self._pcache[self._qkey(query)] = (time.time(), text or "", int(count or 0))
+        while len(self._pcache) > 8:                  # 简单 LRU：丢掉最早写入的
+            oldest = min(self._pcache, key=lambda k: self._pcache[k][0])
+            self._pcache.pop(oldest, None)
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """后台线程检索，结果供下一轮 prefetch 消费（不阻塞对话）。
 
@@ -472,6 +553,9 @@ class BoshiMemoryProvider(MemoryProvider):
                 else:
                     self._prefetch_cache = ""
                 self._prefetch_time = time.time()
+                # 同时写入每 query 缓存：prefetch 按当轮 query 精确取用，
+                # 不再"5 分钟内一律返回第一轮的召回"。
+                self._pcache_put(query, self._prefetch_cache, self._prefetch_count)
             except Exception as e:
                 logger.warning("boshi queue_prefetch 失败（本轮不会有记忆注入、🦄 图标也不会出现）: %s", e)
                 self._prefetch_cache = ""
@@ -555,8 +639,17 @@ class BoshiMemoryProvider(MemoryProvider):
             _diag("prefetch 提前退出：trivial=%s, _core 已连=%s → 本轮无召回、无图标",
                   is_trivial_prompt(query), self._core is not None)
             return ""
-        # 改进3：有缓存且 5 分钟内 → 毫秒级返回，不触发超时
-        if self._prefetch_cache and time.time() - self._prefetch_time < 300:
+        # 缓存：按当轮 query 取值（2026-10-19 改）。旧逻辑只认"5 分钟内"，不看
+        # query，导致同一会话第 2 轮起注入的永远是第一次提问的召回结果。
+        hit = self._pcache_get(query)
+        if hit is not None:
+            text, count = hit
+            self._prefetch_count = count
+            _diag("prefetch 命中 per-query 缓存：count=%s，%d 字符", count, len(text))
+            return text
+        # 兼容旧缓存字段：只有 query 完全一致时才复用（防止跨问题串味）
+        if (self._prefetch_cache and self._prefetch_query == query
+                and time.time() - self._prefetch_time < 300):
             _diag("prefetch 命中缓存：count=%s，%d 字符 → 图标应显示", self._prefetch_count, len(self._prefetch_cache))
             return self._prefetch_cache
         # 首轮/缓存过期：同步检索兜底（保证每轮都有记忆注入）
@@ -582,7 +675,9 @@ class BoshiMemoryProvider(MemoryProvider):
             if not lines:
                 _diag("prefetch 检索结果为空 → 无召回注入、🦄 图标不出现")
                 return ""
-            return "## 伯仕记忆召回\n" + "\n".join(lines[:8])
+            text = "## 伯仕记忆召回\n" + "\n".join(lines[:8])
+            self._pcache_put(query, text, self._prefetch_count)
+            return text
         except Exception as e:
             logger.warning("boshi prefetch 失败（本轮无记忆召回、🦄 图标不会出现）: %s", e)
             return ""
@@ -612,21 +707,28 @@ class BoshiMemoryProvider(MemoryProvider):
     ) -> None:
         """每轮对话后存入伯仕记忆库（仅 primary 上下文）。
 
-        记录两类内容：
-          1. 用户消息（topic=conversation，≤500 字符，跳过 trivial）
-          2. 助手结论（topic=assistant_conclusion，≤800 字符）——
+        记录两类内容（P2 起**原文全存**，槽位另存 slots 列）：
+          1. 用户消息（topic=conversation，跳过 trivial）
+          2. 助手结论（topic=assistant_conclusion）——
              即 agent 输出到屏幕的最终答复。思考推理过程不记，
              但推理的成果（结论/交付说明）是记忆的价值所在：
              新会话靠它知道"当时解决了什么、结论是什么"。
+        `BOSHI_WRITE_SLOTS=0` 才回到旧的 500/800 字截断（唯一回滚开关）。
         """
         if self._core is None or self._agent_context != "primary":
             return
         try:
-            # 1) 用户消息（原有行为）
+            # 1) 用户消息
+            #    P2 升级（2026-10-19）：原文全存，不再截断 500 字——截断的 500 字
+            #    加上 "…" 后原文长度信息也丢了，实测全库 266 条截断行只有 25 条
+            #    能从 state.db 找回原文（9%），其余永久损失。槽位照旧抽（端口/路径/
+            #    参数值），BM25 文档仍用原文，不改排序口径。
+            #    `BOSHI_WRITE_SLOTS=0` → 回滚到旧行为（截断 500 + 无槽位）。
             if user_content and not is_trivial_prompt(user_content):
                 content = user_content.strip()
-                if len(content) > 500:
-                    content = content[:500] + "…"
+                slots_meta = _slots_meta(content)
+                if not _write_slots_enabled() and len(content) > 500:
+                    content = content[:500] + "…"   # 回滚路径：与改造前完全一致
                 self._core.save(
                     content,
                     topic="conversation",
@@ -634,16 +736,22 @@ class BoshiMemoryProvider(MemoryProvider):
                         "source": "hermes_plugin",
                         "session_id": session_id or self._session_id,
                         "role": "user",
+                        **slots_meta,
                     },
                 )
             # 2) 助手结论（新增）
             #    结论不套用 is_trivial_prompt：简短结论（如"已修复"）反而是
             #    高价值的精炼记忆，不该被问候语过滤器误杀。只要非空且非
-            #    纯工具噪音即保存。截断到 800 字符。
+            #    纯工具噪音即保存。
+            #    P2（2026-10-19）：不再截断到 800 字——原文全存，另抽槽位存
+            #    slots/raw_len。BM25 只索引「statement+槽位值」，长原文不进索引，
+            #    既保住完整语义又不让半截 token 制造假匹配。`BOSHI_WRITE_SLOTS=0`
+            #    回到旧行为（截断 800 + 无槽位）。
             asst = (assistant_content or "").strip()
             if asst and _is_capture_worthy_conclusion(asst):
-                if len(asst) > 800:
-                    asst = asst[:800] + "…"
+                slots_meta = _slots_meta(asst)
+                if not _write_slots_enabled() and len(asst) > 800:
+                    asst = asst[:800] + "…"          # 回滚路径：与改造前完全一致
                 self._core.save(
                     asst,
                     topic="assistant_conclusion",
@@ -651,6 +759,7 @@ class BoshiMemoryProvider(MemoryProvider):
                         "source": "hermes_plugin",
                         "session_id": session_id or self._session_id,
                         "role": "assistant",
+                        **slots_meta,
                     },
                 )
         except Exception as e:
@@ -812,9 +921,11 @@ class BoshiMemoryProvider(MemoryProvider):
                         continue
                     try:
                         self._core.save(
-                            content[:500],
+                            content,        # P2：原文全存（不再截断 500）
                             topic="conversation",
-                            metadata={"source": "hermes_plugin", "role": "user", "stage": "pre_compress"},
+                            metadata={"source": "hermes_plugin", "role": "user",
+                                      "stage": "pre_compress",
+                                      **_slots_meta(content)},
                         )
                         saved += 1
                     except Exception:

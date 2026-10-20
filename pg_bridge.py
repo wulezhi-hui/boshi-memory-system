@@ -483,6 +483,23 @@ def add_memory(content: str, metadata: dict = None, memory_id: str = None):
                         (mid, ea, eb, rel, content, _vec_literal(mv), vc))
         return mid
 
+    # ── P2 槽位中心化（2026-10-19 升级）────────────────────────────────────
+    # 原先只有 hermes_plugin 写助手结论时才抽槽位；MCP / 其它 agent 走
+    # boshi_core.save → 这里时 slots 恒为 NULL（实测近三天 218 条 boshi_api
+    # 写入全无槽位）。槽位是纯规则的元数据抽取，不该依赖调用方自觉，所以在
+    # 写入唯一入口统一补齐：调用方没传就现抽，传了就用调用方的（插件已抽过，
+    # 避免重复计算）。`BOSHI_WRITE_SLOTS=0` 一键关掉。
+    if _slots is None and content and os.environ.get("BOSHI_WRITE_SLOTS", "1") != "0":
+        try:
+            _sm = _slots_mod()
+            _sl = _sm.extract(content)
+            if _sm.filled_count(_sl):
+                _slots = _sl
+            if _raw_len is None:
+                _raw_len = len(content)
+        except Exception:      # 抽提是增强项，坏了绝不能阻断写入
+            _slots = None
+
     v = _ef()([content or " "])[0]
     from datetime import datetime, timezone
     try:
@@ -968,6 +985,159 @@ def _score_merge(vec_items: list, kw_items: list, top_k: int,
     return out[:int(top_k)]
 
 
+def _session_expand(c, qv: str, items: list, cond: str, params: list, top_k: int,
+                    penalty: float = None, min_cos: float = None,
+                    max_cand: int = None, topn: int = None,
+                    only_concl: bool = None) -> list:
+    """同会话扩展（2026-10-19 新增，默认关闭，`BOSHI_SESSION_EXPAND=1` 开启）。
+
+    动机（A5 实测）：auto 未中 top1 的 14 条里，有 10 条的 gold 与某个 top5
+    命中**同属一次会话**——记忆库里"用户怎么问"和"当时的结论"通常是两条，
+    问句措辞与 query 更像，结论被顶到后面。做法：取 top-3 命中的 session_id，
+    把同会话内与 query 余弦 ≥ min_cos 的记忆拉进来参与排序，分数乘 penalty
+    （轻微惩罚，保证原有命中不会被无成本顶掉）。
+
+    代价：多 1~2 次 SQL（6k 行的表 + session_id 索引，实测 <10ms）。
+    """
+    if not items:
+        return items
+    # 参数可环境覆盖，便于不重启进程做参数扫描（全默认 = 当前生效值）
+    penalty = 0.95 if penalty is None else penalty
+    min_cos = 0.62 if min_cos is None else min_cos
+    max_cand = 3 if max_cand is None else max_cand
+    topn = 1 if topn is None else topn
+    if only_concl is None:
+        only_concl = os.environ.get("BOSHI_SESSION_EXPAND_CONCL", "1") == "1"
+    ids = [str(x["id"]) for x in items[:int(topn)]]
+    with c.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT session_id::text FROM boshi.memories "
+            "WHERE id::text = ANY(%s) AND session_id IS NOT NULL", (ids,))
+        sids = [r[0] for r in cur.fetchall()]
+    if not sids:
+        return items
+    have = {str(x["id"]) for x in items}
+    extra = " AND role = 'assistant' AND topic = 'assistant_conclusion'" if only_concl else ""
+    sql = (f"SELECT id, content, {_META_SEL}, embedding <=> %s::vector AS dist "
+           f"FROM boshi.memories WHERE {cond} AND session_id::text = ANY(%s){extra} "
+           f"AND embedding <=> %s::vector < %s ORDER BY dist LIMIT %s")
+    with c.cursor() as cur:
+        cur.execute(sql, [qv] + list(params) + [sids, qv, 1.0 - min_cos, int(max_cand)])
+        rows = cur.fetchall()
+    added = 0
+    for r in rows:
+        it = _row_to_item(r)
+        if str(it["id"]) in have:
+            continue
+        cos = max(0.0, 1.0 - float(r[3] or 0.0))
+        f = penalty * cos
+        it["score"] = round(1.0 - (0.60 + 0.40 * min(f, 1.0)), 6)
+        it["fused"] = round(f, 4)
+        it["channels"] = ["session"]
+        it["expanded"] = True
+        it["metadata"] = dict(it.get("metadata") or {}, expanded_from="session")
+        items.append(it)
+        added += 1
+    if added:
+        items.sort(key=lambda x: x["score"])
+    return items[:int(top_k)]
+
+
+# ── P2+ 字段级匹配（默认开，`BOSHI_FIELD_MATCH=0` 关闭）─────────────────
+# 动机：v7.1 §8.4 / A3 证明「槽位文本替代全文」进 BM25 是净负收益（长度归一化
+# 奖励短文档）。但槽位本身仍是对齐度更强的信号——query 里有端口/版本/开关/
+# 路径这类**字面字段**时，只看「候选的同一字段是否也含这个值」，不看全文词袋，
+# 因此不会被文档长度或半截 token 干扰。故改为**排序抬升**，不动 BM25 文档。
+# `numbers` 不进默认集合：A5 参数扫描（8 组）显示它只在 numbers 一类上触发，
+# 且净收益 0（1 条 1→2、1 条 3→1），属歧义字面量（`218`/`24`/`5` 跨语境复用）。
+# 需要时可 `BOSHI_FM_KEYS=ports,versions,flags,files,numbers` 打开。
+_FM_KEYS = tuple(k.strip() for k in os.environ.get(
+    "BOSHI_FM_KEYS", "ports,versions,flags,files").split(",") if k.strip())
+_FM_W = {"ports": 1.0, "versions": 1.0, "flags": 1.0, "files": 0.8, "numbers": 0.4}
+_FM_STEP = float(os.environ.get("BOSHI_FM_STEP", "0.10"))    # 每命中一个字段抬多少 sim
+_FM_MAX = float(os.environ.get("BOSHI_FM_MAX", "0.30"))       # 抬升上限
+_FM_POOL = int(os.environ.get("BOSHI_FM_POOL", "3"))          # 候选池 = top_k × N
+
+
+def _fm_norm(v: str) -> str:
+    """字段值归一：小写、去空白、去首尾标点。只做形态归一，不改字。"""
+    s = (v or "").strip().lower()
+    s = re.sub(r"\s+", "", s)
+    return s.strip("，。、；;:：,.'\"()[]")
+
+
+def _fm_hits(qfields: dict, cand: dict) -> list:
+    """返回命中的字段名列表。同字段双向包含即算命中（`0.1.44.1` ⊂ `0.1.44.1 `）。"""
+    hits = []
+    for key, qvals in qfields.items():
+        cvals = [_fm_norm(x) if isinstance(x, str) else _fm_norm(str(x))
+                 for x in (cand.get(key) or [])]
+        for qv in qvals:
+            if any(qv and cv and (qv in cv or cv in qv) for cv in cvals):
+                hits.append(key)
+                break
+    return hits
+
+
+def _field_match(c, query: str, items: list, top_k: int) -> list:
+    """按「query 字段 ∩ 候选同名字段」抬升排序（P2+）。
+
+    打分：sim' = sim + min(_FM_MAX, _FM_STEP × Σ权重)，再落回距离（1 - sim'）。
+    候选没槽位（历史行）→ 现场用同一套零模型规则从原文抽，行为与「有槽位」一致；
+    抽不到就是空，绝不猜。任何异常都退回原排序（增强项不能影响主检索）。
+    """
+    if not items:
+        return items[:int(top_k)]
+    try:
+        sm = _slots_mod()
+        q = sm.extract(query)
+    except Exception:
+        return items[:int(top_k)]
+    qfields = {k: [] for k in _FM_KEYS}
+    for k in _FM_KEYS:
+        for v in (q.get(k) or []):
+            nv = _fm_norm(v)
+            if nv:
+                qfields[k].append(nv)
+    qfields = {k: v for k, v in qfields.items() if v}
+    if not qfields:
+        return items[:int(top_k)]
+
+    ids = [str(it["id"]) for it in items]
+    db_slots: dict = {}
+    try:
+        with c.cursor() as cur:
+            cur.execute("SELECT id::text, slots FROM boshi.memories "
+                        "WHERE id::text = ANY(%s)", (ids,))
+            for rid, sl in cur.fetchall():
+                if isinstance(sl, str):
+                    try:
+                        sl = json.loads(sl)
+                    except Exception:
+                        sl = None
+                db_slots[rid] = sl if isinstance(sl, dict) else None
+    except Exception:
+        db_slots = {}
+
+    for it in items:
+        sl = db_slots.get(str(it["id"]))
+        if sl is None:
+            try:
+                sl = sm.extract(it.get("content") or "")
+            except Exception:
+                sl = {}
+        hits = _fm_hits(qfields, sl)
+        if not hits:
+            continue
+        gain = min(_FM_MAX, _FM_STEP * sum(_FM_W.get(h, 0.5) for h in hits))
+        sim = max(0.0, 1.0 - float(it.get("score") or 0.0))
+        it["score"] = round(1.0 - min(1.0, sim + gain), 6)
+        it["field_hits"] = hits
+        it["field_gain"] = round(gain, 4)
+    items.sort(key=lambda x: x["score"])
+    return items[:int(top_k)]
+
+
 def search_memory(query: str, top_k: int = 5, where: dict = None,
                   all_versions: bool = False, include_graph: bool = False,
                   scope: str = None, me: str = None, fusion: str = None):
@@ -983,27 +1153,30 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
 
     cond, params = _where_sql(w, scope, me or _resolve_profile(), include_graph)
     mode = (fusion or os.environ.get("BOSHI_SEARCH_FUSION", "auto")).lower()
+    # P2+：字段级匹配要在 top_k 之外还能看见候选（否则只能重排已进榜的几条）
+    fm_on = os.environ.get("BOSHI_FIELD_MATCH", "1") == "1"
+    pool_k = int(top_k) * max(1, _FM_POOL) if fm_on else int(top_k)
     k_each = int(min(max(int(top_k) * 4, 20), 100))
     # kw 通道候选数与 top_k 解耦（见 _KW_POOL_CAP 注释：池污染导致「要得多反而更差」）
     k_kw = min(k_each, _KW_POOL_CAP) if _KW_POOL_CAP > 0 else k_each
 
     qv = _vec_literal(_ef()([query or " "])[0])
-    vec_items = _vec_channel(c, query, k_each, cond, params, v=qv)
+    vec_items = _vec_channel(c, query, max(k_each, pool_k), cond, params, v=qv)
     if mode == "vector":
-        items = vec_items[:int(top_k)]
+        items = vec_items[:int(pool_k)]
     else:
         toks = _kw_tokens(query)
         # auto：纯中文自然语言查询走纯向量（BM25 不辨否定/语义，实测会把
         # 「不是佛教微调，是通用的」顶到第一）；含字面锚点（型号/端口/版本号/
         # 数字）时才开关键词通道 —— 那正是纯向量最容易翻车的场景。
         if not toks or (mode == "auto" and not _has_anchor(query)):
-            items = vec_items[:int(top_k)]
+            items = vec_items[:int(pool_k)]
         else:
             kw_items = _kw_channel(c, toks, k_kw, cond, params)
             if not kw_items:                       # 关键词零命中 → 退回纯向量（旧行为）
-                items = vec_items[:int(top_k)]
+                items = vec_items[:int(pool_k)]
             elif mode == "rrf":
-                items = _rrf_merge(vec_items, kw_items, top_k)
+                items = _rrf_merge(vec_items, kw_items, pool_k)
             else:
                 seen = {x["id"] for x in vec_items}
                 miss = [str(x["id"]) for x in kw_items if x["id"] not in seen]
@@ -1011,7 +1184,23 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
                 for it in kw_items:
                     if it["id"] not in seen:
                         it["_cos"] = cmap.get(str(it["id"]), 0.0)
-                items = _score_merge(vec_items, kw_items, top_k)
+                items = _score_merge(vec_items, kw_items, pool_k)
+
+    # P2+ 字段级匹配（默认关；命中查询字面字段时抬升同字段候选）
+    if fm_on:
+        try:
+            items = _field_match(c, query, list(items), top_k)
+        except Exception:            # 增强项，坏了退回融合排序
+            items = items[:int(top_k)]
+    else:
+        items = items[:int(top_k)]
+
+    # 同会话扩展（2026-10-19 新增，默认关；A5 实测后再决定是否默认开）
+    if os.environ.get("BOSHI_SESSION_EXPAND", "0") == "1":
+        try:
+            items = _session_expand(c, qv, list(items), cond, params, top_k)
+        except Exception:            # 扩展是增强项，坏了不能影响主检索
+            pass
 
     if include_graph:      # 需要图谱联想时，并入边表结果（与 Chroma 后端行为对齐）
         v = _vec_literal(_ef()([query or " "])[0])

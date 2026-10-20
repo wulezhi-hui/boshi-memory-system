@@ -191,10 +191,15 @@ def cmd_slots_only(apply=False):
         s = sm.extract(content or "")
         if not sm.filled_count(s):
             empty += 1
+            # 抽不出槽位 **不写库**：让 slots 保持 NULL（语义=未抽提），
+            # 否则 3,288 条短句会各占一个空 jsonb，且"已抽提"和"无可抽提"
+            # 两种状态混成一团，日后无法判断覆盖情况。
+            continue
         out.append((json.dumps(s, ensure_ascii=False), len(content or ""),
                     raw_len if raw_len is not None else len(content or ""), rid))
     print(f"抽提完成 用时 {time.time()-t0:.1f}s；抽不出任何槽位 {empty} 条"
-          f"（{(empty/len(rows)*100 if rows else 0):.1f}%）")
+          f"（{(empty/len(rows)*100 if rows else 0):.1f}%，保持 NULL 不写）"
+          f"；待写入 {len(out)} 条")
     sample = out[:3]
     for s, ln, rl, rid in sample:
         print(f"  样例 {rid[:8]} len={ln} → {s[:160]}")
