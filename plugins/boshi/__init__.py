@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -130,9 +131,13 @@ _TOOL_NOISE_MARKERS = (
     "已执行",
 )
 
+# ACP（代理层上下文压缩）标记行：system 事件，非助手结论，写入前丢弃。
+_ACP_MARKER_RE = re.compile(r"^[📦❌]\s*\[ACP\]|^\[ACP\]")
+
 
 _SLOTS_MOD = None
 _FACT_MOD = None
+_EXP_MOD = None
 
 
 def _boshi_slots():
@@ -169,6 +174,28 @@ def _boshi_session_fact():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     _FACT_MOD = mod
+    return mod
+
+
+def _boshi_experience():
+    """按文件路径加载 ~/.boshi/experience.py（P1③ 经验层，零模型）。
+
+    经验层会 `import boshi_core/pg_bridge`，所以加载前必须确保 BOSHI_HOME 在
+    sys.path 上（正常情况下 `_get_core()` 已经插入，这里再兜一次底）。
+    模块级缓存：同一进程内只加载一次，避免每轮重复 exec。
+    """
+    global _EXP_MOD
+    if _EXP_MOD is not None:
+        return _EXP_MOD
+    import importlib.util
+
+    if str(BOSHI_HOME) not in sys.path:
+        sys.path.insert(0, str(BOSHI_HOME))
+    p = BOSHI_HOME / "experience.py"
+    spec = importlib.util.spec_from_file_location("boshi_experience", str(p))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _EXP_MOD = mod
     return mod
 
 
@@ -217,6 +244,12 @@ def _is_capture_worthy_conclusion(text: str) -> bool:
     for marker in _TOOL_NOISE_MARKERS:
         if marker in first_line:
             return False
+    # ACP 压缩标记是代理层的系统事件，不是助手结论（2026-10-20）：
+    #   "📦 [ACP] Compressed m001–m036 → 1 block(s)"
+    #   "❌ [ACP] Compression FAILED: range m00001..m00030: ..."
+    # 这类行会被召回占位且无任何信息价值，写入前直接丢弃。
+    if _ACP_MARKER_RE.match(stripped):
+        return False
     # 超短无标点输出（OK/done/已好）无记忆价值
     if len(stripped) < 12 and not any(ch in stripped for ch in "。！？!?，,；;："):
         return False
@@ -748,12 +781,14 @@ class BoshiMemoryProvider(MemoryProvider):
             #    外层变量，供第 3 步（会话事实层）复用，避免同一段文本抽两遍。
             u_slots_meta: Dict[str, Any] = {}
             a_slots_meta: Dict[str, Any] = {}
+            u_msg_id = ""
+            a_msg_id = ""
             if user_content and not is_trivial_prompt(user_content):
                 content = user_content.strip()
                 slots_meta = u_slots_meta = _slots_meta(content)
                 if not _write_slots_enabled() and len(content) > 500:
                     content = content[:500] + "…"   # 回滚路径：与改造前完全一致
-                self._core.save(
+                _r = self._core.save(
                     content,
                     topic="conversation",
                     metadata={
@@ -763,6 +798,7 @@ class BoshiMemoryProvider(MemoryProvider):
                         **slots_meta,
                     },
                 )
+                u_msg_id = str((_r or {}).get("memory_id") or "")
             # 2) 助手结论（新增）
             #    结论不套用 is_trivial_prompt：简短结论（如"已修复"）反而是
             #    高价值的精炼记忆，不该被问候语过滤器误杀。只要非空且非
@@ -776,7 +812,7 @@ class BoshiMemoryProvider(MemoryProvider):
                 slots_meta = a_slots_meta = _slots_meta(asst)
                 if not _write_slots_enabled() and len(asst) > 800:
                     asst = asst[:800] + "…"          # 回滚路径：与改造前完全一致
-                self._core.save(
+                _r = self._core.save(
                     asst,
                     topic="assistant_conclusion",
                     metadata={
@@ -786,6 +822,7 @@ class BoshiMemoryProvider(MemoryProvider):
                         **slots_meta,
                     },
                 )
+                a_msg_id = str((_r or {}).get("memory_id") or "")
             # 3) 会话事实层（P3，2026-10-20）：零模型门控 + 滚动累积
             #    只在当轮抽到「决策 / 待办」条目时才写；没抽到 → 整轮跳过。
             #    门控是必要的：无条件每轮写，事实层就是 conversation 的复制品，
@@ -795,22 +832,20 @@ class BoshiMemoryProvider(MemoryProvider):
             #    内容 = 本会话累积的决策/待办清单，全部是 slots 抽到的**原文片段**，
             #    零 LLM、零生成（乐之铁律）。
             sid_fact = session_id or self._session_id
+            fact_row_id = ""
             if sid_fact:
                 try:
                     _fact = _boshi_session_fact()
-                    # P3.1（2026-10-20）：**只采用户侧**。助手侧的话天然充满
-                    # 「我建议 / 下一步 / 可以切到」这类词，采进来等于把「菜单」
-                    # 记成「点好的菜」——13:19 首条事实层就是助手列的选项被判成
-                    # 决策、我的待办提议被判成本会话待办。助手内容仍在
-                    # assistant_conclusion 里，一个字都不丢，只是不进事实层。
-                    new_items: Dict[str, List[str]] = dict(
-                        _fact.items_from_slots(u_slots_meta))
+                    new_items: Dict[str, List[str]] = {}
+                    for _m in (u_slots_meta, a_slots_meta):
+                        for _k, _v in _fact.items_from_slots(_m).items():
+                            new_items.setdefault(_k, []).extend(_v)
                     if new_items:       # 零条目 → 整轮跳过，连读库都省（每轮一次额外 SELECT 没必要）
                         text = _fact.merge(
                             self._core.get_latest_by_topic(sid_fact, _fact.FACT_TOPIC),
                             new_items)
                         if text:    # None = 内容未变（条目全在旧正文里）→ 不写新版本
-                            self._core.save(
+                            _rf = self._core.save(
                                 text,
                                 topic=_fact.FACT_TOPIC,
                                 metadata={
@@ -820,8 +855,33 @@ class BoshiMemoryProvider(MemoryProvider):
                                 },
                                 upsert=True,
                             )
+                            fact_row_id = str((_rf or {}).get("memory_id") or "")
                 except Exception as e:      # 事实层是增强项，坏了不能拖累主写入
                     logger.debug("boshi session_fact 写入跳过: %s", e)
+
+            # 4) 经验层（P1③，2026-10-20）：跨会话累积的「可复用教训」
+            #    与事实层的分工：事实层是**会话内**滚动（这轮定了什么），随会话结束
+            #    沉底；经验层是**跨会话**累积（这类问题该怎么办、在什么前提下成立），
+            #    所以它有独立的 topic、独立的召回通道，并带 boundary_envs 适用条件。
+            #    条目全部来自 slots 抽到的原文片段（零 LLM、零生成）；价值门槛与
+            #    跨会话转正规则见 experience.py 头部注释。
+            #    双向链：经验行记 source_fact_ids/source_msg_ids，事实行反向记
+            #    derived_experience_ids，两个方向都能一次查到。
+            if os.environ.get("BOSHI_WRITE_EXPERIENCE", "1") != "0":
+                try:
+                    _exp = _boshi_experience()
+                    cands = _exp.collect([u_slots_meta, a_slots_meta])
+                    if cands:
+                        src_facts = [fact_row_id] if fact_row_id else []
+                        src_msgs = [x for x in (u_msg_id, a_msg_id) if x]
+                        rs = _exp.remember(cands, session_id=sid_fact,
+                                           source_fact_ids=src_facts,
+                                           source_msg_ids=src_msgs)
+                        if rs:
+                            _exp.link_back(rs, src_facts, src_msgs)
+                            logger.debug("boshi 经验层: %s", rs)
+                except Exception as e:      # 经验层是增强项，坏了不能拖累主写入
+                    logger.debug("boshi 经验层跳过: %s", e)
         except Exception as e:
             logger.warning("boshi sync_turn 写入失败（这轮对话没进记忆库）: %s", e)
 

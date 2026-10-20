@@ -1374,6 +1374,50 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
         except Exception:            # 扩展是增强项，坏了不能影响主检索
             pass
 
+    # P1③ 经验层独立通道（2026-10-20，默认开，BOSHI_EXPERIENCE_CHANNEL=0 关）
+    #    动机：经验行天生短、措辞与 query 不同构，向量通道容易被长对话淹没；
+    #    而「踩过的坑」恰恰是最该在回答前看到的东西。做法是给它一条自己的路：
+    #    关键词重叠打分（零模型、可解释），只占 top_k 里 1 个名额（BOSHI_EXP_SLOTS
+    #    可调），且只让 promoted 或强字面命中的条目挤进来——否则一次性的感想会
+    #    把真记忆顶掉。命中项 metadata.channels=["experience"]，调用方可区分来源。
+    if os.environ.get("BOSHI_EXPERIENCE_CHANNEL", "1") != "0":
+        try:
+            try:
+                import experience as _experience
+            except Exception:                    # 直接以文件路径加载（CLI 场景）
+                import importlib.util as _ilu
+                _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "experience.py")
+                _sp = _ilu.spec_from_file_location("boshi_experience", _p)
+                _experience = _ilu.module_from_spec(_sp)
+                _sp.loader.exec_module(_experience)
+            _slots_n = int(os.environ.get("BOSHI_EXP_SLOTS", "1"))
+            if _slots_n > 0:
+                _exps = _experience.recall(query, top_k=_slots_n + 2, scope=scope,
+                                           profile=me or _resolve_profile())
+                _seen = {str(x["id"]): x for x in items}
+                _pick = []
+                for _e in _exps:
+                    _hit = _seen.get(str(_e["id"]))
+                    if _hit is not None:
+                        # 向量/关键词已经把这条带上来了：不重复占位，但把来源标上，
+                        # 让「经验层也认可了它」这件事对调用方可见。
+                        _ch = _hit["metadata"].get("channels") or []
+                        if "experience" not in _ch:
+                            _hit["metadata"]["channels"] = _ch + ["experience"]
+                        continue
+                    if ((_e["metadata"].get("status") != "promoted")
+                            and float(_e.get("score") or 0.0) < 0.8):
+                        continue          # 未转正的弱命中不占名额
+                    _e["score"] = round(1.0 - float(_e.get("score") or 0.0), 6)
+                    _e["metadata"].setdefault("channels", ["experience"])
+                    _pick.append(_e)
+                    if len(_pick) >= _slots_n:
+                        break
+                if _pick:
+                    items = (_pick + list(items))[:int(top_k)]
+        except Exception:              # 增强项，坏了退回主链路结果
+            pass
+
     if include_graph:      # 需要图谱联想时，并入边表结果（与 Chroma 后端行为对齐）
         v = _vec_literal(_ef()([query or " "])[0])
         with c.cursor() as cur:

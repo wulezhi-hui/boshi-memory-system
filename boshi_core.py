@@ -91,7 +91,12 @@ def search(query: str, top_k: int = 5, source: str = "all",
         for r in results:
             r["score"] = round(1.0 - r.get("score", 0), 4)
             ch = r.get("channels") or []
-            tag = "fused" if len(ch) > 1 else ("kw" if ch == ["kw"] else "vector")
+            # 经验层独立通道（P1③）：来源必须如实标出，否则巡检时看不出这条
+            # 是「经验通道」捞回来的还是普通向量命中。
+            if "experience" in ch:
+                tag = "experience"
+            else:
+                tag = "fused" if len(ch) > 1 else ("kw" if ch == ["kw"] else "vector")
             r["source"] = tag
             src_count[tag] = src_count.get(tag, 0) + 1
         return {"query": query, "total": len(results), "results": results, "sources": src_count}
