@@ -96,5 +96,62 @@ class MergeWeightTest(unittest.TestCase):
         self.assertAlmostEqual(out[0]["fused"], 0.10, places=4)
 
 
+class KwAbsAllTest(unittest.TestCase):
+    """弱证据下 kw_abs 改用「库内真实存在的 token」做分母（2026-10-21，§11.22）。
+
+    修复前的病灶：纯中文 query 的主 token 是整段汉字，df=0。它的 idf 因此被
+    算成 log(1+(n+0.5)/0.5)（极大），分母 widf_total 被它单方面占满，而
+    `_kw_abs` 对 CJK 主词又给「共享 bigram 的部分信用」——于是 kw_abs 退化成
+    「这条文档里出现过多少查询的 bigram」，实测 A9 上中位数 0.44/0.53/0.78、
+    最高 0.88，几乎人人接近满分（噪声）；而 `_score_merge` 只读 kw_abs，
+    所以关键词通道在融合层等于在往排序里灌噪声。
+    abs_all 打开后，分母改成「库里真有 posting 的 token」，idf 重新有意义，
+    分布被拉开（实测 Q2 中位 0.08/最大 0.72，Q3 0.18/0.32）。
+    """
+
+    TOKS = [("群晖硬盘显示已损毁但检测是好的怎么办", 3.0), ("损毁", 1.0), ("检测", 1.0)]
+
+    def setUp(self):
+        self._orig_idx = pg_bridge._kw_index
+        self._orig_abs = pg_bridge._KW_ABS_ALL
+        pg_bridge._kw_index = lambda c, cond, params: fake_index(
+            {"损毁": [(0, 1)], "检测": [(0, 1), (1, 1)]})
+
+    def tearDown(self):
+        pg_bridge._kw_index = self._orig_idx
+        pg_bridge._KW_ABS_ALL = self._orig_abs
+
+    def test_weak_gets_real_kw_abs(self):
+        pg_bridge._KW_ABS_ALL = True
+        out = pg_bridge._kw_channel(None, self.TOKS, 5, "", [])
+        by = {it["id"]: it for it in out}
+        self.assertTrue(out and all(it["_weak"] for it in out))
+        self.assertGreater(by[DOC0[0]]["kw_abs"], 0.0, "bigram 命中却没换来任何 kw_abs")
+        self.assertAlmostEqual(by[DOC0[0]]["kw_abs"], by[DOC0[0]]["kw_abs_all"], places=6)
+        self.assertLess(by[DOC1[0]]["kw_abs"], by[DOC0[0]]["kw_abs"])
+
+    def test_flag_off_falls_back_to_phantom_denominator(self):
+        pg_bridge._KW_ABS_ALL = True
+        on = {it["id"]: it["kw_abs"] for it in pg_bridge._kw_channel(None, self.TOKS, 5, "", [])}
+        pg_bridge._KW_ABS_ALL = False
+        off_out = pg_bridge._kw_channel(None, self.TOKS, 5, "", [])
+        off = {it["id"]: it["kw_abs"] for it in off_out}
+        self.assertTrue(off_out)
+        # 关掉后没有 kw_abs_all 字段；分数由整句 phantom token 的 partial credit 决定
+        # （合成用例里两者数值可能巧合接近，故只断言口径不同、不再走 abs_all）
+        self.assertTrue(all("kw_abs_all" not in it for it in off_out))
+        self.assertNotEqual(off[DOC0[0]], on[DOC0[0]])
+
+    def test_strong_path_untouched(self):
+        # 主 token 命中（8199 在 doc 里）→ 不走 abs_all，kw_abs 仍按 prim 算
+        pg_bridge._kw_index = lambda c, cond, params: fake_index(
+            {"8199": [(0, 1)], "端口": [(0, 1)]})
+        pg_bridge._KW_ABS_ALL = True
+        out = pg_bridge._kw_channel(None, [("8199", 3.0), ("端口", 1.0)], 5, "", [])
+        self.assertTrue(out)
+        self.assertFalse(out[0]["_weak"])
+        self.assertNotIn("kw_abs_all", out[0])
+
+
 if __name__ == "__main__":
     unittest.main()

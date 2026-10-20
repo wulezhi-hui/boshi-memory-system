@@ -666,7 +666,27 @@ _NUM_RE = re.compile(r"\d+(?:\.\d+)?")
 # 关键词通道参数（P0）。BOSHI_SEARCH_FUSION=vector 可一键回滚到纯向量。
 _RRF_K = int(os.environ.get("BOSHI_RRF_K", "60"))
 _KW_MIN = float(os.environ.get("BOSHI_KW_MIN", "0.05"))  # 相对分门槛（相对本轮 top1）
-_KW_MAX_TOKENS = 16
+_KW_MAX_TOKENS = int(os.environ.get("BOSHI_KW_MAX_TOKENS", "64") or 0) or 64
+# query 侧 CJK bigram 上限（2026-10-21）：0/未设 = 全部生成（与文档侧对齐）。
+# 旧行为是 6（`range(min(n-1, 6))`），对中文长句等于只让**前半句**参与匹配：
+# A9 40 条纯中文 query 实测 588 个 bigram 需要 588，只用上 240（41%），
+# 被截断的 348 个里 295 个（85%）在 postings 里真实存在——证据本来能命中却被丢掉；
+# 40/40 条都含「截断也能命中」的 bigram，4 条 gold 只靠截断 bigram 命中（纯损失）。
+# 回退：BOSHI_KW_QBIG_LIMIT=6 复原旧行为。
+_KW_QBIG_LIMIT = int(os.environ.get("BOSHI_KW_QBIG_LIMIT", "0") or 0)
+# 后半段 bigram 的权重衰减（0 = 不衰减，全部 1.0）。用于抑制长句尾部噪声。
+_KW_QBIG_DECAY = float(os.environ.get("BOSHI_KW_QBIG_DECAY", "0") or 0)
+# query 侧「功能字 bigram」过滤（2026-10-21）。放开全部 bigram 后实测变差，
+# 原因是「怎么 / 什么 / 还要 / 能不 / 是什」这类纯功能字组合贡献了大量低信息
+# 命中：它们 idf 低但数量多，把长尾文档的分数叠起来，挤掉金标（overlap
+# top1 4→2）。规则：两字都是功能字 → 直接丢弃；一字功能一字实义 → 权重 ×0.5。
+_KW_QBIG_FUNC = (os.environ.get("BOSHI_KW_QBIG_FUNC", "1") != "0")
+# 功能字过滤是否也作用于前 6 个 bigram（旧窗口）。默认只过滤尾部，保持前窗口
+# 与旧行为逐字一致——overlap 型 query 的金标主要靠前窗口命中，动它就有掉分风险。
+_KW_QBIG_FUNC_HEAD = (os.environ.get("BOSHI_KW_QBIG_FUNC_HEAD", "0") == "1")
+_FUNC_CHARS = set("的了着过吗呢吧啊呀哦嘛么怎什怎样如何能不能可会要就都也还又很太更最这那哪"
+                  "个只些是把被在对我你他她它们和与跟同及或并且但是因为所以如果不然没不是有无"
+                  "上下里中前后时当一二三四五六七八九十多少几")
 _KW_BM25_K1 = float(os.environ.get("BOSHI_BM25_K1", "1.2"))
 _KW_BM25_B = float(os.environ.get("BOSHI_BM25_B", "0.50"))
 _KW_TTL = float(os.environ.get("BOSHI_KW_TTL", "180"))   # 索引最长复用秒数
@@ -692,6 +712,8 @@ _KW_LENB = float(os.environ.get("BOSHI_KW_LENB", "0.5"))
 # 与向量通道等权融合会把噪声顶进 top5，故把 wk 从 0.55 降到 0.30。
 _KW_WEAK_WV = float(os.environ.get("BOSHI_KW_WEAK_WV", "0.70"))
 _KW_WEAK_WK = float(os.environ.get("BOSHI_KW_WEAK_WK", "0.30"))
+# 弱证据下 kw_abs 改用「库内真实存在的 token」做分母（1=开，默认开）。
+_KW_ABS_ALL = (os.environ.get("BOSHI_KW_ABS_ALL", "1") != "0")
 
 
 def _has_anchor(query: str) -> bool:
@@ -732,9 +754,22 @@ def _kw_tokens(query: str) -> list:
         if n >= 2:
             add(seg, 3.0)
             if n >= 3:
-                for i in range(min(n - 1, 6)):
-                    add(seg[i:i + 2], 1.0)
-    return toks[:_KW_MAX_TOKENS]
+                grams = [seg[i:i + 2] for i in range(n - 1)]
+                lim = _KW_QBIG_LIMIT if _KW_QBIG_LIMIT > 0 else len(grams)
+                for i, g in enumerate(grams[:lim]):
+                    # 衰减只作用于「超出旧 6 个窗口」的尾部，前 6 个恒 1.0，
+                    # 保证 BOSHI_KW_QBIG_DECAY 调到 >0 时旧行为仍是特例。
+                    w = 1.0
+                    if _KW_QBIG_DECAY > 0 and i >= 6 and n > 2:
+                        w = max(0.35, 1.0 - _KW_QBIG_DECAY * (i - 5) / max(1, n - 2))
+                    if _KW_QBIG_FUNC and (i >= 6 or _KW_QBIG_FUNC_HEAD):
+                        nf = sum(1 for ch in g if ch in _FUNC_CHARS)
+                        if nf == 2:
+                            continue          # 纯功能字组合：无信息量，纯噪声
+                        if nf == 1:
+                            w *= 0.5
+                    add(g, w)
+    return toks[:_KW_MAX_TOKENS] if _KW_MAX_TOKENS > 0 else toks
 
 
 def _norm_ascii(tok: str) -> str:
@@ -991,6 +1026,21 @@ def _kw_channel(c, toks: list, k: int, cond: str, params: list) -> list:
     # 非零 0/295）。此时 coord 的信息量恒为 0（大家覆盖率都是 0），它只毁掉
     # bigram 信号，所以只在「至少一个主 token 命中」时施加。
     weak = main_hit_n == 0         # 关键词证据只剩 bigram（见 _KW_WEAK_WV/WK）
+    # 纯中文长句的 kw_abs 退化（2026-10-21）：主 token = 整段汉字，df≈0 →
+    # widf_total 全是"库里不存在的词"，kw_abs 对所有人恒 0.0，而 _score_merge
+    # 只看 kw_abs 不看 kw/名次 → 关键词通道在融合层等于不存在（bigram 证据全废）。
+    # 开启 abs_all 后，改用「库内真实存在的 token（含 bigram）」做分母，
+    # 让 bigram 覆盖率成为可与向量 sim 直接对比的绝对分。
+    allp: list = []
+    widf_all = 0.0
+    if weak and _KW_ABS_ALL:
+        for tok, w in toks:
+            pl = postings.get(tok)
+            df = len(pl) if pl else 0
+            if not df:
+                continue
+            allp.append((tok, w, math.log(1.0 + (n - df + 0.5) / (df + 0.5))))
+        widf_all = sum(w * i for _, w, i in allp)
     if main_hit_n:
         pr = {i: (hits.get(i) or {}).get("cov", 0.0) for i in scores}
         scores = {i: s * (pr[i] / (sum(w for _, w in toks if w >= 2.5) or 1.0))
@@ -1013,6 +1063,9 @@ def _kw_channel(c, toks: list, k: int, cond: str, params: list) -> list:
         # 可跨文档比较、可与向量 sim 直接加权求和。top1 归一化会把「弱命中里的
         # 第一名」抬成 1.0，做加权融合时会把噪声顶上去。
         it["kw_abs"] = round(_kw_abs(dtxt, prim, widf_total, _dl, avgdl), 3)
+        if allp and widf_all > 0:
+            it["kw_abs_all"] = round(_kw_abs(dtxt, allp, widf_all, _dl, avgdl), 3)
+            it["kw_abs"] = it["kw_abs_all"]
         it["_weak"] = weak          # 供 _score_merge 判权（融合后即被 pop）
         out.append(it)
     return out
