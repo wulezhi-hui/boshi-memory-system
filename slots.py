@@ -67,6 +67,9 @@ _SKIP_PREFIX = ("|", "---", "```")
 
 _SENT_CAP = 200       # statement 截断
 _RE_BULLET = re.compile(r"^\s*(?:[-*+•]|\d+[.)、]|[（(]\d+[)）])\s*\S")  # 列表项起始行
+# 列表项落库时剥掉行首记号（P3.1 补）：保留 `- ` 会让渲染成 `待办：` + `- - xxx` 双短横。
+# 只剥开头一小段，值仍是原文连续子串。`(?!\d)` 防把「1.5 倍」吃成「5 倍」。
+_RE_BULLET_STRIP = re.compile(r"^\s*(?:[-*+•]\s*|\d+[.)、](?!\d)\s*|[（(]\d+[)）]\s*)")
 # 出现这些词说明「还没决定」，不是决策（「还没决定用哪个」曾被记成决策）
 _DECIDE_NEG = ("还没决定", "未决定", "没定", "尚未决定", "待定", "不确定", "没想好")
 _ITEM_CAP = 180       # 句子级槽位单条截断
@@ -160,7 +163,11 @@ def _split_items(seg: str) -> List[str]:
             cur.append(line)
     if cur:
         items.append("\n".join(cur))
-    return items
+    out: List[str] = []
+    for it in items:
+        stripped = _RE_BULLET_STRIP.sub("", it, count=1)
+        out.append(stripped if stripped.strip() else it)   # 整条只有记号就别剥空了
+    return out
 
 
 def _sentences(text: str) -> List[str]:
