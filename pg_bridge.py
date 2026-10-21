@@ -45,6 +45,11 @@ _LOG = os.path.expanduser("~/.boshi/logs/pg_autostart.log")
 
 _conn_holder: Dict[str, Any] = {}
 _ef_holder: Dict[str, Any] = {}
+# HNSW 检索宽度：pgvector 默认 hnsw.ef_search=40，而 HNSW 只会返回
+# min(LIMIT, ef_search) 行 —— 深池（k>40）会静默退化成浅池。实测 k=150 只回 40 行。
+_HNSW_EF_FLOOR = int(os.environ.get("BOSHI_HNSW_EF_FLOOR", "40"))
+_HNSW_EF_NOW = [0]          # 当前会话已生效的 ef_search（只升不降，换连接时归零）
+_HNSW_ITER = [False]        # 当前会话是否已开 iterative_scan
 
 
 def _log(msg: str) -> None:
@@ -300,6 +305,8 @@ def _conn():
                 "③ 临时绕过：显式设 BOSHI_BACKEND=chroma（回 Chroma）" % (PG_DSN, _LOG)) from e
         c = psycopg.connect(PG_DSN, connect_timeout=5, autocommit=True)
     _conn_holder["c"] = c
+    _HNSW_EF_NOW[0] = 0        # 新会话：ef_search 回到 pgvector 默认，别以为还是旧的
+    _HNSW_ITER[0] = False
     return c
 
 
@@ -806,10 +813,40 @@ def _norm_ascii(tok: str) -> str:
     return tok.replace("_", "").replace("-", "").replace(".", "").replace("/", "").replace(",", "")
 
 
+def _ensure_ef(c, k: int) -> None:
+    """把 hnsw.ef_search 抬到 ≥ k（只升不降，会话级）。
+
+    pgvector 的 HNSW 只返回 min(LIMIT, ef_search) 行，默认 ef_search=40 ——
+    传 LIMIT 150 只会拿回 40 条，深池检索静默退化成浅池。_conn 是 autocommit
+    单例，所以用会话级 SET（不是 SET LOCAL，事务外无效）。
+    """
+    need = max(_HNSW_EF_FLOOR, int(k))
+    deep = int(k) > _HNSW_EF_FLOOR          # 只有深池才需要放宽顺序换召回
+    if need <= _HNSW_EF_NOW[0] and (not deep or _HNSW_ITER[0]):
+        return
+    try:
+        with c.cursor() as cur:
+            if need > _HNSW_EF_NOW[0]:
+                cur.execute("SELECT set_config('hnsw.ef_search', %s, false)", (str(need),))
+                _HNSW_EF_NOW[0] = need
+            if deep and not _HNSW_ITER[0]:
+                # 加了 WHERE（isLatest/scope/时间窗）后 HNSW 先在 ef_search 个候选里过滤，
+                # 命中不足就永远凑不满 k —— 实测 k=150 只回 103 行。pgvector 0.8 起
+                # 可开 iterative_scan 继续扫，凑满 k 行（relaxed_order 放宽顺序换召回）。
+                # 小查询（k<=40）不开：那是线上主链路，保持严格近邻序。
+                cur.execute("SELECT set_config('hnsw.iterative_scan', 'relaxed_order', false)")
+                cur.execute("SELECT set_config('hnsw.max_scan_tuples', %s, false)",
+                            (str(max(40000, need * 200)),))
+                _HNSW_ITER[0] = True
+    except Exception:                # 索引/参数不存在（老库）→ 不影响主链路
+        pass
+
+
 def _vec_channel(c, q: str, k: int, cond: str, params: list, v=None) -> list:
     """向量通道（纯余弦，与旧实现完全一致）。v 可传入已算好的查询向量。"""
     if v is None:
         v = _vec_literal(_ef()([q or " "])[0])
+    _ensure_ef(c, k)
     sql = f"""
         SELECT id, content, {_META_SEL}, embedding <=> %s::vector AS dist
         FROM boshi.memories
@@ -1518,12 +1555,50 @@ def _time_bounds(since=None, until=None) -> tuple:
 #   A9-paraphrase  4/ 5/ 8 →  6/ 9/11
 #   A5            21/30/32 → 30/34/34
 # 延迟（20 候选，GPU，含 HTTP 往返）p50 769ms / p90 1105ms。
+#
+# ── P1④ 定档（2026-10-21 19:00 定案，纯重排 + 池 100）────────────────
+# 目标：把 A9 完全改写型（括弧里换个说法、字面几乎不重叠）top5 从 40% 推到 >60%。
+# 池深扫描（重排存活、ef_search 已修，top_k=5）：
+#   pool  15 → ov 13/17/18  para  6/10/10  A5 31/34/34
+#   pool 100 → ov 13/18/20  para  7/ 9/12  A5 30/34/34   ← 定档
+#   pool 150 → ov 13/18/19  para  7/ 9/10  A5 30/34/34   （更深处开始进噪声）
+# 漏的 8 条 para 里 3 条（d13aed83/a457b574/89a147e0）连 800 深度的向量池都不在，
+# 即失败发生在**召回层**而非重排层；池内近失的 5 条名次 8/12/19/25/27，没有一个是
+# 「池够深就能救」的。所以 100 是收益拐点，再深只增加 token 成本。
+# 代价（75 条真实 query，3060 12G，重排常驻）：
+#   rerank OFF  p50 64ms / p95 92ms      （纯融合序基线）
+#   pool 40     p50 976ms / p95 1386ms   para 6/8/11（55%）不达标
+#   pool 100    p50 1701ms / p95 2527ms  ← 生产默认
+# 杠杆实验（都试过，都不换）：截断 BOSHI_RERANK_CHARS 300/200/120 → p50 1456/1280/1113ms
+# 但 para 掉到 11/11/9；加大 BOSHI_RERANK_CHUNK 2200→3500 反而更慢（1817ms）；
+# 请求并发（2/4 线程、-np 4 新实例）只省 9%——rerank 前向在 GPU 上已 90~99% util 打满。
+# 结论：池深 × 每条约 288 字正文就是固有成本；嫌慢就降池（BOSHI_RERANK_POOL=40 换回 55%）。
+# 置信度门控升级（先浅池、top1 logit 低才扩池）也量过并否决：thr=1.0 时 20% 升级，
+# 质量仍低于单跑深池（ov 17/19 vs 18/20），均值 1.59s、p95 3.0s 反而更差。
 # 默认开；端点不可达/超时一律静默降级回融合序（增强项绝不能伤主链路）。
 _RERANK_ON = os.environ.get("BOSHI_RERANK", "1") == "1"
 _RERANK_URL = os.environ.get("BOSHI_RERANK_URL", "http://127.0.0.1:11437/rerank")
 _RERANK_MODEL = os.environ.get("BOSHI_RERANK_MODEL", "bge-reranker-v2-m3")
-_RERANK_POOL = int(os.environ.get("BOSHI_RERANK_POOL", "15"))
+_RERANK_POOL = int(os.environ.get("BOSHI_RERANK_POOL", "100"))
 _RERANK_CHARS = int(os.environ.get("BOSHI_RERANK_CHARS", "700"))
+# 融合序混入（RRF，默认关）：纯重排会「救一批、打掉一批」——把融合序本来排第 1 的
+# 目标重排到前 5 之外（A9 实测 8b027120：融合 1 → 重排 19），而融合序又有它自己的
+# 盲区（改写句向量远）。两组名次做 RRF 加权融合，两边各保留发言权：
+#   key = W_RK/(K+重排名次) + W_FU/(K+融合名次)，只让融合前 HEAD 名参与投票
+#   （融合尾部是噪声，不该有权重）。
+# 生产口径 trace 复算（池 100，A9 40 + A5 35，名次取自线上同一条路径）：
+#   纯重排    ov 13/18/20  para 7/9/12  A5 30/34/34
+#   等权 blend ov 12/17/18 para 6/9/13  A5 30/34/35
+# 病例分型：gold 两侧都进前 5 的 56 条、只有重排进前 5 的 10 条、只有融合序进前 5 的
+# 仅 2 条（para 8b027120、A5 90161ac0）→ 重排以 5:1 压倒融合序。blend 每救回 1 条
+# 就要打掉 89a147e0（融合 93 → 重排 2）、3f1be78e（融合 31 → 重排 4）这类重排独有的
+# 大跨度命中；四档「给融合 top1 留固定名额」全试过，插第 1 位 A5 top1 塌到 26，
+# 插第 2/3 位 para 零收益，插第 4/5 位与纯重排完全等价。故 W_FU 默认 0，代码保留
+# 供环境变量开启对照。
+_BLEND_W_RK = float(os.environ.get("BOSHI_BLEND_W_RK", "1.2"))
+_BLEND_W_FU = float(os.environ.get("BOSHI_BLEND_W_FU", "0"))
+_BLEND_K = int(os.environ.get("BOSHI_BLEND_K", "10"))
+_BLEND_HEAD = int(os.environ.get("BOSHI_BLEND_HEAD", "20"))
 _RERANK_CHUNK = int(os.environ.get("BOSHI_RERANK_CHUNK", "2200"))
 _RERANK_TIMEOUT = float(os.environ.get("BOSHI_RERANK_TIMEOUT", "8"))
 # 连接超时必须单独压到亚秒级：本机实测「连一个没人听的 127.0.0.1 端口」要 2.0s 才拒绝
@@ -1531,6 +1606,62 @@ _RERANK_TIMEOUT = float(os.environ.get("BOSHI_RERANK_TIMEOUT", "8"))
 _RERANK_CONNECT_TIMEOUT = float(os.environ.get("BOSHI_RERANK_CONNECT_TIMEOUT", "0.35"))
 _RERANK_COOLDOWN = float(os.environ.get("BOSHI_RERANK_COOLDOWN", "60"))
 _RERANK_DOWN_UNTIL = [0.0]        # 熔断：失败后静默 N 秒，避免每次都付连接代价
+# 显存预检：重排模型 FP16 常驻约 650 MiB（实测 +650）。3060 12G 是共卡，
+# 别的 llama-server 一起载入时会把显存吃到只剩 4xx MiB，这时再唤醒重排
+# 会让 llama-server OOM 直接**掉进程**（2026-10-21 实测：14:35 另起两个服务
+# 后 11437 进程消失，此后所有查询静默退回融合序，成绩 para 4/5/8）。
+# 所以开火前先看空闲显存，不够就当场降级并在状态里写明原因，不赌。
+_RERANK_VRAM_MIN = int(os.environ.get("BOSHI_RERANK_VRAM_MIN", "800"))
+_RERANK_VRAM_CHECK = os.environ.get("BOSHI_RERANK_VRAM", "1") == "1"
+_RERANK_WARM_SEC = float(os.environ.get("BOSHI_RERANK_WARM", "300"))
+_RERANK_LAST_OK = [0.0]           # 上次成功重排的时间（判定「权重是否还在卡上」）
+_VRAM_CACHE = {"t": 0.0, "free": None}
+# 运行状态（给 doctor/运维看，避免"到底有没有在重排"只能靠猜）
+_RERANK_STATUS: Dict[str, Any] = {"ok": None, "reason": "", "ts": 0.0, "detail": ""}
+_STATUS_LOG_AT = [0.0]
+
+
+def _vram_free_mib():
+    """当前空闲显存（MiB）；取不到返回 None（取不到就不阻断重排）。"""
+    if not _RERANK_VRAM_CHECK:
+        return None
+    if time.time() - _VRAM_CACHE["t"] < 20:
+        return _VRAM_CACHE["free"]
+    free = None
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, timeout=4)
+        txt = (out.stdout or b"").decode("ascii", "replace").strip().splitlines()
+        if out.returncode == 0 and txt:
+            free = int(txt[0].strip())
+    except Exception:                # noqa: BLE001  没装 nvidia-smi / 超时 → 不阻断
+        free = None
+    _VRAM_CACHE["t"], _VRAM_CACHE["free"] = time.time(), free
+    return free
+
+
+def _set_rerank_status(ok: bool, reason: str = "", detail: str = "") -> None:
+    _RERANK_STATUS.update(ok=ok, reason=reason, ts=time.time(), detail=detail[:200])
+    if ok:
+        return
+    if time.time() - _STATUS_LOG_AT[0] > 120:      # 降级原因写日志，但不刷屏
+        _STATUS_LOG_AT[0] = time.time()
+        _log("rerank 降级：%s %s" % (reason, detail[:160]))
+
+
+def rerank_status() -> Dict[str, Any]:
+    """重排运行状态快照（ok/reason/detail/ts + 配置），供 doctor/人工核对。"""
+    free = _VRAM_CACHE["free"]
+    return {"enabled": _RERANK_ON, "url": _RERANK_URL, "ok": _RERANK_STATUS["ok"],
+            "reason": _RERANK_STATUS["reason"], "detail": _RERANK_STATUS["detail"],
+            "ts": _RERANK_STATUS["ts"], "pool": _RERANK_POOL,
+            "blend": {"w_rk": _BLEND_W_RK, "w_fu": _BLEND_W_FU,
+                      "k": _BLEND_K, "head": _BLEND_HEAD},
+            "vram_free_mib": free, "vram_min": _RERANK_VRAM_MIN,
+            "down_until": _RERANK_DOWN_UNTIL[0]}
+
 
 
 def _rerank_items(query: str, items: list, top_k: int) -> list:
@@ -1549,6 +1680,14 @@ def _rerank_items(query: str, items: list, top_k: int) -> list:
         return items[:k]
     if time.time() < _RERANK_DOWN_UNTIL[0]:      # 熔断中：直接走融合序
         return items[:k]
+    # 显存预检：只有「模型很可能已经睡了」时才查显存（wake 需 +650MiB）；
+    # 刚成功调用过（≤_RERANK_WARM_SEC）说明权重还在卡上，直接调，不做无谓拦截。
+    if time.time() - _RERANK_LAST_OK[0] > _RERANK_WARM_SEC:
+        free = _vram_free_mib()
+        if free is not None and free < _RERANK_VRAM_MIN:
+            _set_rerank_status(False, "vram_low",
+                               "free=%dMiB < min=%dMiB" % (free, _RERANK_VRAM_MIN))
+            return items[:k]
     try:
         import math
         import requests
@@ -1580,14 +1719,30 @@ def _rerank_items(query: str, items: list, top_k: int) -> list:
             buf.append(t)
             bidx.append(i)
         _flush()
-    except Exception:                 # 端点没起 / 超时 / 500：静默退回融合序 + 熔断
+    except Exception as e:            # 端点没起 / 超时 / 500 / 显存不够被 OOM：降级 + 熔断
         _RERANK_DOWN_UNTIL[0] = time.time() + _RERANK_COOLDOWN
+        _set_rerank_status(False, "endpoint_error", "%s: %s" % (type(e).__name__, e))
         return items[:k]
 
-    if len(scores) < len(items):      # 有候选没拿到分（截断/异常）→ 不敢用半套排序
+    # 有候选没拿到分（某一片 500/超时）→ 不能整套弃用：那会让「一片坏掉」等于
+    # 「全部退化成融合序」。改成有分的按重排分排前面，没分的保持融合原序接在后面。
+    if not scores:
+        _RERANK_DOWN_UNTIL[0] = time.time() + _RERANK_COOLDOWN
+        _set_rerank_status(False, "no_scores", "0/%d 有分" % len(items))
         return items[:k]
+    missing = [i for i in range(len(items)) if i not in scores]
+    if missing:
+        _set_rerank_status(False, "partial_scores",
+                           "%d/%d 无分，已按融合序补在后" % (len(missing), len(items)))
+        for i in missing:
+            items[i]["score"] = 1.0        # 距离语义的最差值；sort 稳定 → 组内保留原序
+    else:
+        _RERANK_LAST_OK[0] = time.time()
+        _set_rerank_status(True)
 
     for i, it in enumerate(items):
+        if i in missing:
+            continue
         lg = scores[i]
         p = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, lg))))
         # 落回库里惯用的 0.7~1.0 伪距离区间（与 RRF 融合同一约定）：score=1-(0.6+0.4p)。
@@ -1596,8 +1751,53 @@ def _rerank_items(query: str, items: list, top_k: int) -> list:
         md = it.get("metadata")
         if isinstance(md, dict):
             md["rerank_score"] = round(lg, 4)
-    items.sort(key=lambda x: x["score"])     # 升序（距离语义）＝重排分从高到低
-    return items[:k]
+    scored = [i for i in range(len(items)) if i not in missing]
+    rk_rank = {i: r for r, i in enumerate(
+        sorted(scored, key=lambda i: (items[i]["score"], i)))}
+
+    # 诊断采样（默认关）：把「融合序 + 原始重排分」整串落盘，用于离线复算任意
+    # 混参而不必反复跑 150 条查询的在线评测。BOSHI_RERANK_TRACE=<目录>
+    _tr = os.environ.get("BOSHI_RERANK_TRACE")
+    if _tr:
+        try:
+            with open(os.path.join(_tr, "trace.jsonl"), "a", encoding="utf-8") as _f:
+                _f.write(json.dumps({
+                    "q": query,
+                    "fu": [str(items[i].get("id"))[:8] for i in range(len(items))],
+                    "rs": [None if scores.get(i) is None else round(scores[i], 4)
+                           for i in range(len(items))],
+                }, ensure_ascii=False) + "\n")
+        except Exception:            # 采样失败绝不能影响检索
+            pass
+
+
+    if _BLEND_W_FU > 0 and len(scored) > 1:
+        # 融合名次天然等于「进函数时的下标」：此时 items 仍是融合序，尚未被重排覆盖。
+        key = {i: _BLEND_W_RK / (_BLEND_K + rk_rank[i] + 1.0) for i in scored}
+        head = scored[:_BLEND_HEAD] if _BLEND_HEAD > 0 else scored
+        for r, i in enumerate(head):
+            key[i] += _BLEND_W_FU / (_BLEND_K + r + 1.0)
+        order = sorted(key, key=lambda i: (-key[i], rk_rank[i]))
+    else:
+        order = sorted(scored, key=lambda i: (items[i]["score"], i))
+    order += sorted(missing)              # 无分的按融合原序接在尾部
+
+    # 按融合后的名次落盘顺序，同时把 score 压成单调不减（升序＝好）：被融合序
+    # 顶上来的条目本来重排分偏差，若原样留着，下游任何按 score 再排一次的地方
+    # 都会把它翻回去；单调化之后「顺序」与「分数」永远同向。
+    out, prev = [], 0.0
+    for i in order:
+        it = items[i]
+        d = float(it.get("score") or 0.0)
+        if d < prev:
+            d = prev
+        prev = d
+        it["score"] = round(d, 6)
+        md = it.get("metadata")
+        if isinstance(md, dict) and _BLEND_W_FU > 0:
+            md["fusion_rank"] = i + 1
+        out.append(it)
+    return out[:k]
 
 
 
