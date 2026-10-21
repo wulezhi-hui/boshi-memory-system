@@ -201,20 +201,9 @@ def create_server():
         _audit("boshi_search", _me, scope, query, ctx=ctx)
         result = search(query=query, top_k=top_k, source=source,
                         include_graph=include_graph, scope=scope,
-                        me=_me)
-        # 时间过滤（Python 端，不依赖 ChromaDB where）
-        if since or until:
-            results = result.get("results", [])
-            filtered = []
-            for r in results:
-                ts = r.get("metadata", {}).get("_version_created", 0)
-                if since and ts < since:
-                    continue
-                if until and ts > until:
-                    continue
-                filtered.append(r)
-            result["results"] = filtered
-            result["total"] = len(filtered)
+                        me=_me, since=since, until=until)
+        # 时间窗已在后端 SQL 层（created_at 真列）生效，先过滤再取 top_k，
+        # 不会出现"先截 5 条再过滤导致空结果"的老问题，这里不再重复过滤。
         return json.dumps(_with_meta(result, ctx, scope), ensure_ascii=False, indent=2)
 
     @server.tool(

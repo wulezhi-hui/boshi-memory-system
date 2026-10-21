@@ -41,3 +41,10 @@ chroma_extract_*.json
 
 # 运行日志（不入库）
 logs/
+
+# 槽位回填备份（大数据文件，本地留档不入库）
+backups/slots_backfill_*.json
+
+# 运维快照（export_snapshot / export_markdown 产物，含全量记忆正文，严禁入库）
+snapshots/
+

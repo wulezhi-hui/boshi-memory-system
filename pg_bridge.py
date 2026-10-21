@@ -1447,9 +1447,47 @@ def _fm_stats(c, qfields: dict, top: list, pre_top1: str = None) -> None:
         pass
 
 
+def _time_bounds(since=None, until=None) -> tuple:
+    """since/until（Unix 秒、数字串或 ISO 串）→ (SQL 片段, 参数)。
+
+    P2 遗留项：`get_time_range()` 早就存在，但检索主路径没有时间入口，
+    导致「上周/上个月的记忆」只能整库召回再人工过滤。这里把时间窗做成
+    检索的一等参数，落在 created_at 真列上（可用索引，不进 meta 扫描）。
+    """
+    import datetime as _dt
+
+    def _ts(x):
+        if x is None or x == "":
+            return None
+        if isinstance(x, bool):
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip()
+        try:
+            return float(s)
+        except ValueError:
+            pass
+        try:
+            return _dt.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+
+    parts, ps = [], []
+    a, b = _ts(since), _ts(until)
+    if a is not None:
+        parts.append("created_at >= to_timestamp(%s)")
+        ps.append(a)
+    if b is not None:
+        parts.append("created_at <= to_timestamp(%s)")
+        ps.append(b)
+    return " AND ".join(parts), ps
+
+
 def search_memory(query: str, top_k: int = 5, where: dict = None,
                   all_versions: bool = False, include_graph: bool = False,
-                  scope: str = None, me: str = None, fusion: str = None):
+                  scope: str = None, me: str = None, fusion: str = None,
+                  since=None, until=None):
     c = _conn()
     w = dict(where or {})
     if not all_versions:
@@ -1461,6 +1499,11 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
         return _search_edges(query, top_k, rel_type)
 
     cond, params = _where_sql(w, scope, me or _resolve_profile(), include_graph)
+    # P2 时间维度接检索：since/until 直接并进 where 条件（两条轨道都用同一 cond）
+    _tc, _tp = _time_bounds(since, until)
+    if _tc:
+        cond = "(%s) AND (%s)" % (cond, _tc)
+        params = list(params) + _tp
     mode = (fusion or os.environ.get("BOSHI_SEARCH_FUSION", "auto")).lower()
     # P2+：字段级匹配要在 top_k 之外还能看见候选（否则只能重排已进榜的几条）
     fm_on = os.environ.get("BOSHI_FIELD_MATCH", "1") == "1"
@@ -1577,10 +1620,12 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
 
 def hybrid_search(query: str, top_k: int = 5, where: dict = None,
                   all_versions: bool = False, search_sessions: bool = True,
-                  include_graph: bool = False, scope: str = None, me: str = None):
+                  include_graph: bool = False, scope: str = None, me: str = None,
+                  since=None, until=None):
     """语义检索（PG）+ 会话历史（Hermes state.db FTS，与存储后端无关）。"""
     mems = search_memory(query, top_k=top_k, where=where, all_versions=all_versions,
-                         include_graph=include_graph, scope=scope, me=me)
+                         include_graph=include_graph, scope=scope, me=me,
+                         since=since, until=until)
     sessions: List[dict] = []
     if search_sessions:
         try:
@@ -1765,6 +1810,239 @@ def get_all_relations(top_k: int = 10000) -> list:
         return [{"id": str(r[0]), "content": r[1], "metadata": r[2]} for r in cur.fetchall()]
 
 
+# ── 白盒可编辑 / 快照回滚（共识5：可读、可改、可回滚）──────────────
+# 原先 CLI 只能 save/delete，改一条错记（错别字、错版本号）只能删了重写，
+# 丢掉原 id 与时间线；也没有任何"改之前先存一份"的退路。这两件事都是
+# agent 长期记忆最容易出事的地方，所以补成原生能力。
+
+
+def edit_memory(memory_id: str, content: str = None, meta_patch: dict = None,
+                topic: str = None, is_latest: bool = None):
+    """就地修改一条记忆（正文 / 元数据 / 主题 / 有效标记）。
+
+    正文变更时**必须重算向量与槽位**：只改 content 列不改 embedding，检索
+    仍按旧语义命中，等于"改了看不见"；槽位是正文的纯规则派生，不同步就会
+    让字段级匹配读到旧版本号/端口。
+    meta_patch 里值为 None 表示删除该键。
+    """
+    c = _conn()
+    with c.cursor() as cur:
+        cur.execute("SELECT content, meta, slots, topic, is_latest "
+                    "FROM boshi.memories WHERE id = %s", (memory_id,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    old_content, meta, slots, old_topic, old_latest = row
+    meta = dict(meta or {})
+    changed = []
+    new_content = old_content if content is None else content
+    reembed = content is not None and content != old_content
+    if reembed:
+        changed.append("content")
+        if slots is not None:          # 原本就有槽位才重抽，避免给旧行凭空造槽位
+            try:
+                slots = _slots_mod().extract(new_content) or slots
+            except Exception:          # 抽提增强项，坏了保留旧槽位
+                pass
+    if meta_patch:
+        for k, v in meta_patch.items():
+            if v is None:
+                if k in meta:
+                    meta.pop(k, None)
+                    changed.append("meta." + k)
+            elif meta.get(k) != v:
+                meta[k] = v
+                changed.append("meta." + k)
+    if topic is not None and topic != old_topic:
+        changed.append("topic")
+    if is_latest is not None and bool(is_latest) != bool(old_latest):
+        changed.append("isLatest")
+    if not changed:
+        return {"id": memory_id, "changed": []}
+
+    sets, ps = [], []
+    if reembed:
+        v = _ef()([new_content or " "])[0]
+        sets += ["content = %s", "embedding = %s::vector", "slots = %s::jsonb", "raw_len = %s"]
+        ps += [new_content, _vec_literal(v),
+               json.dumps(slots, ensure_ascii=False) if slots else None, len(new_content or "")]
+    if meta_patch:
+        sets.append("meta = %s::jsonb")
+        ps.append(json.dumps(meta, ensure_ascii=False))
+    if topic is not None:
+        sets.append("topic = %s")
+        ps.append(topic)
+    if is_latest is not None:
+        sets.append("is_latest = %s")
+        ps.append(bool(is_latest))
+    ps.append(memory_id)
+    with c.cursor() as cur:
+        cur.execute("UPDATE boshi.memories SET " + ", ".join(sets) + " WHERE id = %s",
+                    tuple(ps))
+    return {"id": memory_id, "changed": changed}
+
+
+def _snapshot_dir() -> str:
+    d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "snapshots")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def export_snapshot(path: str = None, scope: str = "all", me: str = None,
+                    include_graph: bool = True):
+    """全库导出为 JSONL 快照（保留原 id / created_at / slots），用于备份回滚。
+
+    与 md 导出的区别：JSONL 是**可恢复**的（restore 用原 id 回灌），
+    md 只是给人读的。默认落 ~/.boshi/snapshots/。
+    """
+    from datetime import datetime as _dt
+    c = _conn()
+    cond, params = _where_sql({}, scope, me or _resolve_profile())
+    with c.cursor() as cur:
+        cur.execute("SELECT id, content, profile, source, topic, role, session_id, meta, "
+                    "is_latest, created_at, version_created, slots, raw_len "
+                    "FROM boshi.memories WHERE " + cond + " ORDER BY created_at NULLS FIRST",
+                    tuple(params))
+        mems = cur.fetchall()
+    if not path:
+        path = os.path.join(_snapshot_dir(),
+                            "boshi-%s.jsonl" % _dt.now().strftime("%Y%m%d-%H%M%S"))
+    n = 0
+    with open(path, "w", encoding="utf-8") as f:
+        for r in mems:
+            rec = {"kind": "memory", "id": str(r[0]), "content": r[1] or "",
+                   "profile": r[2], "source": r[3], "topic": r[4], "role": r[5],
+                   "session_id": r[6], "meta": r[7] or {}, "is_latest": r[8],
+                   "created_at": r[9].isoformat() if r[9] else None,
+                   "version_created": r[10], "slots": r[11], "raw_len": r[12]}
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            n += 1
+        if include_graph:
+            with c.cursor() as cur:
+                cur.execute("SELECT id, entity_a, entity_b, relation, content, version_created "
+                            "FROM boshi.graph_edges")
+                for r in cur.fetchall():
+                    f.write(json.dumps({"kind": "edge", "id": str(r[0]), "entity_a": r[1],
+                                        "entity_b": r[2], "relation": r[3],
+                                        "content": r[4] or "",
+                                        "version_created": r[5]}, ensure_ascii=False) + "\n")
+                    n += 1
+    return {"path": path, "count": n}
+
+
+def restore_snapshot(path: str, dry_run: bool = False):
+    """把快照回灌进库：只补**缺失的 id**（ON CONFLICT DO NOTHING），不覆盖现状。
+
+    这个语义是刻意的：回滚的常见诉求是"删错了/库空了，把那条找回来"，
+    而不是"用三天前的版本把今天的库冲掉"。要整库回退请先手动作业。
+    """
+    added, skipped, errors = 0, 0, []
+    with open(path, "r", encoding="utf-8") as f:
+        for ln, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception as e:
+                errors.append("line %d: %s" % (ln, e))
+                continue
+            if dry_run:
+                # 演练：只回答"会补多少、会跳过多少"，不写库、不算 embedding（省时间）
+                try:
+                    if rec.get("kind") == "edge":
+                        with _conn().cursor() as cur:
+                            cur.execute("SELECT 1 FROM boshi.graph_edges WHERE id = %s",
+                                        (rec.get("id"),))
+                            hit = cur.fetchone() is not None
+                    else:
+                        with _conn().cursor() as cur:
+                            cur.execute("SELECT 1 FROM boshi.memories WHERE id = %s",
+                                        (rec.get("id"),))
+                            hit = cur.fetchone() is not None
+                    skipped += 1 if hit else 0
+                    added += 0 if hit else 1
+                except Exception as e:
+                    errors.append("line %d: %s" % (ln, e))
+                continue
+            try:
+                if rec.get("kind") == "edge":
+                    with _conn().cursor() as cur:
+                        cur.execute("""INSERT INTO boshi.graph_edges
+                                       (id, entity_a, entity_b, relation, content, version_created)
+                                       VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING""",
+                                    (rec.get("id"), rec.get("entity_a", ""), rec.get("entity_b", ""),
+                                     rec.get("relation", ""), rec.get("content", ""),
+                                     rec.get("version_created")))
+                        added += 1 if cur.rowcount else 0
+                        skipped += 0 if cur.rowcount else 1
+                else:
+                    c = _conn()
+                    from datetime import datetime as _dt
+                    created = None
+                    if rec.get("created_at"):
+                        try:
+                            created = _dt.fromisoformat(rec["created_at"])
+                        except Exception:
+                            created = None
+                    v = _ef()([rec.get("content") or " "])[0]
+                    with c.cursor() as cur:
+                        cur.execute("""INSERT INTO boshi.memories
+                            (id, content, embedding, profile, source, topic, role, session_id,
+                             meta, is_latest, created_at, version_created, slots, raw_len)
+                            VALUES (%s,%s,%s::vector,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s)
+                            ON CONFLICT (id) DO NOTHING""",
+                                    (rec.get("id"), rec.get("content", ""), _vec_literal(v),
+                                     rec.get("profile"), rec.get("source"), rec.get("topic"),
+                                     rec.get("role"), rec.get("session_id"),
+                                     json.dumps(rec.get("meta") or {}, ensure_ascii=False),
+                                     bool(rec.get("is_latest", True)), created,
+                                     rec.get("version_created"),
+                                     json.dumps(rec["slots"], ensure_ascii=False) if rec.get("slots") else None,
+                                     rec.get("raw_len")))
+                        added += 1 if cur.rowcount else 0
+                        skipped += 0 if cur.rowcount else 1
+            except Exception as e:
+                errors.append("line %d: %s" % (ln, e))
+    return {"path": path, "added": added, "skipped": skipped,
+            "errors": errors[:20], "error_count": len(errors)}
+
+
+def export_markdown(path: str = None, scope: str = "all", me: str = None,
+                    limit: int = 5000):
+    """导出为人读的 Markdown（按 topic 分组，带 id 与时间），便于 review/归档。"""
+    from datetime import datetime as _dt
+    c = _conn()
+    cond, params = _where_sql({}, scope, me or _resolve_profile())
+    with c.cursor() as cur:
+        cur.execute("SELECT id, content, topic, profile, created_at, is_latest "
+                    "FROM boshi.memories WHERE " + cond +
+                    " ORDER BY topic, created_at DESC LIMIT %s",
+                    tuple(params) + (int(limit),))
+        rows = cur.fetchall()
+    if not path:
+        path = os.path.join(_snapshot_dir(),
+                            "boshi-%s.md" % _dt.now().strftime("%Y%m%d-%H%M%S"))
+    prov = me or _resolve_profile()
+    lines = ["# 伯仕记忆导出", "",
+             "- 生成时间：%s" % _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+             "- profile：%s（scope=%s）" % (prov, scope),
+             "- 条数：%d" % len(rows), ""]
+    cur_topic = object()
+    for r in rows:
+        if r[2] != cur_topic:
+            cur_topic = r[2]
+            lines += ["", "## %s" % (cur_topic or "(未分类)"), ""]
+        ts = r[4].strftime("%Y-%m-%d %H:%M") if r[4] else "无时间"
+        flag = "" if r[5] else " · 已被新版取代"
+        lines.append("- **%s**%s `%s`" % (ts, flag, r[0]))
+        body = (r[1] or "").strip().replace("\n", "\n  ")
+        lines.append("  " + body)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return {"path": path, "count": len(rows)}
+
+
 # ── 以下功能 PG 后端暂未实现（现役路径不依赖）────────────────────
 def _not_impl(name: str):
     raise NotImplementedError(
@@ -1775,9 +2053,163 @@ def auto_forget(dry_run: bool = False):
     _not_impl("auto_forget")
 
 
-def detect_conflicts(query: str = "", top_k: int = 10, **kw):
-    _not_impl("detect_conflicts")
+def fact_chain(memory_id: str, max_depth: int = 20) -> dict:
+    """同一事实的版本链（新→旧），顺着 `meta.superseded_by` 走。
+
+    `resolve_conflict` 只做「落败行 is_latest=false + superseded_by=赢家」，
+    链本身是推导出来的，不额外建表。给定任一版本 id：
+    - 若它是旧版 → 向上走到最新款；
+    - 若它已是最新 → 向下找出所有指向它的旧版（递归）。
+    """
+    c = _conn()
+    with c.cursor() as cur:
+        cur.execute("""SELECT id, content, topic, is_latest, created_at,
+                              meta->>'superseded_by', meta->>'supersede_reason'
+                       FROM boshi.memories WHERE id = %s""", (str(memory_id),))
+        row = cur.fetchone()
+        if row is None:
+            return None
+
+        def _node(r):
+            return {"id": str(r[0]), "content": r[1], "topic": r[2],
+                    "is_latest": bool(r[3]),
+                    "created_at": r[4].strftime("%Y-%m-%d %H:%M") if r[4] else None,
+                    "superseded_by": str(r[5]) if r[5] else None,
+                    "reason": r[6] or ""}
+
+        chain = [_node(row)]
+        seen = {str(row[0])}
+        nxt = row[5]
+        while nxt and len(chain) < max_depth:
+            sid = str(nxt)
+            if sid in seen:
+                break
+            cur.execute("""SELECT id, content, topic, is_latest, created_at,
+                                  meta->>'superseded_by', meta->>'supersede_reason'
+                           FROM boshi.memories WHERE id = %s""", (sid,))
+            r = cur.fetchone()
+            if r is None:
+                break
+            chain.append(_node(r))
+            seen.add(sid)
+            nxt = r[5]
+
+        # 向下：所有（多级）指向本 id 的旧版
+        cur.execute("""WITH RECURSIVE down(id, depth) AS (
+                         SELECT id, 1 FROM boshi.memories
+                          WHERE meta->>'superseded_by' = %s
+                         UNION ALL
+                         SELECT m.id, d.depth + 1 FROM boshi.memories m
+                           JOIN down d ON m.meta->>'superseded_by' = d.id::text
+                          WHERE d.depth < %s
+                       )
+                       SELECT m.id, m.content, m.topic, m.is_latest, m.created_at,
+                              m.meta->>'superseded_by', m.meta->>'supersede_reason'
+                         FROM down d JOIN boshi.memories m ON m.id = d.id
+                        ORDER BY m.created_at DESC""", (str(memory_id), max_depth))
+        descendants = [_node(r) for r in cur.fetchall()]
+
+    latest = chain[-1]  # chain 是新→旧，末项即链尾（有链时=最新版）
+    summary = "共 %d 版" % (len(chain) + len(descendants))
+    if latest.get("created_at"):
+        summary += "，最新 %s" % latest["created_at"]
+    summary += "；最新内容：「%s」" % (latest["content"] or "")[:60].replace("\n", " ")
+    return {"id": str(row[0]), "chain": chain, "descendants": descendants,
+            "summary": summary}
+
+
+def detect_conflicts(topic: str = None, top_k: int = 20, sim_threshold: float = 0.85,
+                     max_pairs: int = 4000) -> list:
+    """零模型冲突候选：同文件 + 高相似 + 槽位互斥 → 交人工 `resolve_conflict` 裁决。
+
+    不做全表 O(n²) 比对（实测 6283 行要 12s+）：先按 `slots.files` 有交集挑候选对
+    （1343 对量级），再算余弦，最后只看"同一槽位键取值互斥"的对——
+    取值是包含关系（['8188'] vs ['8188','11355']）算补充信息，不算冲突。
+    """
+    import numpy as np
+    c = _conn()
+    with c.cursor() as cur:
+        if topic:
+            cur.execute("""SELECT id, content, slots, created_at FROM boshi.memories
+                            WHERE is_latest AND slots IS NOT NULL AND topic = %s""", (topic,))
+        else:
+            cur.execute("""SELECT id, content, slots, created_at FROM boshi.memories
+                            WHERE is_latest AND slots IS NOT NULL""")
+        rows = cur.fetchall()
+
+    idx, filemap = {}, {}
+    for i, r in enumerate(rows):
+        idx[str(r[0])] = i
+        for f in (r[2].get("files") or []):
+            filemap.setdefault(f, []).append(i)
+
+    pairs = set()
+    for ids in filemap.values():
+        if len(ids) < 2 or len(ids) > 60:
+            continue
+        for a in range(len(ids)):
+            for b in range(a + 1, len(ids)):
+                pairs.add((ids[a], ids[b]))
+                if len(pairs) >= max_pairs:
+                    break
+    if not pairs:
+        return []
+
+    need = sorted({i for p in pairs for i in p})
+    idlist = [rows[i][0] for i in need]
+    with c.cursor() as cur:
+        cur.execute("SELECT id, embedding FROM boshi.memories WHERE id = ANY(%s)", (idlist,))
+        emb = {}
+        for mid, vec in cur.fetchall():
+            if vec is None:
+                continue
+            v = np.fromstring(str(vec).strip("[]"), sep=",", dtype=np.float32)
+            n = float(np.linalg.norm(v))
+            if n > 0:
+                emb[str(mid)] = v / n
+
+    # boundary_envs 存的是整句话（抽取器口径），互相比较只会产生噪声，不参与冲突判定
+    KEYS = ("ports", "versions", "commands", "numbers", "files")
+    out = []
+    for a, b in pairs:
+        ia, ib = str(rows[a][0]), str(rows[b][0])
+        if ia not in emb or ib not in emb:
+            continue
+        sim = float(np.dot(emb[ia], emb[ib]))
+        if sim < sim_threshold:
+            continue
+        sa, sb = rows[a][2], rows[b][2]
+        conflicts = []
+        for k in KEYS:
+            va = {str(x) for x in (sa.get(k) or [])}
+            vb = {str(x) for x in (sb.get(k) or [])}
+            if va and vb and not (va & vb):
+                conflicts.append({"key": k, "a": sorted(va), "b": sorted(vb)})
+        if not conflicts:
+            continue
+        out.append({"a": ia, "b": ib, "similarity": round(sim, 4),
+                    "conflicts": conflicts,
+                    "a_time": rows[a][3].strftime("%Y-%m-%d %H:%M") if rows[a][3] else None,
+                    "b_time": rows[b][3].strftime("%Y-%m-%d %H:%M") if rows[b][3] else None,
+                    "a_content": (rows[a][1] or "")[:120],
+                    "b_content": (rows[b][1] or "")[:120]})
+    out.sort(key=lambda x: -x["similarity"])
+    return out[:top_k]
 
 
 def resolve_conflict(winner_id: str, loser_id: str, reason: str = "") -> bool:
-    _not_impl("resolve_conflict")
+    """极简冲突处理：落败行 `is_latest=false` + `meta.superseded_by=winner`。
+
+    不改表结构（沿用 v5.8 不可变日志约定），旧答案仍可 all_versions 追溯；
+    fact_chain 就是顺着 superseded_by 往上走。
+    """
+    c = _conn()
+    with c.cursor() as cur:
+        cur.execute("""UPDATE boshi.memories
+                       SET is_latest = false,
+                           meta = meta || jsonb_build_object(
+                                  'superseded_by', %s::text,
+                                  'supersede_reason', %s::text)
+                       WHERE id = %s AND is_latest
+                       RETURNING id""", (str(winner_id), reason or "", str(loser_id)))
+        return cur.fetchone() is not None

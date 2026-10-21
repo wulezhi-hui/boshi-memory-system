@@ -1091,6 +1091,9 @@ _PUBLIC_API = (
     "delete_memories", "update_memory", "deprecate_memory", "get_all_relations",
     "auto_forget", "detect_conflicts", "resolve_conflict", "get_by_id",
     "get_graph_count", "get_latest_by_topic",
+    # 白盒运维面（2026-10-21 P2/P3）：就地编辑、快照导出/回灌、冲突链
+    "edit_memory", "export_snapshot", "export_markdown", "restore_snapshot",
+    "fact_chain",
 )
 
 if BACKEND == "pg":

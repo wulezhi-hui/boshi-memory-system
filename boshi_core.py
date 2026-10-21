@@ -61,7 +61,7 @@ def _get_kg():
 
 def search(query: str, top_k: int = 5, source: str = "all",
            include_graph: bool = False, scope: str = None,
-           me: str = None) -> dict:
+           me: str = None, since=None, until=None) -> dict:
     """
     多策略检索记忆。
 
@@ -76,6 +76,8 @@ def search(query: str, top_k: int = 5, source: str = "all",
             ~/.boshi/profiles.json）；"all" 读全库（含其他 profile 与外部 agent）。
         me:     调用方归属标识（如 "opencode"/"dsh"/"dashi"）。显式传入可避免
             依赖进程环境变量，供多客户端共用同一 MCP 进程时使用。
+        since/until: 时间窗（Unix 秒或 ISO 串），落到 created_at 真列。
+            P2 时间维度的检索入口：问"上周/上个月定的事"时不必整库召回再人工筛。
 
     返回:
         {"query": str, "total": int, "results": [...], "sources": {...}}
@@ -86,7 +88,7 @@ def search(query: str, top_k: int = 5, source: str = "all",
         # 注意：后端（pg）的 search_memory 默认 fusion=auto，命中型号/数字等锚点时
         # 会融合关键词通道。这里把每条实际走的通道如实标出来，别一律写 "vector"。
         results = cb.search_memory(query, top_k=top_k, include_graph=include_graph,
-                                   scope=scope, me=me)
+                                   scope=scope, me=me, since=since, until=until)
         src_count: dict = {}
         for r in results:
             r["score"] = round(1.0 - r.get("score", 0), 4)
@@ -103,7 +105,7 @@ def search(query: str, top_k: int = 5, source: str = "all",
 
     elif source == "hybrid":
         result = cb.hybrid_search(query, top_k=top_k, include_graph=include_graph,
-                                  scope=scope, me=me)
+                                  scope=scope, me=me, since=since, until=until)
         mems = result.get("memories", [])
         for r in mems:
             r["source"] = "hybrid"
@@ -122,7 +124,7 @@ def search(query: str, top_k: int = 5, source: str = "all",
     else:
         # 三路融合：hybrid_search(语义+全文) + graph
         hybrid = cb.hybrid_search(query, top_k=top_k, include_graph=include_graph,
-                                  scope=scope, me=me)
+                                  scope=scope, me=me, since=since, until=until)
         vector_results = hybrid.get("memories", [])
         for r in vector_results:
             # ChromaDB 返回的是距离（越小越相似），转为相似度（越大越好）
@@ -223,6 +225,89 @@ def delete(memory_id: str) -> dict:
     cb = _get_chroma()
     cb.delete_memory(memory_id)
     return {"success": True, "deleted": memory_id}
+
+
+def edit(memory_id: str, content: str = None, meta_patch: dict = None,
+         topic: str = None, is_latest: bool = None) -> dict:
+    """就地修改一条记忆（白盒可编辑）。返回 {"success", "memory_id", "changed"}。"""
+    cb = _get_chroma()
+    fn = getattr(cb, "edit_memory", None)
+    if fn is None:
+        return {"success": False, "error": "当前后端不支持就地编辑"}
+    r = fn(memory_id, content=content, meta_patch=meta_patch,
+           topic=topic, is_latest=is_latest)
+    if r is None:
+        return {"success": False, "error": "未找到该记忆", "memory_id": memory_id}
+    return {"success": True, "memory_id": r["id"], "changed": r.get("changed", [])}
+
+
+def export_snapshot(path: str = None, scope: str = "all", include_graph: bool = True,
+                    me: str = None) -> dict:
+    """导出可恢复的 JSONL 快照。返回 {"success", "path", "count"}。"""
+    cb = _get_chroma()
+    fn = getattr(cb, "export_snapshot", None)
+    if fn is None:
+        return {"success": False, "error": "当前后端不支持快照导出"}
+    r = fn(path=path, scope=scope, me=me, include_graph=include_graph)
+    r["success"] = True
+    return r
+
+
+def export_markdown(path: str = None, scope: str = "all", limit: int = 5000,
+                    me: str = None) -> dict:
+    """导出人读版 Markdown。返回 {"success", "path", "count"}。"""
+    cb = _get_chroma()
+    fn = getattr(cb, "export_markdown", None)
+    if fn is None:
+        return {"success": False, "error": "当前后端不支持 md 导出"}
+    r = fn(path=path, scope=scope, me=me, limit=limit)
+    r["success"] = True
+    return r
+
+
+def restore_snapshot(path: str, dry_run: bool = False) -> dict:
+    """按快照回灌缺失记录（不覆盖现状）。返回 {"success", "added", "skipped"}。"""
+    cb = _get_chroma()
+    fn = getattr(cb, "restore_snapshot", None)
+    if fn is None:
+        return {"success": False, "error": "当前后端不支持快照回灌"}
+    r = fn(path, dry_run=dry_run)
+    r["success"] = True
+    return r
+
+
+def resolve_conflict(winner_id: str, loser_id: str, reason: str = "") -> dict:
+    """标记冲突落败行（is_latest=false + meta.superseded_by）。"""
+    cb = _get_chroma()
+    fn = getattr(cb, "resolve_conflict", None)
+    if fn is None:
+        return {"success": False, "error": "当前后端不支持冲突处理"}
+    return {"success": bool(fn(winner_id, loser_id, reason)),
+            "winner": winner_id, "loser": loser_id}
+
+
+def fact_chain(memory_id: str, max_depth: int = 20) -> dict:
+    """同一事实的版本链（新→旧）+ 所有被取代的旧版。"""
+    cb = _get_chroma()
+    fn = getattr(cb, "fact_chain", None)
+    if fn is None:
+        return {"success": False, "error": "当前后端不支持版本链"}
+    r = fn(memory_id, max_depth=max_depth)
+    if r is None:
+        return {"success": False, "error": "未找到该记忆"}
+    r["success"] = True
+    return r
+
+
+def detect_conflicts(topic: str = None, top_k: int = 20,
+                     sim_threshold: float = 0.85) -> dict:
+    """零模型冲突候选（同文件 + 高相似 + 槽位互斥）。"""
+    cb = _get_chroma()
+    fn = getattr(cb, "detect_conflicts", None)
+    if fn is None:
+        return {"success": False, "error": "当前后端不支持冲突检测"}
+    items = fn(topic=topic, top_k=top_k, sim_threshold=sim_threshold)
+    return {"success": True, "count": len(items or []), "items": items or []}
 
 
 def status() -> dict:

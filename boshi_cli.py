@@ -6,7 +6,9 @@
 
 用法:
   boshi search "查询文本" [--top-k 5] [--source all|vector|keyword|graph]
+                [--since 7d|2026-10-01] [--until ...]
   boshi save "记忆内容" [--topic 主题]
+  boshi edit <memory_id> [--content 新正文] [-f 文件] [--meta k=v ...] [--topic 主题]
   boshi delete <memory_id>
   boshi status
   boshi profile
@@ -15,6 +17,10 @@
   boshi graph-add-edge <起点> <终点> <关系>
   boshi recent [10]
   boshi brief
+  boshi export [--out 路径] [--md] [--scope self|all]
+  boshi restore <快照.jsonl> [--dry-run]
+  boshi chain <memory_id>
+  boshi conflicts [--topic 主题] [--limit 20] [--threshold 0.85]
 """
 import os
 import sys
@@ -29,8 +35,37 @@ if BOSHI_HOME not in sys.path:
 from boshi_core import (
     search, save, delete, status, profile,
     graph_query, graph_add_node, graph_add_edge,
-    recent, brief,
+    recent, brief, edit, export_snapshot, export_markdown, restore_snapshot,
+    fact_chain, detect_conflicts,
 )
+
+
+def _parse_when(s):
+    """'7d' / '24h' / '30m' / '2026-10-01' / ISO / epoch → Unix 秒（解析不了返回 None）。
+
+    相对时间按"当前时刻往前推"，方便随手问"最近一周拍板的决定"。
+    """
+    if not s:
+        return None
+    s = str(s).strip()
+    units = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+    if s and s[-1].lower() in units and s[:-1].replace(".", "", 1).isdigit():
+        from time import time
+        return time() - float(s[:-1]) * units[s[-1].lower()]
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    from datetime import datetime
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt).timestamp()
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 # ═══════════════════════════════════════════
@@ -125,7 +160,9 @@ def _fmt_recent(results: list):
 
 def cmd_search(args):
     result = search(query=args.query, top_k=args.top_k, source=args.source,
-                    scope=getattr(args, "scope", None))
+                    scope=getattr(args, "scope", None),
+                    since=_parse_when(getattr(args, "since", None)),
+                    until=_parse_when(getattr(args, "until", None)))
     _fmt_search(result)
 
 
@@ -145,6 +182,91 @@ def cmd_delete(args):
         print(f"✅ 已删除: {result['deleted']}")
     else:
         print(f"❌ 删除失败: {result}")
+
+
+def cmd_edit(args):
+    content = args.content
+    if getattr(args, "file", None):
+        with open(args.file, "r", encoding="utf-8") as f:
+            content = f.read()
+    meta_patch = None
+    if getattr(args, "meta", None):
+        meta_patch = {}
+        for item in args.meta:
+            if "=" not in item:
+                print(f"❌ --meta 需要 k=v 形式: {item}")
+                return
+            k, v = item.split("=", 1)
+            # k= （空值）表示删除该键，与 edit_memory 的 None 语义对齐
+            meta_patch[k] = v if v != "" else None
+    result = edit(memory_id=args.memory_id, content=content, meta_patch=meta_patch,
+                  topic=getattr(args, "topic", None),
+                  is_latest=getattr(args, "is_latest", None))
+    if result.get("success"):
+        changed = result.get("changed") or ["（无变化）"]
+        print(f"✅ 已更新 {result['memory_id']}: {', '.join(changed)}")
+    else:
+        print(f"❌ 更新失败: {result.get('error')}")
+
+
+def cmd_export(args):
+    scope = getattr(args, "scope", None) or "all"
+    if getattr(args, "md", False):
+        result = export_markdown(path=args.out, scope=scope, limit=args.limit)
+    else:
+        result = export_snapshot(path=args.out, scope=scope,
+                                 include_graph=not getattr(args, "no_graph", False))
+    if result.get("success"):
+        print(f"✅ 已导出 {result['count']} 条 → {result['path']}")
+    else:
+        print(f"❌ 导出失败: {result.get('error')}")
+
+
+def cmd_restore(args):
+    result = restore_snapshot(args.path, dry_run=getattr(args, "dry_run", False))
+    if result.get("success"):
+        tag = "（演练，未写入）" if getattr(args, "dry_run", False) else ""
+        print(f"✅ 回灌完成{tag}: 新增 {result['added']} / 跳过 {result['skipped']} "
+              f"/ 失败 {result.get('error_count', 0)}")
+        for e in (result.get("errors") or [])[:5]:
+            print(f"   ⚠ {e}")
+    else:
+        print(f"❌ 回灌失败: {result.get('error')}")
+
+
+def cmd_chain(args):
+    result = fact_chain(args.memory_id)
+    if not result.get("success"):
+        print(f"❌ {result.get('error')}")
+        return
+    print(f"🔗 {result['summary']}")
+    print()
+    for i, n in enumerate(result.get("chain") or []):
+        flag = "最新" if n["is_latest"] else "已被取代"
+        print(f"  {i}. [{flag}] {n['created_at']} `{n['id']}`")
+        print(f"     {(n['content'] or '')[:100]}")
+    for n in result.get("descendants") or []:
+        print(f"  ↳ 旧版 {n['created_at']} `{n['id']}` — {(n['content'] or '')[:70]}")
+
+
+def cmd_conflicts(args):
+    result = detect_conflicts(topic=args.topic, top_k=args.limit,
+                              sim_threshold=args.threshold)
+    if not result.get("success"):
+        print(f"❌ {result.get('error')}")
+        return
+    items = result.get("items") or []
+    if not items:
+        print("✅ 未发现槽位互斥的冲突候选")
+        return
+    print(f"⚠ 冲突候选 {len(items)} 组（相似度 ≥ {args.threshold}，槽位取值互斥）")
+    for it in items:
+        print(f"\n  sim={it['similarity']}  A={it['a_time']} `{it['a']}`  B={it['b_time']} `{it['b']}`")
+        for c in it["conflicts"]:
+            print(f"    {c['key']}: {c['a']}  vs  {c['b']}")
+        print(f"    A: {it['a_content'][:90]}")
+        print(f"    B: {it['b_content'][:90]}")
+    print("\n裁决：boshi edit ... 或调用 resolve_conflict(winner, loser, reason)")
 
 
 def cmd_status(args):
@@ -200,6 +322,10 @@ def main():
     p_search.add_argument("--source", choices=["all", "vector", "hybrid", "graph"], default="all", help="检索策略")
     p_search.add_argument("--scope", choices=["self", "all"], default=None,
                           help="记忆归属范围：self=只读本 profile（默认，见 ~/.boshi/profiles.json）；all=全库")
+    p_search.add_argument("--since", default=None,
+                          help="起始时间：7d / 24h / 2026-10-01 / ISO / epoch")
+    p_search.add_argument("--until", default=None,
+                          help="截止时间：同上（默认不限）")
     p_search.set_defaults(func=cmd_search)
 
     # save
@@ -213,6 +339,47 @@ def main():
     p_delete = subparsers.add_parser("delete", help="删除记忆")
     p_delete.add_argument("memory_id", help="记忆ID")
     p_delete.set_defaults(func=cmd_delete)
+
+    # edit
+    p_edit = subparsers.add_parser("edit", help="就地修改记忆（改正文会重算 embedding 与槽位）")
+    p_edit.add_argument("memory_id", help="记忆ID")
+    p_edit.add_argument("--content", default=None, help="新的正文")
+    p_edit.add_argument("-f", "--file", default=None, help="从文件读新正文")
+    p_edit.add_argument("--meta", action="append", default=None,
+                        help="meta 补丁 k=v，可多次；k= 空值表示删除该键")
+    p_edit.add_argument("--topic", default=None, help="改主题标签")
+    p_edit.add_argument("--is-latest", dest="is_latest", action="store_true",
+                        default=None, help="标记为最新版")
+    p_edit.set_defaults(func=cmd_edit)
+
+    # export
+    p_exp = subparsers.add_parser("export", help="导出快照（JSONL 可回灌 / --md 人读版）")
+    p_exp.add_argument("--out", default=None, help="输出路径（默认 ~/.boshi/snapshots/）")
+    p_exp.add_argument("--md", action="store_true", help="导出 Markdown 人读版")
+    p_exp.add_argument("--scope", choices=["self", "all"], default=None, help="导出范围")
+    p_exp.add_argument("--limit", type=int, default=5000, help="md 导出的最大条数")
+    p_exp.add_argument("--no-graph", dest="no_graph", action="store_true",
+                       help="不导出知识图谱边")
+    p_exp.set_defaults(func=cmd_export)
+
+    # restore
+    p_res = subparsers.add_parser("restore", help="按快照回灌缺失记录（不覆盖现状）")
+    p_res.add_argument("path", help="快照 JSONL 路径")
+    p_res.add_argument("--dry-run", dest="dry_run", action="store_true",
+                       help="只统计不写入")
+    p_res.set_defaults(func=cmd_restore)
+
+    # chain
+    p_chain = subparsers.add_parser("chain", help="同一事实的版本链（新→旧）")
+    p_chain.add_argument("memory_id", help="记忆ID（任一版本）")
+    p_chain.set_defaults(func=cmd_chain)
+
+    # conflicts
+    p_conf = subparsers.add_parser("conflicts", help="冲突候选检测（零模型，槽位互斥）")
+    p_conf.add_argument("--topic", default=None, help="只看某个主题")
+    p_conf.add_argument("--limit", type=int, default=20, help="最多返回几组")
+    p_conf.add_argument("--threshold", type=float, default=0.85, help="余弦相似度门槛")
+    p_conf.set_defaults(func=cmd_conflicts)
 
     # status
     p_status = subparsers.add_parser("status", help="记忆库状态")
