@@ -727,6 +727,18 @@ _KW_ABS_ALL = (os.environ.get("BOSHI_KW_ABS_ALL", "1") != "0")
 #   overlap 只在 live 语料掉 1 个 top3（仍在 top5 内）。
 # 结论：不是噪声，是把「通道头名」这个确定性信号接回来 → **默认开到 0.4**。
 _KW_REL_BLEND = float(os.environ.get("BOSHI_KW_REL_BLEND", "0.4") or 0)
+# 锚点奖励（2026-10-21，池结构改造 A 的落地）：query 带型号/端口/版本/两位数字时，
+# 「字面通道内名次」比 kw_abs 的绝对量级更可靠——那种 query 里通道 top1 几乎必是
+# 同一主题。给向量通道前 5、关键词通道前 3 各加一点分（等价于把 RRF 的名次信号
+# 作为奖励项叠加在绝对分融合上，不动 kw_abs 的量纲）。
+# 离线实测（eval/sweep_fuse.py，深度 60 的回放）：
+#   A5（35 条全带锚点）top1/top3/top5 20/26/29 → 26/33/33
+#   A9（40 条纯中文，无锚点 → 不加分）逐条不变 10/18 · 4/7
+# 之所以按锚点分叉而不是全局加：全局加会把 A9 overlap top5 18→14（名次奖励在
+# 纯中文里放大 bigram 噪声）。默认关，BOSHI_ANCHOR_BONUS=1 才生效。
+_ANCHOR_BONUS_ON = os.environ.get("BOSHI_ANCHOR_BONUS", "0") == "1"
+_AB_V = float(os.environ.get("BOSHI_ANCHOR_BONUS_V", "0.10"))   # 向量通道 rank<=5
+_AB_K = float(os.environ.get("BOSHI_ANCHOR_BONUS_K", "0.15"))   # 关键词通道 rank<=3
 
 
 def _has_anchor(query: str) -> bool:
@@ -1118,7 +1130,7 @@ def _rrf_merge(vec_items: list, kw_items: list, top_k: int, k: int = None) -> li
 
 
 def _score_merge(vec_items: list, kw_items: list, top_k: int,
-                 wv: float = 0.45, wk: float = 0.55) -> list:
+                 wv: float = 0.45, wk: float = 0.55, query: str = None) -> list:
     """加权分融合：sim = wv*(1-dist) + wk*kw_abs，再映射到 0.6~1.0 展示区间。
 
     与 RRF 的分工：RRF 只看名次，两个通道各排第 30 的文档能压过单通道第 1
@@ -1135,12 +1147,15 @@ def _score_merge(vec_items: list, kw_items: list, top_k: int,
     # 弱证据 query：只在通道内名次好、绝对覆盖率低的 gold 才需要相对分兜底
     qweak = _KW_REL_BLEND > 0 and any(it.get("_weak") for it in kw_items)
     wsum = (wv + wk) or 1.0
+    bonus_on = _ANCHOR_BONUS_ON and _has_anchor(query or "")
     pool: dict = {}
-    for it in vec_items:
+    for rank, it in enumerate(vec_items, 1):
         pool.setdefault(it["id"], {"item": it, "v": max(0.0, 1.0 - it["score"]),
-                                   "k": 0.0, "ch": []})["ch"].append("vec")
-    for it in kw_items:
-        d = pool.setdefault(it["id"], {"item": it, "v": 0.0, "k": 0.0, "ch": []})
+                                   "k": 0.0, "ch": [], "rv": rank, "rk": None})["ch"].append("vec")
+    for rank, it in enumerate(kw_items, 1):
+        d = pool.setdefault(it["id"], {"item": it, "v": 0.0, "k": 0.0, "ch": [],
+                                      "rv": None, "rk": None})
+        d["rk"] = rank
         if d["v"] == 0.0 and it.get("_cos"):
             d["v"] = max(0.0, float(it["_cos"]))       # 关键词独有文档补的真实余弦
             d["item"] = it
@@ -1155,9 +1170,14 @@ def _score_merge(vec_items: list, kw_items: list, top_k: int,
         it["score"] = round(1.0 - (0.60 + 0.40 * min(f, 1.0)), 6)   # 单调，展示仍落 0.6~1.0
         it["channels"] = d["ch"]
         it["fused"] = round(f, 4)
+        # 锚点奖励只进排序键，不进展示分（否则 0.6~1.0 区间会被顶爆）
+        it["_sortf"] = f + ((_AB_V if d["rv"] and d["rv"] <= 5 else 0.0)
+                            + (_AB_K if d["rk"] and d["rk"] <= 3 else 0.0) if bonus_on else 0.0)
         it.pop("_weak", None)                    # 内部标记不外泄
         out.append(it)
-    out.sort(key=lambda x: x["score"])
+    out.sort(key=lambda x: -x["_sortf"])
+    for it in out:
+        it.pop("_sortf", None)
     return out[:int(top_k)]
 
 
@@ -1544,7 +1564,7 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
                 for it in kw_items:
                     if it["id"] not in seen:
                         it["_cos"] = cmap.get(str(it["id"]), 0.0)
-                items = _score_merge(vec_items, kw_items, pool_k)
+                items = _score_merge(vec_items, kw_items, pool_k, query=query)
 
     # P2+ 字段级匹配（默认关；命中查询字面字段时抬升同字段候选）
     if fm_on:
