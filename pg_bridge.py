@@ -1580,6 +1580,11 @@ _RERANK_ON = os.environ.get("BOSHI_RERANK", "1") == "1"
 _RERANK_URL = os.environ.get("BOSHI_RERANK_URL", "http://127.0.0.1:11437/rerank")
 _RERANK_MODEL = os.environ.get("BOSHI_RERANK_MODEL", "bge-reranker-v2-m3")
 _RERANK_POOL = int(os.environ.get("BOSHI_RERANK_POOL", "100"))
+# 锚点查询（型号/端口/版本/路径/英文词）用小池：这类查询的答案靠字面定位，深池只会
+# 把相邻的远亲文档捞进来搅局。A5(35 条带锚点) 实测 pool 40 → 31/34/34、pool 100 →
+# 30/34/34（top1 反而退 1），而 p50 从 1701ms 降到 976ms。所以按查询形态分档：
+# 有锚点 40、纯中文 100（A9 改写型 40→para 6/8/11、100→7/9/12，深池确实必要）。
+_RERANK_POOL_ANCHOR = int(os.environ.get("BOSHI_RERANK_POOL_ANCHOR", "40"))
 _RERANK_CHARS = int(os.environ.get("BOSHI_RERANK_CHARS", "700"))
 # 融合序混入（RRF，默认关）：纯重排会「救一批、打掉一批」——把融合序本来排第 1 的
 # 目标重排到前 5 之外（A9 实测 8b027120：融合 1 → 重排 19），而融合序又有它自己的
@@ -1657,6 +1662,7 @@ def rerank_status() -> Dict[str, Any]:
     return {"enabled": _RERANK_ON, "url": _RERANK_URL, "ok": _RERANK_STATUS["ok"],
             "reason": _RERANK_STATUS["reason"], "detail": _RERANK_STATUS["detail"],
             "ts": _RERANK_STATUS["ts"], "pool": _RERANK_POOL,
+            "pool_anchor": _RERANK_POOL_ANCHOR,
             "blend": {"w_rk": _BLEND_W_RK, "w_fu": _BLEND_W_FU,
                       "k": _BLEND_K, "head": _BLEND_HEAD},
             "vram_free_mib": free, "vram_min": _RERANK_VRAM_MIN,
@@ -1826,7 +1832,10 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
     fm_on = os.environ.get("BOSHI_FIELD_MATCH", "1") == "1"
     pool_k = int(top_k) * max(1, _FM_POOL) if fm_on else int(top_k)
     if _RERANK_ON:                     # 重排要看见更深一层的候选，否则只能重排已进榜的
-        pool_k = max(int(pool_k), _RERANK_POOL)
+        # 池深按查询形态分档（见 _RERANK_POOL_ANCHOR 注释）：带锚点 40 更准也更快，
+        # 纯中文 100 才有改写型需要的那层深度。
+        _rp = _RERANK_POOL_ANCHOR if (_RERANK_POOL_ANCHOR > 0 and _has_anchor(query)) else _RERANK_POOL
+        pool_k = max(int(pool_k), _rp)
     k_each = int(min(max(int(top_k) * 4, 20), 100))
     # kw 通道候选数与 top_k 解耦（见 _KW_POOL_CAP 注释：池污染导致「要得多反而更差」）
     k_kw = min(k_each, _KW_POOL_CAP) if _KW_POOL_CAP > 0 else k_each

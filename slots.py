@@ -308,11 +308,15 @@ def _versions(text: str) -> List[str]:
                 # 裸 4 段且每节都是合法 IP 节 → 语法上与 IP 无法区分，只认版本语境
                 if _PRIVATE_IP.match(tok):
                     continue
-                win = ctx + after
-                if any(w in win for w in _IP_CTX):
-                    continue
-                if not (any(w in win for w in _VER4_CTX) or _VER4_CTX_RE.search(win)):
-                    continue
+                # 前置语境里已有「版本/升级/回滚」这类硬证据 → 直接收，不再看后文。
+                # 否则「版本 0.1.44.1，端口 8188」会被后文的「端口」误判成 IP 而整条丢掉
+                # （2026-10-21 doctor 自检发现；这句话正是本库最常见的版本+端口同句写法）。
+                if not (any(w in ctx for w in _VER4_CTX) or _VER4_CTX_RE.search(ctx)):
+                    win = ctx + after
+                    if any(w in win for w in _IP_CTX):
+                        continue
+                    if not (any(w in win for w in _VER4_CTX) or _VER4_CTX_RE.search(win)):
+                        continue
             found.append((s, tok))
     found.sort()
     return [t for _, t in found]

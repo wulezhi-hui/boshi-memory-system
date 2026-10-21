@@ -352,6 +352,18 @@ def cmd_brief(args):
     _fmt_profile(result)
 
 
+def cmd_doctor(args):
+    """体检入口：直接把 doctor.main 的退出码透出去（cron/脚本可直接判成败）。"""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import doctor
+    argv = []
+    if getattr(args, "fast", False):
+        argv.append("--fast")
+    if getattr(args, "fix_ts", False):
+        argv.append("--fix-ts")
+    sys.exit(doctor.main(argv))
+
+
 # ═══════════════════════════════════════════
 # CLI 入口
 # ═══════════════════════════════════════════
@@ -481,6 +493,12 @@ def main():
     # brief
     p_brief = subparsers.add_parser("brief", help="会话简报")
     p_brief.set_defaults(func=cmd_brief)
+
+    # doctor
+    p_doc = subparsers.add_parser("doctor", help="体检：看清哪一环在静默降级")
+    p_doc.add_argument("--fast", action="store_true", help="跳过真实检索自检")
+    p_doc.add_argument("--fix-ts", action="store_true", help="回填 created_at 为空的历史行")
+    p_doc.set_defaults(func=cmd_doctor)
 
     args = parser.parse_args()
     if not args.command:

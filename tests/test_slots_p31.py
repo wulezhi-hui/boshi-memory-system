@@ -126,5 +126,25 @@ class TestVerbatimInvariant(unittest.TestCase):
                 self.assertIn(v, text, f"{key} 的值不是原文子串: {v!r}")
 
 
+class TestBareVer4(unittest.TestCase):
+    """裸 4 段版本号 vs 私有 IP：曾经「端口」把版本误判成 IP 整条丢掉（2026-10-21 修）。"""
+
+    def test_版本后紧跟端口时仍收版本(self):
+        out = slots.extract("版本 0.1.44.1，端口 8188 在跑。")
+        self.assertEqual(out["versions"], ["0.1.44.1"])
+
+    def test_私有IP不被当版本(self):
+        for s in ("服务监听 172.16.0.219，端口 5432。",
+                  "主机 192.168.1.10 上跑的。",
+                  "网段 172.16.0.0/16 里。",
+                  "IP 10.0.0.5 那台。"):
+            with self.subTest(s=s):
+                self.assertEqual(slots.extract(s)["versions"], [], s)
+
+    def test_版本与IP同句只收版本(self):
+        out = slots.extract("版本 1.2.3.4 跑在 172.16.0.219 上。")
+        self.assertEqual(out["versions"], ["1.2.3.4"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
