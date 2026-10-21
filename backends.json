@@ -1,15 +1,7 @@
 {
-  "_comment": "按 profile 指定存储后端。键 = profile 名（由 BOSHI_PROFILE 或 HERMES_HOME 推导），\"*\" = 通配键。值：chroma | pg。环境变量 BOSHI_BACKEND 优先级最高（覆盖本文件）。",
-  "_profiles": "default = Hermes 主身（当前对话）；opencode / dsh / desktop / zuojia / dashi / shizhen = 各接入方",
-  "_switch": "改这一个文件即完成按接入方切换；**进程重启后生效**（后端在 import 时解析）。未列出的 profile 走 \"*\"。",
-  "_note": "接入方切换要两头一致：这里改成 pg 的同时，接入方也可以（可选）在自己的 MCP/插件 env 里显式写 BOSHI_BACKEND=pg；env 优先。",
-  "_rule": "2026-10-19 定稿：所有 profile 一律 pg（含 \"*\" 通配）——全量记忆必须在 PG 里有一份，不再有\"某入口只写 Chroma\"的分叉。chroma 仅作历史备份与回滚用。",
-  "default": "pg",
-  "dsh": "pg",
-  "opencode": "pg",
-  "desktop": "pg",
-  "zuojia": "pg",
-  "dashi": "pg",
-  "shizhen": "pg",
-  "*": "pg"
+  "_comment": "存储后端例外表。默认值不在这里，在 chroma_bridge._resolve_backend() 代码里 = pg。",
+  "_profiles": "default = Hermes 主身；opencode / dsh / desktop / zuojia / dashi / shizhen = 各接入方",
+  "_switch": "只填**例外**：给某 profile 写 \"chroma\" 才切回它，\"*\" 是通配键。留空 = 全部走代码默认 pg。进程重启后生效。",
+  "_note": "接入方如需自己指定，可在自己的 MCP/插件 env 里写 BOSHI_BACKEND（env 优先级最高）。",
+  "_rule": "2026-10-19 定稿：读写记忆全部落 PG；Chroma 只作 Hermes 自带的历史全量库，不写入、不回补、不参与读写。默认值刻意写在代码里——本文件会被重装/升级重置，一旦回落 chroma 就是静默丢记忆（没人会收到通知）。"
 }
