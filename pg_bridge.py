@@ -1507,6 +1507,100 @@ def _time_bounds(since=None, until=None) -> tuple:
     return " AND ".join(parts), ps
 
 
+# ── E 方案：交叉编码器重排（2026-10-21）────────────────────────────────
+# 动机：A9 paraphrase 的缺口在**排序**不在召回——union 池里已经有 gold，融合分被
+# bigram/余弦噪声压住。本机 BuddhistRAG 早配好了 bge-reranker-v2-m3-FP16.gguf
+# （D:/llama/models/，llama.cpp --rerank 独立实例 11437），直接复用做第二段排序，
+# 零下载、零训练、零标注。不引入新模型文件，只是把已有的重排器接进记忆召回。
+#
+# 实测（2026-10-21，A9 40 条 + A5 35 条，top1/top3/top5）：
+#   A9-overlap    10/15/18 → 13/17/18
+#   A9-paraphrase  4/ 5/ 8 →  6/ 9/11
+#   A5            21/30/32 → 30/34/34
+# 延迟（20 候选，GPU，含 HTTP 往返）p50 769ms / p90 1105ms。
+# 默认开；端点不可达/超时一律静默降级回融合序（增强项绝不能伤主链路）。
+_RERANK_ON = os.environ.get("BOSHI_RERANK", "1") == "1"
+_RERANK_URL = os.environ.get("BOSHI_RERANK_URL", "http://127.0.0.1:11437/rerank")
+_RERANK_MODEL = os.environ.get("BOSHI_RERANK_MODEL", "bge-reranker-v2-m3")
+_RERANK_POOL = int(os.environ.get("BOSHI_RERANK_POOL", "15"))
+_RERANK_CHARS = int(os.environ.get("BOSHI_RERANK_CHARS", "700"))
+_RERANK_CHUNK = int(os.environ.get("BOSHI_RERANK_CHUNK", "2200"))
+_RERANK_TIMEOUT = float(os.environ.get("BOSHI_RERANK_TIMEOUT", "8"))
+# 连接超时必须单独压到亚秒级：本机实测「连一个没人听的 127.0.0.1 端口」要 2.0s 才拒绝
+# （Windows 的 SYN 重试），不设 connect 超时的话降级路径每次要多花 2 秒。
+_RERANK_CONNECT_TIMEOUT = float(os.environ.get("BOSHI_RERANK_CONNECT_TIMEOUT", "0.35"))
+_RERANK_COOLDOWN = float(os.environ.get("BOSHI_RERANK_COOLDOWN", "60"))
+_RERANK_DOWN_UNTIL = [0.0]        # 熔断：失败后静默 N 秒，避免每次都付连接代价
+
+
+def _rerank_items(query: str, items: list, top_k: int) -> list:
+    """用本地 bge-reranker 重排候选池，返回新的前 top_k 条（score 同步改写）。
+
+    - 分数方向：llama.cpp /rerank 返回负 logit（越大越相关）；本库 score 是
+      距离语义（越小越前），所以统一映射成 score = 1 - sigmoid(logit)，
+      既保住「升序=好」的既有约定，又让展示相似度与重排概率对齐。
+    - 分批：一次请求把多对 query-doc 塞进同一 batch，ubatch 4096 会报
+      "input too large to process"，所以按字符预算切块（中文≈1 char/token）。
+    - 任何失败 → 原序返回，不抛异常。
+    """
+    items = list(items)
+    k = int(top_k)
+    if len(items) < 2 or not (query or "").strip():
+        return items[:k]
+    if time.time() < _RERANK_DOWN_UNTIL[0]:      # 熔断中：直接走融合序
+        return items[:k]
+    try:
+        import math
+        import requests
+    except Exception:
+        return items[:k]
+
+    texts = [(it.get("content") or it.get("document") or "")[:_RERANK_CHARS]
+             for it in items]
+    scores = {}
+    buf, bidx = [], []
+
+    def _flush():
+        if not buf:
+            return True
+        resp = requests.post(_RERANK_URL,
+                             timeout=(_RERANK_CONNECT_TIMEOUT, _RERANK_TIMEOUT),
+                             json={"model": _RERANK_MODEL, "query": query,
+                                   "documents": list(buf)})
+        resp.raise_for_status()
+        for rr in resp.json().get("results", []):
+            scores[bidx[int(rr["index"])]] = float(rr.get("relevance_score") or 0.0)
+        del buf[:], bidx[:]
+        return True
+
+    try:
+        for i, t in enumerate(texts):
+            if buf and sum(len(x) for x in buf) + len(t) > _RERANK_CHUNK:
+                _flush()
+            buf.append(t)
+            bidx.append(i)
+        _flush()
+    except Exception:                 # 端点没起 / 超时 / 500：静默退回融合序 + 熔断
+        _RERANK_DOWN_UNTIL[0] = time.time() + _RERANK_COOLDOWN
+        return items[:k]
+
+    if len(scores) < len(items):      # 有候选没拿到分（截断/异常）→ 不敢用半套排序
+        return items[:k]
+
+    for i, it in enumerate(items):
+        lg = scores[i]
+        p = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, lg))))
+        # 落回库里惯用的 0.7~1.0 伪距离区间（与 RRF 融合同一约定）：score=1-(0.6+0.4p)。
+        # 直接写 1-p 会把量纲压到 0~0.05，和 include_graph 并进来的余弦距离不可比。
+        it["score"] = round(1.0 - (0.60 + 0.40 * p), 6)
+        md = it.get("metadata")
+        if isinstance(md, dict):
+            md["rerank_score"] = round(lg, 4)
+    items.sort(key=lambda x: x["score"])     # 升序（距离语义）＝重排分从高到低
+    return items[:k]
+
+
+
 def search_memory(query: str, top_k: int = 5, where: dict = None,
                   all_versions: bool = False, include_graph: bool = False,
                   scope: str = None, me: str = None, fusion: str = None,
@@ -1531,6 +1625,8 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
     # P2+：字段级匹配要在 top_k 之外还能看见候选（否则只能重排已进榜的几条）
     fm_on = os.environ.get("BOSHI_FIELD_MATCH", "1") == "1"
     pool_k = int(top_k) * max(1, _FM_POOL) if fm_on else int(top_k)
+    if _RERANK_ON:                     # 重排要看见更深一层的候选，否则只能重排已进榜的
+        pool_k = max(int(pool_k), _RERANK_POOL)
     k_each = int(min(max(int(top_k) * 4, 20), 100))
     # kw 通道候选数与 top_k 解耦（见 _KW_POOL_CAP 注释：池污染导致「要得多反而更差」）
     k_kw = min(k_each, _KW_POOL_CAP) if _KW_POOL_CAP > 0 else k_each
@@ -1567,11 +1663,18 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
                 items = _score_merge(vec_items, kw_items, pool_k, query=query)
 
     # P2+ 字段级匹配（默认关；命中查询字面字段时抬升同字段候选）
+    _cand_k = int(pool_k) if _RERANK_ON else int(top_k)
     if fm_on:
         try:
-            items = _field_match(c, query, list(items), top_k)
+            items = _field_match(c, query, list(items), _cand_k)
         except Exception:            # 增强项，坏了退回融合排序
-            items = items[:int(top_k)]
+            items = list(items)[:_cand_k]
+    else:
+        items = list(items)[:_cand_k]
+
+    # E 方案：交叉编码器重排（默认开；端点不可达自动降级回融合序）
+    if _RERANK_ON:
+        items = _rerank_items(query, items, top_k)
     else:
         items = items[:int(top_k)]
 
