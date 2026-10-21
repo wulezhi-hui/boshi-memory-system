@@ -154,7 +154,7 @@ class KwAbsAllTest(unittest.TestCase):
 
 
 class KwRelBlendTest(unittest.TestCase):
-    """弱证据下掺入关键词通道相对分（2026-10-23，§11.23）。
+    """弱证据下掺入关键词通道相对分（2026-10-21，§11.23）。
 
     病灶：`_score_merge` 只读 kw_abs。改写式 query 的 gold 常只对上两三个
     bigram（kw_abs 低），但它在关键词通道里是第 1 名——绝对分把它埋掉。
@@ -180,6 +180,13 @@ class KwRelBlendTest(unittest.TestCase):
 
     def test_off_by_default_keeps_abs_order(self):
         self.assertEqual(pg_bridge._score_merge([], self.items(), 5)[0]["id"], "abstop")
+
+    @unittest.skipIf("BOSHI_KW_REL_BLEND" in os.environ,
+                     "环境里显式设了 BOSHI_KW_REL_BLEND，跳过默认值断言")
+    def test_module_default_is_04(self):
+        # 交付口径（2026-10-21）：默认开 0.4 —— 4 个 ASOF 快照上 paraphrase
+        # top5 全 +2、零退化，见 §11.23 与 scratch/a9_b_stability.py
+        self.assertEqual(self._old, 0.4)
 
     def test_on_promotes_channel_leader(self):
         pg_bridge._KW_REL_BLEND = 1.0
