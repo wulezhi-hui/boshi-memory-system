@@ -1095,7 +1095,7 @@ _PUBLIC_API = (
     "edit_memory", "export_snapshot", "export_markdown", "restore_snapshot",
     "fact_chain",
     # 认知层（2026-10-21 P2 ④）：心智模型预计算页
-    "get_mental_model", "rebuild_mental_model",
+    "get_mental_model", "rebuild_mental_model", "prune_mental_model",
 )
 
 if BACKEND == "pg":

@@ -16,6 +16,8 @@ HERE = r"C:/Users/wulezhi/.boshi"
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "eval"))
 os.chdir(HERE)
+# 与 a9_eval 同：评测流量不进线上 fm_stats 打点。
+os.environ.setdefault("BOSHI_FM_STATS", "0")
 import pg_bridge
 
 # (query, gold_id8, 该 gold 必须包含的锚串——防止 gold 记错)

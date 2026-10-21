@@ -89,10 +89,12 @@ class BackendApiTest(unittest.TestCase):
     def test_implemented(self):
         self.assertTrue(callable(getattr(pg_bridge, "get_mental_model", None)))
         self.assertTrue(callable(getattr(pg_bridge, "rebuild_mental_model", None)))
+        self.assertTrue(callable(getattr(pg_bridge, "prune_mental_model", None)))
 
     def test_public_api(self):
         self.assertIn("get_mental_model", chroma_bridge._PUBLIC_API)
         self.assertIn("rebuild_mental_model", chroma_bridge._PUBLIC_API)
+        self.assertIn("prune_mental_model", chroma_bridge._PUBLIC_API)
 
     def test_signature(self):
         sig = inspect.signature(pg_bridge.get_mental_model)
@@ -131,8 +133,60 @@ class CliTest(unittest.TestCase):
                             "model", "--help"], capture_output=True, text=True,
                            cwd=HERE, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr[-400:])
-        for flag in ("--show", "--rebuild", "--key", "--scope"):
+        for flag in ("--show", "--rebuild", "--key", "--scope",
+                     "--prune", "--prune-apply", "--keep"):
             self.assertIn(flag, r.stdout)
+
+
+class PruneTest(unittest.TestCase):
+    """页面旧版清理：只动派生态，默认只统计不删。"""
+
+    def test_keep_versions(self):
+        self.assertEqual(mental_model.KEEP_VERSIONS, 8)
+
+    def test_dry_run_default(self):
+        sig = inspect.signature(mental_model.prune_pages)
+        self.assertIs(sig.parameters["dry_run"].default, True)
+        sig2 = inspect.signature(pg_bridge.prune_mental_model)
+        self.assertIs(sig2.parameters["dry_run"].default, True)
+
+    def test_only_non_latest_deleted(self):
+        src = inspect.getsource(mental_model.prune_pages)
+        self.assertIn("is_latest = false", src)
+        self.assertIn("is_latest DESC", src)
+
+    def test_dry_run_no_delete(self):
+        src = inspect.getsource(mental_model.prune_pages)
+        # DELETE 只能在 not dry_run 分支之后
+        self.assertLess(src.index("not dry_run"), src.index("DELETE"))
+        self.assertIn("if rows and not dry_run:", src)
+
+    def test_core_wrapper(self):
+        self.assertTrue(callable(getattr(boshi_core, "prune_mental_model", None)))
+
+
+class SavePageTest(unittest.TestCase):
+    def test_content_dedupe(self):
+        """24h 定时重建：内容没变就不落库，否则每天白多 4~5 行派生态。"""
+        src = inspect.getsource(mental_model.save_page)
+        self.assertIn("内容未变", src)
+        self.assertIn("rows[0][1]", src)
+
+    def test_keeps_old_versions(self):
+        src = inspect.getsource(mental_model.save_page)
+        self.assertIn("is_latest = false", src)
+
+
+class EvalHygieneTest(unittest.TestCase):
+    def test_fm_stats_disabled_in_evals(self):
+        """评测用例不能污染 boshi.fm_stats（否则 _FM_W 权重永远估不准）。"""
+        for name in ("a9_eval.py", "a5_eval.py"):
+            with open(os.path.join(HERE, "eval", name), encoding="utf-8") as f:
+                src = f.read()
+            self.assertIn('BOSHI_FM_STATS', src, name)
+            self.assertIn('"0"', src, name)
+            idx_env = src.index("BOSHI_FM_STATS")
+            self.assertLess(idx_env, src.index("import pg_bridge"), name)
 
 
 class McpTest(unittest.TestCase):

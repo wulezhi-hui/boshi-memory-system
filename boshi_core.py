@@ -334,6 +334,18 @@ def rebuild_mental_model(profile: str = None, keys: list = None,
     return r
 
 
+def prune_mental_model(profile: str = None, keep: int = None,
+                       dry_run: bool = True) -> dict:
+    """清理心智模型页旧版（派生态，可重算；默认只统计不删）。"""
+    cb = _get_chroma()
+    fn = getattr(cb, "prune_mental_model", None)
+    if fn is None:
+        return {"success": False, "error": "当前后端不支持心智模型页"}
+    r = fn(profile=profile, keep=keep, dry_run=dry_run)
+    r["success"] = True
+    return r
+
+
 def status() -> dict:
     """
     记忆库状态总览。

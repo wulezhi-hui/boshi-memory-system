@@ -17,6 +17,9 @@ HERE = r"C:/Users/wulezhi/.boshi"
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "eval"))
 os.chdir(HERE)
+# 评测不是线上流量：默认关掉 fm_stats 打点，否则几十条用例会把
+# boshi.fm_stats 灌成「versions 字段 252 queries」，让真实流量彻底不可读。
+os.environ.setdefault("BOSHI_FM_STATS", "0")
 import pg_bridge
 from cases_a9 import CASES
 

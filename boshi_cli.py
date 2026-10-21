@@ -38,7 +38,7 @@ from boshi_core import (
     graph_query, graph_add_node, graph_add_edge,
     recent, brief, edit, export_snapshot, export_markdown, restore_snapshot,
     fact_chain, detect_conflicts,
-    get_mental_model, rebuild_mental_model,
+    get_mental_model, rebuild_mental_model, prune_mental_model,
 )
 
 
@@ -272,8 +272,25 @@ def cmd_conflicts(args):
 
 
 def cmd_model(args):
-    """打印 / 重建心智模型预计算页。"""
+    """打印 / 重建 / 清理心智模型预计算页。"""
     scope = args.scope or "self"
+    if getattr(args, "prune", False) or getattr(args, "prune_apply", False):
+        apply = bool(getattr(args, "prune_apply", False))
+        r = prune_mental_model(keep=getattr(args, "keep", None), dry_run=not apply)
+        if not r.get("success", True):
+            print(f"❌ {r.get('error')}")
+            return
+        total = sum((r.get("pages") or {}).values())
+        if not total:
+            print(f"✅ 无需清理（keep={r.get('keep')}，每页版本都在上限内）")
+        else:
+            detail = "  ".join(f"{k}:{v}" for k, v in sorted(r["pages"].items()))
+            print(f"{'🗑 已删' if apply else '👀 可删'} {total} 行旧版（keep={r.get('keep')}） profile={r.get('profile')}")
+            print(f"   分布：{detail}")
+            if not apply:
+                print("   确认无误后执行 `boshi model --prune-apply` 真正删除")
+        if not args.rebuild and not args.show:
+            return
     if args.rebuild:
         keys = [args.key] if args.key else None
         r = rebuild_mental_model(keys=keys, scope=scope)
@@ -420,6 +437,12 @@ def main():
                          help="只重建某一页：identity/env/active_projects/pitfalls/open_threads")
     p_model.add_argument("--scope", default="self", choices=["self", "all"],
                          help="self=只看本 profile（默认）；all=全库")
+    p_model.add_argument("--prune", action="store_true",
+                         help="统计可清理的旧版页（只读，不删）")
+    p_model.add_argument("--prune-apply", action="store_true",
+                         help="真正删除超出 keep 的旧版页（派生态，可重算）")
+    p_model.add_argument("--keep", type=int, default=None,
+                         help="每页保留版本数（默认 8）")
     p_model.set_defaults(func=cmd_model)
 
     # status

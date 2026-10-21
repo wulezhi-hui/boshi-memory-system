@@ -2244,3 +2244,11 @@ def rebuild_mental_model(profile: str = None, keys: list = None,
     """重算并落库（零模型：每条都是记忆原文片段/槽位原值）。"""
     import mental_model as mm
     return mm.rebuild(profile or _resolve_profile(), keys, scope)
+
+
+def prune_mental_model(profile: str = None, keep: int = None,
+                       dry_run: bool = True) -> dict:
+    """清理页面旧版（派生态）。默认 dry_run，删除需显式 dry_run=False。"""
+    import mental_model as mm
+    return mm.prune_pages(keep or mm.KEEP_VERSIONS,
+                          profile or _resolve_profile(), dry_run)
