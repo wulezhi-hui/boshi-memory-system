@@ -233,7 +233,9 @@ class TestFindEdgeDedup(unittest.TestCase):
         self.assertEqual(got, "edge-1")
         sql, params = self.sink[-1]
         self.assertEqual(params, ["a", "b", "引用", "related"])
-        self.assertIn("relation = %s", sql)
+        # 匹配对象必须是读侧兜底表达式，否则空 relation 列的历史边不参与去重
+        self.assertIn(pb._EDGE_REL_EXPR, sql)
+        self.assertNotIn("AND (relation = %s", sql)
         self.assertIn("LIMIT 1", sql)
 
     def test_no_raw_uses_normalized_case(self):
@@ -241,7 +243,15 @@ class TestFindEdgeDedup(unittest.TestCase):
         self.assertEqual(pb.find_edge("a", "b", "related", None), "")
         sql, params = self.sink[-1]
         self.assertEqual(params, ["a", "b", "related"])
-        self.assertIn("CASE WHEN relation IN", sql)
+        self.assertIn("CASE WHEN " + pb._EDGE_REL_EXPR + " IN", sql)
+
+    def test_matches_edge_with_empty_relation_column(self):
+        """列空 + content 带 `--[引用]-->` 的边（长驻旧模块写的）也要能匹配上。"""
+        self.rows = [("edge-empty",)]
+        got = pb.find_edge("a", "b", "related", "引用")
+        self.assertEqual(got, "edge-empty")
+        sql, _ = self.sink[-1]
+        self.assertIn("substring(content from", sql)
 
     def test_error_returns_empty(self):
         def boom():

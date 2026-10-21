@@ -2656,18 +2656,23 @@ def find_edge(entity_a: str, entity_b: str, relation_norm: str = None,
     关系比较口径：**原串优先**。relation 列存的是原串，只有当归一值相同时才算同一条边；
     否则「引用」和「不同关系」都会被归一成 related 而互相顶掉（实测会少写边）。
     4 类标准关系的原串 == 归一值，两种比较等价。
+
+    2026-10-22：比较对象从 `relation` 列改为 `_EDGE_REL_EXPR`（列空则从 content 解析）。
+    否则读侧兜底不对去重生效——长驻旧模块写出的空 relation 边读出来是原串、却永远匹配不上，
+    同一实体对会被反复写入（实测该缺口下空 relation 边持续增长）。
     """
     try:
         c = _conn()
+        rel = _EDGE_REL_EXPR
         sql = "SELECT id FROM boshi.graph_edges WHERE entity_a = %s AND entity_b = %s"
         ps = [entity_a, entity_b]
         if relation_raw:
-            sql += (" AND (relation = %s OR (relation IN ('updates','extends','derives','related')"
-                    " AND relation = %s))")
+            sql += (" AND (" + rel + " = %s OR (" + rel + " IN ('updates','extends','derives','related')"
+                    " AND " + rel + " = %s))")
             ps += [relation_raw, relation_norm or relation_raw]
         elif relation_norm:
-            sql += (" AND (CASE WHEN relation IN ('updates','extends','derives','related')"
-                    " THEN relation ELSE 'related' END) = %s")
+            sql += (" AND (CASE WHEN " + rel + " IN ('updates','extends','derives','related')"
+                    " THEN " + rel + " ELSE 'related' END) = %s")
             ps.append(relation_norm)
         sql += " LIMIT 1"
         with c.cursor() as cur:
