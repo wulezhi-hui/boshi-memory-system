@@ -39,6 +39,7 @@ if BOSHI_HOME not in sys.path:
     sys.path.insert(0, BOSHI_HOME)
 
 from boshi_core import (
+    __version__,
     search, save, delete, status, profile,
     graph_query, graph_add_node, graph_add_edge,
     recent, time_range,
@@ -180,7 +181,7 @@ def _audit(tool: str, identity: Optional[str], scope=None, query: str = "",
 
 def create_server():
     """创建 mcp 2.0 MCPServer，注册全部 10 个工具。"""
-    server = MCPServer("boshi-memory", version="6.1.0",
+    server = MCPServer("boshi-memory", version=__version__,
                        instructions=SERVER_INSTRUCTIONS)
 
     @server.tool(

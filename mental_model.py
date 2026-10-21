@@ -197,17 +197,77 @@ def _page_pitfalls(cur, prof: str = None, scope: str = "self") -> List[Dict[str,
     return _dedupe(items, key_len=36)[:6]
 
 
+# ── 未了事项页的质量门（2026-10-21）──
+# 全部是字面/形态判断，不调模型（与"不用模型生成内容"铁律一致）。
+_OPEN_TASK_KW = ("待办", "待定", "待你", "待确认", "待补", "TODO", "下一步", "还需",
+                 "还在等", "还没", "尚未", "未完成", "未开工", "未合并", "未解决",
+                 "需要确认", "需要你", "等你", "需要补")
+_OPEN_CLOSED_KW = ("正式关闭", "这项关闭", "已关闭", "不需要改", "无需再改", "已推送",
+                   "已合并", "作废", "不用了")
+_OPEN_META_KW = ("你还没选", "你没有选", "什么都没动", "什么都不动", "什么都不改",
+                 "一个字都还没", "等你回来", "等你召唤", "等我召唤", "等你放行")
+_OPEN_LEAD_DROP = ("没有", "不是", "无法")
+# 强待办词：agent/用户把活儿明确挂在某处才会这么写。只有强信号才允许长句（带上下文说明）；
+# 仅靠「还没/尚未」这类弱信号的长句基本是讨论/总结（实测反例：《从 RAG 走向 LLM Wiki…》读书笔记）。
+_OPEN_STRONG_KW = ("待你", "等你", "待办", "待定", "待确认", "TODO", "下一步", "需要你",
+                   "还需", "未开工", "未合并", "未解决",
+                   "未完成", "尚未完成", "需要确认", "需要补")
+_OPEN_WEAK_MAX = 60
+
+
+def _open_thread_ok(text: str, topic: str = "") -> bool:
+    """这条 open question 够不够格进「未了事项」页（规则见 _page_open_threads 文档串）。"""
+    t = _clean(text)
+    if any(k in t for k in _OPEN_CLOSED_KW) or any(k in t for k in _OPEN_META_KW):
+        return False
+    if t.startswith(_OPEN_LEAD_DROP):
+        return False
+    has_q = ("?" in t) or ("？" in t)
+    # 用户原话：只有提问才算未了；陈述（"暂停，…等我召唤"）是状态播报
+    if topic == "conversation" and not has_q:
+        return False
+    return has_q or any(k in t for k in _OPEN_TASK_KW)
+
+
+def _open_thread_rank(text: str, topic: str = "") -> int:
+    """排序/裁剪用的分档：0=强待办，1=弱信号，2=丢弃。
+
+    弱信号（只有「还没/尚未」这类字面）本身就不可靠：实测反例是一条读书笔记
+    「这篇《从 RAG 走向 LLM Wiki 的 4 阶段》…区分我们真做到了的和还没做到的」，
+    命中「还没做」。所以弱信号只留短句（短句多是「某服务还没挂自启」这种真待办），
+    长句一律当讨论/总结丢掉。
+    """
+    if not _open_thread_ok(text, topic):
+        return 2
+    if any(k in text for k in _OPEN_STRONG_KW):
+        return 0
+    return 1 if len(text) <= _OPEN_WEAK_MAX else 2
+
+
 def _page_open_threads(cur, prof: str = None, scope: str = "self") -> List[Dict[str, Any]]:
-    """未了事项：槽位 open_questions 里近 21 天的条目（每条取第一个问题）。"""
+    """未了事项：槽位 open_questions 里近 21 天的条目（每条取第一个问题）。
+
+    质量门（2026-10-21 加）：本页以前的取数是「最近 25 条、每条取第一项」，
+    没有任何判据，于是最新的一条垃圾稳居第一行。实测 top1 是用户原话
+    「暂停，目前伯仕记忆系统升级尚未完成，并且工作日志和技术文档也还没写入，
+    等我召唤你再继续」——上游 `slots.py` 的 OPEN_Q 是纯字面命中（待/还没/下一步…），
+    陈述句也会被抽成 open question。这里按形态过滤，不调模型：
+
+      a) `topic='conversation'`（用户原话）必须带问号：用户提问才是真未了，用户陈述不是；
+      b) 必须含任务标记（待你/还没/下一步/…）：完成播报（"v3片头剪52帧已落地…"）不进本页；
+      c) 已声明收尾的丢掉（正式关闭/不需要改/已推送）；
+      d) 对话元语言丢掉（"你还没选"/"等你回来"/"什么都不动"）——那是 agent 的状态播报；
+      e) 断言式开头（"没有…"/"不是…"）丢掉，这类极少是待办。
+    """
     pc, pp = _prof_clause(scope, prof)
     rows = _rows(cur, """
-        SELECT id::text, slots->'open_questions' AS q FROM boshi.memories
+        SELECT id::text, topic, slots->'open_questions' AS q FROM boshi.memories
          WHERE %sis_latest
            AND slots->'open_questions' <> '[]'::jsonb
            AND created_at > now() - interval '21 days'
-         ORDER BY created_at DESC NULLS LAST LIMIT 25""" % pc, pp)
+         ORDER BY created_at DESC NULLS LAST LIMIT 40""" % pc, pp)
     items = []
-    for i, q in rows:
+    for i, topic, q in rows:
         if isinstance(q, str):
             try:
                 q = json.loads(q)
@@ -216,9 +276,21 @@ def _page_open_threads(cur, prof: str = None, scope: str = "self") -> List[Dict[
         if not isinstance(q, list):
             continue
         for one in q[:1]:
-            one = re.sub(r"^[-*\s]+", "", str(one))       # 槽位里带过 "- " / "**" 开头
-            if _worth(one, 10):
-                items.append({"text": one, "evidence": [i]})
+            one = str(one)
+            one = re.sub(r"\*\*(.+?)\*\*", r"\1", one)         # 成对 `**` 是原文强调，先剥掉再判形态
+            one = re.sub(r"^[-*•\s]+", "", one).strip()       # 槽位里带过 "- " / "**" 开头
+            one = one.rstrip("；;，,、 ")                        # 切句残留的尾部分隔符
+            if len(one) < 2:
+                continue
+            if not _worth(one, 15):
+                continue
+            rank = _open_thread_rank(one, topic)
+            if rank == 2:
+                continue
+            items.append({"text": one, "evidence": [i], "_rank": rank})
+    items.sort(key=lambda x: x["_rank"])       # 稳定排序：强待办在前，各自保持时间倒序
+    for it in items:
+        it.pop("_rank", None)
     return _dedupe(items, key_len=36)[:6]
 
 

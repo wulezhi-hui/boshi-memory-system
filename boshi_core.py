@@ -11,6 +11,11 @@ import re
 import time
 from datetime import datetime, timezone
 
+# ── 版本唯一源 ──
+# 此前 status()/MCP 握手各写各的（"6.0" / "6.1.0"），memory/VERSION 还留着 "5.4.0"，
+# 三处互相打架。文档正本为 v7.1，故以这里为唯一口径，其余全部引用本常量。
+__version__ = "7.1"
+
 # ── 路径配置 ──
 BOSHI_HOME = os.path.expanduser("~/.boshi")
 MEMORY_DIR = os.path.join(BOSHI_HOME, "memory")
@@ -375,7 +380,7 @@ def status() -> dict:
         pass
     return {
         "service": "boshi-memory",
-        "version": "6.0",
+        "version": __version__,
         "total_memories": total,
         "knowledge_graph": kg_info,
         "backend": backend,

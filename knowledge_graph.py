@@ -14,6 +14,7 @@
     from knowledge_graph import add_relation, get_relations, trace_version_chain, merge_duplicates
 """
 
+import re
 import time
 import uuid
 import logging
@@ -53,6 +54,50 @@ _KEEP_ACRONYMS = {
     "INT8", "FP16", "FP32", "BF16", "FP8", "INT4", "CUDA", "NVLink", "HDR",
     "FPS", "IT", "IOT", "CDN", "DNS", "TCP", "UDP", "IP", "LAN", "WAN",
 }
+
+
+# ── 中文实体的形态门槛（2026-10-21）─────────────────────────────
+# 背景：中文后缀规则（*系统/模型/库/站…）历史上允许「任意 2~6 个汉字」当前缀，
+# 于是把句子片段当实体抽了出来。全库实测（graph_edges，2026-10-21）：
+#   7,505 个不同实体，18.7% 含虚词/助词字；2,447 条后缀式实体里 1,395 条（57%）
+#   是「进了记忆库」「只有记忆库」「今天给记忆库」「一个没在线的模型」这类碎片。
+# 处置：写入侧（learn_entities）拒绝抽取，读取侧（search/query）跳过，
+#       存量数据不动（可逆、不删边）。
+_ENT_FUNC_CHARS = set("的了是和把被让给这那它我你他她它们不就也还很太更再又只才已"
+                      "个些各每此其之与及吗呢吧啊么")
+_ENT_NOISE_LEAD = ("进了", "只有", "已经", "还有", "就是", "不是", "可以", "需要",
+                   "应该", "因为", "所以", "但是", "如果", "虽然", "只是", "正在",
+                   "一直", "一个", "三个", "两个", "今天", "刚刚", "可能", "没有",
+                   "不要", "不用", "之后", "以前", "现在")
+_ENT_PUNCT_RE = re.compile(r"[，。、；：！？“”‘’（）《》\s]")
+_CJK_RE = re.compile(r"[\u4e00-\u9fa5]")
+# 人工确认的真实体一律放行（"乐之"含"之"，会被虚词表误伤——用户名绝不能判噪声）
+_ENT_WHITELIST = {"乐之", "伯仕", "伯仕记忆", "伯仕记忆系统", "俱舍论", "佛光大辞典"}
+
+
+def is_noise_entity(name: str) -> bool:
+    """实体名是否是中文句法碎片（不是专有名词）。
+
+    只判含汉字的实体：英文/型号类（MiniMax H3、RTX 3060 12GB、HTTP 200）由原有
+    英文过滤规则负责，本函数一律放行——否则它们的空格/数字会被误判成噪声。
+    汉字实体只做形态判断，不调模型：含虚词/助词字、含标点空格、或以虚词/动词开头。
+    """
+    n = (name or "").strip()
+    if not n:
+        return True
+    if not _CJK_RE.search(n):
+        return False
+    if n in _ENT_WHITELIST:
+        return False
+    if n in globals().get("KNOWN_ENTITIES", ()):      # 人工维护的实体表不判噪声
+        return False
+    if _ENT_PUNCT_RE.search(n):
+        return True
+    if any(ch in _ENT_FUNC_CHARS for ch in n):
+        return True
+    if n.startswith(_ENT_NOISE_LEAD):
+        return True
+    return False
 
 
 # ── 核心关系操作 ──────────────────────────────────────
@@ -552,6 +597,9 @@ class KnowledgeGraph:
                 a, b = meta.get("entity_a"), meta.get("entity_b")
                 if not a or not b:
                     continue
+                # 读取侧门槛（2026-10-21）：任一端是句法碎片就整条边不返回
+                if is_noise_entity(a) or is_noise_entity(b):
+                    continue
                 nodes.setdefault(a, {"id": a})
                 nodes.setdefault(b, {"id": b})
                 edges.append({
@@ -608,17 +656,20 @@ class KnowledgeGraph:
             q = (query or "").strip().lower()
             if not q:
                 # 无查询词时返回最热的实体（前 top_k 个）
-                names = list(entity_map.keys())[:top_k]
+                names = [n for n in entity_map.keys() if not is_noise_entity(n)][:top_k]
             else:
                 names = []
                 for name in entity_map:
                     nl = name.lower()
                     if q in nl or nl in q:
+                        # 读取侧门槛（2026-10-21）：存量里的碎片实体不再参与召回
+                        if is_noise_entity(name):
+                            continue
                         names.append(name)
                 # 已知实体兜底：KNOWN_ENTITIES 中命中的也算
                 for ent in KNOWN_ENTITIES:
                     if ent.lower() in q or q in ent.lower():
-                        if ent not in names:
+                        if ent not in names and not is_noise_entity(ent):
                             names.append(ent)
                 names = names[:top_k]
 
@@ -670,6 +721,9 @@ class KnowledgeGraph:
         # 要求：后缀词前面至少 2 个中文字，且不能是已有实体的子串
         for m in re.finditer(r"([\u4e00-\u9fa5]{2,6}(?:系统|模型|引擎|工具|库|站|平台|框架|项目|技能|插件))", text):
             cand = m.group(1)
+            # 形态门槛（2026-10-21）：拒绝句子碎片（进了记忆库/只有记忆库/一个没在线的模型）
+            if is_noise_entity(cand):
+                continue
             # 过滤：如果候选是某个已有实体（或已有实体是候选的子串）的子串，跳过
             is_substring = any(e in cand and e != cand for e in KNOWN_ENTITIES)
             if not is_substring:

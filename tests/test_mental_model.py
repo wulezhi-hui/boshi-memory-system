@@ -85,6 +85,43 @@ class HelperTest(unittest.TestCase):
                 os.environ["BOSHI_MENTAL_MODEL"] = old
 
 
+class OpenThreadGateTest(unittest.TestCase):
+    """未了事项页质量门（2026-10-21）：纯字面/形态判断，不调模型。"""
+
+    def test_user_statement_rejected(self):
+        # 实测 top1：用户原话「暂停，…等我召唤你再继续」是状态播报，不是未了事项
+        self.assertEqual(mental_model._open_thread_rank(
+            "暂停，目前伯仕记忆系统升级尚未完成，并且工作日志和技术文档也还没写入，等我召唤你再继续",
+            "conversation"), 2)
+
+    def test_user_question_kept(self):
+        self.assertNotEqual(mental_model._open_thread_rank(
+            "这个技能可以导出，还需要吗？", "conversation"), 2)
+
+    def test_completion_broadcast_rejected(self):
+        self.assertEqual(mental_model._open_thread_rank(
+            "v3片头剪52帧已落地，两仓都已提交，正式关闭。"), 2)
+
+    def test_meta_language_rejected(self):
+        self.assertEqual(mental_model._open_thread_rank(
+            "问询超时了，你还没选，等你回来再说。"), 2)
+
+    def test_weak_signal_long_discussion_rejected(self):
+        # 读书笔记命中「还没做到的」；弱信号 + 长句 = 讨论，不是待办
+        self.assertEqual(mental_model._open_thread_rank(
+            "这篇《从 RAG 走向 LLM Wiki 的 4 阶段》（嘉为蓝鲸，09-18）基本就是在描述"
+            "我们知识库在做的事——先给结论，再较真区分\"我们真做到了的\"和\"还没做到的\"。"), 2)
+
+    def test_strong_task_long_kept(self):
+        self.assertEqual(mental_model._open_thread_rank(
+            "另有两个小待办挂着：4 段版本号（`v` 前缀规则，收益 18 次）、"
+            "4 条 `created_at IS NULL`（时间窗会漏掉它们）——都等你点头才动。"), 0)
+
+    def test_weak_short_kept(self):
+        self.assertEqual(mental_model._open_thread_rank(
+            "精排服务重启电脑后要手动双击 start_llama_rerank.bat（开机自启还没挂）"), 1)
+
+
 class BackendApiTest(unittest.TestCase):
     def test_implemented(self):
         self.assertTrue(callable(getattr(pg_bridge, "get_mental_model", None)))
