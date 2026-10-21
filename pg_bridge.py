@@ -463,12 +463,18 @@ _META_SEL = ("meta || jsonb_build_object('profile', profile, 'isLatest', is_late
 # 没有 meta jsonb，读侧 metadata 全靠这里重建。约定：**relation 列存原串**
 # （自定义关系不再被折叠成 related 丢掉原串），relation_norm 给归一后的 4 类语义。
 # 2026-10-19 β5：此前列里写的是归一值，读侧又连 rel_type 都不给 → 读回永远 related。
+# 2026-10-22：列里已回填 84,696 行，但仍有「漏写」来源——长驻进程加载旧模块、
+# 或未来某条写入路径忘了给 relation。读侧加兜底：列为空/NULL 时从 content 的
+# `--[xxx]-->` 里把原串解析回来（历史 84,682 行 100% 命中该模式，解析无损）。
+_EDGE_REL_EXPR = ("COALESCE(NULLIF(btrim(relation), ''), "
+                  "substring(content from '--\\[([^\\]]*)\\]-->'), '')")
 _EDGE_META_SEL = ("jsonb_build_object('type','relation','entity_a',entity_a,"
-                  "'entity_b',entity_b,'relation',relation,'relation_raw',relation,"
-                  "'relation_norm', CASE WHEN relation IN "
-                  "('updates','extends','derives','related') THEN relation ELSE 'related' END,"
-                  "'rel_type', CASE WHEN relation IN "
-                  "('updates','extends','derives','related') THEN relation ELSE 'related' END)")
+                  "'entity_b',entity_b,'relation'," + _EDGE_REL_EXPR + ","
+                  "'relation_raw'," + _EDGE_REL_EXPR + ","
+                  "'relation_norm', CASE WHEN " + _EDGE_REL_EXPR + " IN "
+                  "('updates','extends','derives','related') THEN " + _EDGE_REL_EXPR + " ELSE 'related' END,"
+                  "'rel_type', CASE WHEN " + _EDGE_REL_EXPR + " IN "
+                  "('updates','extends','derives','related') THEN " + _EDGE_REL_EXPR + " ELSE 'related' END)")
 
 
 # ── 公开 API（与 chroma_bridge 同名同签名）────────────────────────
