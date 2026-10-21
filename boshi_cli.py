@@ -21,6 +21,7 @@
   boshi restore <快照.jsonl> [--dry-run]
   boshi chain <memory_id>
   boshi conflicts [--topic 主题] [--limit 20] [--threshold 0.85]
+  boshi model [--show] [--rebuild] [--key identity] [--scope self|all]
 """
 import os
 import sys
@@ -37,6 +38,7 @@ from boshi_core import (
     graph_query, graph_add_node, graph_add_edge,
     recent, brief, edit, export_snapshot, export_markdown, restore_snapshot,
     fact_chain, detect_conflicts,
+    get_mental_model, rebuild_mental_model,
 )
 
 
@@ -269,6 +271,35 @@ def cmd_conflicts(args):
     print("\n裁决：boshi edit ... 或调用 resolve_conflict(winner, loser, reason)")
 
 
+def cmd_model(args):
+    """打印 / 重建心智模型预计算页。"""
+    scope = args.scope or "self"
+    if args.rebuild:
+        keys = [args.key] if args.key else None
+        r = rebuild_mental_model(keys=keys, scope=scope)
+        if not r.get("success", True):
+            print(f"❌ {r.get('error')}")
+            return
+        if r.get("disabled"):
+            print("⚠ BOSHI_MENTAL_MODEL=0，心智模型页已关闭")
+            return
+        print(f"🔧 重建完成 {r.get('ms')}ms  profile={r.get('profile')} scope={r.get('scope')}")
+        print(f"   已建：{', '.join(r.get('built') or []) or '（无）'}")
+        if r.get("empty"):
+            print(f"   空页：{', '.join(r['empty'])}")
+    r = get_mental_model(scope=scope)
+    if not r.get("success"):
+        print(f"❌ {r.get('error')}")
+        return
+    text = (r.get("text") or "").strip()
+    if not text:
+        print("（暂无心智模型页，运行 `boshi model --rebuild` 生成）")
+        return
+    print(text)
+    pages = r.get("pages") or {}
+    print(f"\n— {len(pages)} 页 / {len(text)} 字符 / profile={r.get('profile')} scope={r.get('scope')} / 读耗时 {r.get('ms')}ms")
+
+
 def cmd_status(args):
     result = status()
     _fmt_status(result)
@@ -380,6 +411,16 @@ def main():
     p_conf.add_argument("--limit", type=int, default=20, help="最多返回几组")
     p_conf.add_argument("--threshold", type=float, default=0.85, help="余弦相似度门槛")
     p_conf.set_defaults(func=cmd_conflicts)
+
+    # mental_model（P2 ④ 心智模型预计算页）
+    p_model = subparsers.add_parser("model", help="心智模型页（固定问题的预计算答案）")
+    p_model.add_argument("--show", action="store_true", help="直接打印已存页面（默认行为）")
+    p_model.add_argument("--rebuild", action="store_true", help="按当前记忆重建页面")
+    p_model.add_argument("--key", default=None,
+                         help="只重建某一页：identity/env/active_projects/pitfalls/open_threads")
+    p_model.add_argument("--scope", default="self", choices=["self", "all"],
+                         help="self=只看本 profile（默认）；all=全库")
+    p_model.set_defaults(func=cmd_model)
 
     # status
     p_status = subparsers.add_parser("status", help="记忆库状态")

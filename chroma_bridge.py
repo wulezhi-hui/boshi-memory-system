@@ -1094,6 +1094,8 @@ _PUBLIC_API = (
     # 白盒运维面（2026-10-21 P2/P3）：就地编辑、快照导出/回灌、冲突链
     "edit_memory", "export_snapshot", "export_markdown", "restore_snapshot",
     "fact_chain",
+    # 认知层（2026-10-21 P2 ④）：心智模型预计算页
+    "get_mental_model", "rebuild_mental_model",
 )
 
 if BACKEND == "pg":

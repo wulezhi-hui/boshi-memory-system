@@ -409,6 +409,9 @@ def _where_sql(where: Optional[dict], scope: Optional[str], me: str,
         parts.append("profile IS NOT DISTINCT FROM %s")
         params.append(me or _resolve_profile())
 
+    # 心智模型预计算页是派生数据（正文来自别的记忆），绝不能反向污染召回/最近列表
+    parts.append("COALESCE(topic, '') <> 'mental_model'")
+
     # include_graph=False 时无需额外条件：图谱边本就存在另一张表里
     return " AND ".join(parts), params
 
@@ -1705,7 +1708,8 @@ def get_total_count() -> int:
     """
     c = _conn()
     with c.cursor() as cur:
-        cur.execute("SELECT count(*) FROM boshi.memories")
+        cur.execute("SELECT count(*) FROM boshi.memories "
+                    "WHERE COALESCE(topic, '') <> 'mental_model'")
         m = cur.fetchone()[0]
     return int(m)
 
@@ -2213,3 +2217,30 @@ def resolve_conflict(winner_id: str, loser_id: str, reason: str = "") -> bool:
                        WHERE id = %s AND is_latest
                        RETURNING id""", (str(winner_id), reason or "", str(loser_id)))
         return cur.fetchone() is not None
+
+
+# ══════════════════════════════════════════════════════════════════
+# 认知层：心智模型预计算页（P2 ④）
+# 读 = 一条 SELECT，不加载 embedding 模型 → 免掉首轮 6.4s 冷启
+# （实测 measure_cold.py：import 1.09s + 首次 hybrid 6.39s，正好压在
+#   Hermes prefetch 8s 超时线上）
+# ══════════════════════════════════════════════════════════════════
+def get_mental_model(profile: str = None, scope: str = "self",
+                     max_chars: int = 1400) -> dict:
+    """读预计算页（纯 SQL）。返回 {"text": 注入文本, "pages": {key: {...}}}。"""
+    import mental_model as mm
+    import time as _t
+    _t0 = _t.perf_counter()
+    prof = profile or _resolve_profile()
+    pages = mm.load_pages(prof, scope)
+    return {"text": mm.render_all(prof, max_chars, scope) if pages else "",
+            "pages": pages, "profile": prof, "scope": scope,
+            "count": len(pages),
+            "ms": round((_t.perf_counter() - _t0) * 1000)}
+
+
+def rebuild_mental_model(profile: str = None, keys: list = None,
+                         scope: str = None) -> dict:
+    """重算并落库（零模型：每条都是记忆原文片段/槽位原值）。"""
+    import mental_model as mm
+    return mm.rebuild(profile or _resolve_profile(), keys, scope)

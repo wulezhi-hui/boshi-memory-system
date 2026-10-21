@@ -42,6 +42,7 @@ from boshi_core import (
     search, save, delete, status, profile,
     graph_query, graph_add_node, graph_add_edge,
     recent, time_range,
+    get_mental_model, rebuild_mental_model,
 )
 
 from mcp.server import MCPServer
@@ -178,7 +179,7 @@ def _audit(tool: str, identity: Optional[str], scope=None, query: str = "",
 
 
 def create_server():
-    """创建 mcp 2.0 MCPServer，注册全部 9 个工具。"""
+    """创建 mcp 2.0 MCPServer，注册全部 10 个工具。"""
     server = MCPServer("boshi-memory", version="6.1.0",
                        instructions=SERVER_INSTRUCTIONS)
 
@@ -312,6 +313,30 @@ def create_server():
                             include_graph=include_graph, scope=scope,
                             me=_me)
         return json.dumps(result, ensure_ascii=False, indent=2)
+
+    @server.tool(
+        name="boshi_mental_model",
+        description="读取伯仕的「心智模型预计算页」——固定问题（用户画像/环境铁律/活跃项目/反复踩的坑/未了事项）的预计算答案，一条 SQL 读出、不需要向量检索，适合对话开场注入。action=show 读页（默认），action=rebuild 按当前记忆重算落库。",
+    )
+    def boshi_mental_model(
+        action: Literal["show", "rebuild"] = "show",
+        key: Optional[str] = None,
+        scope: ScopeParam = None,
+        ctx: Optional[Context] = None,
+    ) -> str:
+        """心智模型页：action=show 读已存页面；action=rebuild 重算（key 可只重建 identity/env/active_projects/pitfalls/open_threads 中的一页）；scope 见参数说明（默认只读本 agent 的，全库须传 all）"""
+        _me = _caller_identity(ctx)
+        _audit("boshi_mental_model", _me, scope, extra={"action": action, "key": key}, ctx=ctx)
+        _scope = scope or "self"
+        if action == "rebuild":
+            keys = [key] if key else None
+            result = rebuild_mental_model(profile=_me, keys=keys, scope=_scope)
+            if not result.get("success") and result.get("error"):
+                return json.dumps(result, ensure_ascii=False, indent=2)
+        elif action != "show":
+            return json.dumps({"error": f"Unknown action: {action}"}, ensure_ascii=False)
+        result = get_mental_model(profile=_me, scope=_scope)
+        return json.dumps(_with_meta(result, ctx, scope), ensure_ascii=False, indent=2)
 
     return server
 

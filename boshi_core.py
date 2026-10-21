@@ -310,6 +310,30 @@ def detect_conflicts(topic: str = None, top_k: int = 20,
     return {"success": True, "count": len(items or []), "items": items or []}
 
 
+def get_mental_model(profile: str = None, scope: str = "self",
+                     max_chars: int = 1400) -> dict:
+    """心智模型预计算页（读 = 一次 SELECT，免 bge-m3 冷启）。"""
+    cb = _get_chroma()
+    fn = getattr(cb, "get_mental_model", None)
+    if fn is None:
+        return {"success": False, "error": "当前后端不支持心智模型页"}
+    r = fn(profile=profile, scope=scope, max_chars=max_chars)
+    r["success"] = True
+    return r
+
+
+def rebuild_mental_model(profile: str = None, keys: list = None,
+                         scope: str = None) -> dict:
+    """重算心智模型页（零模型：原文片段/槽位原值聚合，带 evidence_ids）。"""
+    cb = _get_chroma()
+    fn = getattr(cb, "rebuild_mental_model", None)
+    if fn is None:
+        return {"success": False, "error": "当前后端不支持心智模型页"}
+    r = fn(profile=profile, keys=keys, scope=scope)
+    r["success"] = not r.get("disabled")
+    return r
+
+
 def status() -> dict:
     """
     记忆库状态总览。

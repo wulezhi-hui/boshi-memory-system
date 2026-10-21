@@ -305,6 +305,9 @@ class BoshiMemoryProvider(MemoryProvider):
         # 不校验 query 就直接返回——同一会话里第 2 轮起拿到的都是第 1 轮问题的
         # 召回结果。改为按 query 指纹缓存（LRU 8 条，TTL 300s）。
         self._pcache: Dict[str, tuple] = {}
+        # 心智模型预计算页（P2 ④）：本会话首次召回时注入一次，之后静默
+        self._mm_text = ""
+        self._mm_done = False
         # 压缩提炼去重：记录上次 on_pre_compress 已提炼的消息 id 集合
         self._compressed_msg_ids: set = set()
 
@@ -417,6 +420,8 @@ class BoshiMemoryProvider(MemoryProvider):
         self._prefetch_cache = ""
         self._prefetch_count = 0
         self._prefetch_time = 0.0
+        self._mm_text = ""
+        self._mm_done = False
 
     # ------------------------------------------------------------------
     # 系统提示词注入（静态）
@@ -687,11 +692,14 @@ class BoshiMemoryProvider(MemoryProvider):
 
         改进2：同步兜底同样合并历史会话 FTS 召回。
         改进3：缓存带 TTL（300秒），避免 Hermes 8 秒超时被跳过。
+        改进4（P2 ④）：本会话首次召回前置「心智模型预计算页」——读一次 SQL，
+        省掉 bge-m3 首轮 6.4s 冷启（实测正好压在 8s 超时线上）。
         """
         if is_trivial_prompt(query) or self._core is None:
             _diag("prefetch 提前退出：trivial=%s, _core 已连=%s → 本轮无召回、无图标",
                   is_trivial_prompt(query), self._core is not None)
             return ""
+        mm = self._mental_model_prefix()
         # 缓存：按当轮 query 取值（2026-10-19 改）。旧逻辑只认"5 分钟内"，不看
         # query，导致同一会话第 2 轮起注入的永远是第一次提问的召回结果。
         hit = self._pcache_get(query)
@@ -699,12 +707,12 @@ class BoshiMemoryProvider(MemoryProvider):
             text, count = hit
             self._prefetch_count = count
             _diag("prefetch 命中 per-query 缓存：count=%s，%d 字符", count, len(text))
-            return text
+            return self._with_mm(text, mm)
         # 兼容旧缓存字段：只有 query 完全一致时才复用（防止跨问题串味）
         if (self._prefetch_cache and self._prefetch_query == query
                 and time.time() - self._prefetch_time < 300):
             _diag("prefetch 命中缓存：count=%s，%d 字符 → 图标应显示", self._prefetch_count, len(self._prefetch_cache))
-            return self._prefetch_cache
+            return self._with_mm(self._prefetch_cache, mm)
         # 首轮/缓存过期：同步检索兜底（保证每轮都有记忆注入）
         try:
             result = self._core.search(query, top_k=5, source="all")
@@ -727,12 +735,49 @@ class BoshiMemoryProvider(MemoryProvider):
             _diag("prefetch 实时检索：count=%s，%d 行内容", self._prefetch_count, len(lines))
             if not lines:
                 _diag("prefetch 检索结果为空 → 无召回注入、🦄 图标不出现")
-                return ""
+                return self._with_mm("", mm)
             text = "## 伯仕记忆召回\n" + "\n".join(lines[:8])
             self._pcache_put(query, text, self._prefetch_count)
-            return text
+            return self._with_mm(text, mm)
         except Exception as e:
             logger.warning("boshi prefetch 失败（本轮无记忆召回、🦄 图标不会出现）: %s", e)
+            return self._with_mm("", mm)
+
+    # ------------------------------------------------------------------
+    # 心智模型预计算页（P2 ④）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _with_mm(text: str, mm: str) -> str:
+        """把心智模型页拼在本轮召回前面；页为空则原样返回。"""
+        if not mm:
+            return text
+        return mm + ("\n\n" + text if text else "")
+
+    def _mental_model_prefix(self) -> str:
+        """本会话首次召回时读一次心智模型页（一条 SELECT，毫秒级）。
+
+        只注入首轮：页面是「常驻背景」，每轮重复注入纯属浪费 token。
+        任何失败都返回空串——不能让画像层拖垮召回主路径。
+        """
+        if self._mm_done or self._core is None:
+            return ""
+        self._mm_done = True
+        try:
+            getter = getattr(self._core, "get_mental_model", None)
+            if not callable(getter):
+                return ""
+            r = getter()
+            if not isinstance(r, dict) or not r.get("success"):
+                return ""
+            text = (r.get("text") or "").strip()
+            if not text:
+                return ""
+            self._mm_text = text
+            _diag("心智模型页注入：%s 页 / %d 字符", r.get("count", 0), len(text))
+            return text
+        except Exception as e:  # noqa: BLE001
+            logger.debug("boshi 心智模型页读取失败（忽略）: %s", e)
             return ""
 
     def recall_status(self) -> Optional[RecallStatus]:
@@ -1008,6 +1053,9 @@ class BoshiMemoryProvider(MemoryProvider):
         if reset:
             self._prefetch_cache = ""
             self._prefetch_count = 0
+            # 新会话重新注入一次心智模型页
+            self._mm_text = ""
+            self._mm_done = False
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """压缩前提炼任务结论 + 存用户消息（长期会话主路径）。
