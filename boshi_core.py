@@ -278,10 +278,31 @@ def get_latest_by_topic(session_id: str, topic: str, profile: str = None):
 
 
 def delete(memory_id: str) -> dict:
-    """删除一条记忆。返回 {"success": True, "deleted": memory_id}"""
+    """删除一条记忆，返回带状态的契约（#4：不再无条件 success）。
+
+    Returns:
+        {"success": bool, "status": "deleted"|"not_found"|"error",
+         "deleted": memory_id, "rows": int|None}
+    「删了」「本来就没有」「后端报错」三态必须分得清——否则 5 条测试残留会被
+    一次全 False 的批量删除误判成「清理完成」。
+    """
     cb = _get_chroma()
-    cb.delete_memory(memory_id)
-    return {"success": True, "deleted": memory_id}
+    try:
+        n = cb.delete_memory(memory_id)
+    except Exception as e:                       # noqa: BLE001
+        return {"success": False, "status": "error", "deleted": memory_id,
+                "rows": None, "error": "%s: %s" % (type(e).__name__, e)}
+    if n is None:                                # 后端不报行数：无法验证存在性
+        return {"success": True, "status": "deleted", "deleted": memory_id,
+                "rows": None, "verified": False}
+    n = int(n)
+    if n < 0:
+        return {"success": False, "status": "error", "deleted": memory_id,
+                "rows": None, "error": "backend delete failed"}
+    if n == 0:
+        return {"success": False, "status": "not_found", "deleted": memory_id,
+                "rows": 0}
+    return {"success": True, "status": "deleted", "deleted": memory_id, "rows": n}
 
 
 def edit(memory_id: str, content: str = None, meta_patch: dict = None,
@@ -437,7 +458,22 @@ def status() -> dict:
         "knowledge_graph": kg_info,
         "backend": backend,
         "chroma_dir": CHROMA_DIR,
+        # #2：我是谁、谁定的 —— 裸 CLI(恒 default) 与 MCP/插件(BOSHI_PROFILE=opencode?)
+        # 身份不同会看起来像「跨进程丢记忆」，把解析链摊在 status 里就不必猜。
+        "identity": identity(),
     }
+
+
+def identity() -> dict:
+    """当前进程的记忆归属身份 + 解析来源（BOSHI_PROFILE > HERMES_HOME > default）。"""
+    cb = _get_chroma()
+    fn = getattr(cb, "resolve_profile_info", None)
+    if fn is None:
+        return {"profile": current_profile(), "source": "unknown"}
+    try:
+        return fn()
+    except Exception as e:                       # noqa: BLE001
+        return {"profile": current_profile(), "source": "unknown", "error": str(e)}
 
 
 def profile(scope: str = None, me: str = None) -> dict:

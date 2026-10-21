@@ -291,6 +291,51 @@ def default_scope(profile: str = None) -> str:
     return scope if scope in ("self", "all") else "self"
 
 
+def _hermes_home_profile(home: str = None):
+    """HERMES_HOME → (profile 名, 原值)。形如 .../hermes/profiles/<name> 才是 profile 名。"""
+    home = (home if home is not None else (os.environ.get("HERMES_HOME") or "")).strip()
+    if not home:
+        return None, ""
+    try:
+        norm = home.rstrip("\\/").replace("\\", "/")
+        name = norm.rsplit("/", 1)[-1]
+        parent = norm.rsplit("/", 2)[-2] if "/" in norm else ""
+        if parent == "profiles" and name:
+            return name, home
+    except Exception:
+        pass
+    return None, home
+
+
+def resolve_profile_info() -> dict:
+    """身份解析的**可解释**版本（#2：裸 CLI 恒 default，与 MCP/插件不一致）。
+
+    刻意不改默认值（把 default 改成 all/别人会悄悄扩大检索面），只把「我是谁、
+    谁定的、还有哪些候选」摊开：身份不一致时用户能自己看见，而不是误判「跨进程丢记忆」。
+    """
+    env = (os.environ.get("BOSHI_PROFILE") or "").strip()
+    home_prof, home = _hermes_home_profile()
+    if env:
+        prof, src = env, "env"
+    elif home_prof:
+        prof, src = home_prof, "hermes_home"
+    else:
+        prof, src = DEFAULT_PROFILE, "default"
+    cfg = load_profile_config()
+    known = sorted(k for k in cfg if not str(k).startswith("_"))
+    return {
+        "profile": prof,
+        "source": src,
+        "env_boshi_profile": env or None,
+        "hermes_home": home or None,
+        "hermes_home_profile": home_prof,
+        "profile_known": prof in known,
+        "known_profiles": known,
+        "default_scope": default_scope(prof),
+        "differs_from_hermes_home": bool(env and home_prof and env != home_prof),
+    }
+
+
 def _apply_profile_scope(where: dict, scope: str, me: str) -> dict:
     """按记忆归属过滤：``scope=self`` 只保留本 profile 的记忆。
 
@@ -705,11 +750,18 @@ def get_total_count() -> int:
 
 
 def delete_memory(memory_id: str):
-    """删除一条记忆"""
+    """删除一条记忆。返回行数（0=不存在，>0=已删），与 pg_bridge 契约对齐。"""
     client = _get_client()
     ef = _get_embedding_function()
     col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=ef)
+    try:
+        hit = col.get(ids=[memory_id])
+        if not (hit or {}).get("ids"):
+            return 0
+    except Exception:  # noqa: BLE001  老 chroma 版本/异常时退回「删了就算成功」
+        pass
     col.delete(ids=[memory_id])
+    return 1
 
 
 def delete_memories(ids: list):
@@ -980,6 +1032,31 @@ def resolve_conflict(winner_id: str, loser_id: str, reason: str = "") -> bool:
     except Exception:
         return False
 
+def find_edge(entity_a: str, entity_b: str, relation_norm: str = None,
+              relation_raw: str = None):
+    """按实体对精确找一条已存在的边 ID（chroma 后端版；pg 后端由 _PUBLIC_API 换掉）。"""
+    try:
+        col = _get_collection()
+        data = col.get(where={"type": "relation"}, limit=20000,
+                       include=["metadatas"])
+        found = ""
+        for m in (data.get("metadatas") or []):
+            if not m:
+                continue
+            if m.get("entity_a") != entity_a or m.get("entity_b") != entity_b:
+                continue
+            if relation_raw:
+                if (m.get("relation_raw") or m.get("relation")) != relation_raw:
+                    continue
+            elif relation_norm and (m.get("relation_norm") or m.get("rel_type")) != relation_norm:
+                continue
+            found = m.get("id") or ""
+            break
+        return found
+    except Exception:
+        return ""
+
+
 def get_all_relations(top_k: int = 10000) -> list:
     """精确列出所有 type=relation 的记忆（供图谱去重使用）。
 
@@ -1088,7 +1165,7 @@ BACKEND, BACKEND_SOURCE = _resolve_backend()
 _PUBLIC_API = (
     "add_memory", "add_memories_batch", "search_memory", "hybrid_search",
     "get_time_range", "get_recent", "get_total_count", "delete_memory",
-    "delete_memories", "update_memory", "deprecate_memory", "get_all_relations",
+    "delete_memories", "update_memory", "deprecate_memory", "get_all_relations", "find_edge",
     "auto_forget", "detect_conflicts", "resolve_conflict", "get_by_id",
     "get_graph_count", "get_latest_by_topic",
     # 白盒运维面（2026-10-21 P2/P3）：就地编辑、快照导出/回灌、冲突链

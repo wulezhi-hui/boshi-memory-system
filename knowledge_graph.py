@@ -125,24 +125,29 @@ def add_relation(
     try:
         from chroma_bridge import add_memory, search_memory
 
+        # 原串保留：自定义关系（如「验收自测边」）在 4 类语义里归一成 related 存
+        # rel_type/relation，但原串写 relation_raw 一起落库，读回不再只剩 related。
+        rel_raw = str(rel_type or "").strip()
         if rel_type not in ("updates", "extends", "derives", "related"):
             logger.warning(f"未知关系类型 {rel_type}，降级为 related")
             rel_type = "related"
 
-        # 去重：同一条边不重复写入（基于精确 metadata 匹配，2026-08-19 修复）
-        # 原实现用语义搜索 dedup_key 判断，会误匹配原始记忆文本导致新边被跳过。
-        dedup_key = f"{from_id}---{rel_type}---{to_id}"
+        # 去重：同一对实体 + 同一归一关系只保留一条边。
+        # 历史实现两处坑（2026-10-19 β5 一并修）：
+        #   a) PG 把边单独存 graph_edges 表，读回的 metadata 里没有 from_id/to_id，
+        #      原「只比 ID」的去重恒不命中 → 同一条边每调一次 add_edge 就多一条（实测 2 条）；
+        #   b) 原实现拉 get_all_relations() 再内存比对，该函数带 LIMIT 10000，
+        #      而边表 8 万+ 行 → 超出窗口的边永不去重，且每次写入白拉一万行。
+        # 改为后端各自实现的精确查询（PG 走 (entity_a, entity_b) 条件，chroma 走 where 过滤）。
         try:
-            from chroma_bridge import get_all_relations
-            existing_edges = get_all_relations()
-            for e in existing_edges:
-                em = e.get("metadata", {})
-                if (em.get("from_id") == from_id and em.get("to_id") == to_id
-                        and em.get("rel_type") == rel_type):
-                    return e.get("id", "")
+            from chroma_bridge import find_edge
+            hit = find_edge(from_id, to_id, rel_type, rel_raw)
+            if hit:
+                return hit
         except (ImportError, AttributeError):
-            # fallback：语义搜索（旧逻辑，可能有误判但保底）
-            existing = search_memory(dedup_key, top_k=1, where={"type": "relation"})
+            # 老接口没有 find_edge 时退回语义搜（只数条，不拉全表）
+            existing = search_memory(f"{from_id}---{rel_type}---{to_id}", top_k=1,
+                                     where={"type": "relation"})
             if existing and existing[0].get("score", 0) < 0.3:
                 return existing[0]["id"]
 
@@ -152,6 +157,8 @@ def add_relation(
         edge_meta = {
             "type": "relation",
             "rel_type": rel_type,
+            "relation": rel_type,          # PG graph_edges.relation 列的真值来源（原缺失）
+            "relation_raw": rel_raw or rel_type,
             "from_id": from_id,
             "to_id": to_id,
             "reason": reason[:500] if reason else "",
@@ -164,7 +171,9 @@ def add_relation(
             edge_meta.update(metadata)
 
         add_memory(
-            content=f"{from_id} --[{rel_type}]--> {to_id} [{reason[:100] if reason else ''}]",
+            # 边文本写原串：这条 content 会被嵌入并展示给模型，若写归一值
+            # 「--[related]-->」，自定义关系在正文里也看不到原意（同属原串丢失）。
+            content=f"{from_id} --[{rel_raw or rel_type}]--> {to_id} [{reason[:100] if reason else ''}]",
             metadata=edge_meta,
             memory_id=edge_id,
         )
@@ -432,7 +441,7 @@ def get_graph_context(memory_id: str, depth: int = 2) -> str:
             seen = set()
             for r in relations[:10]:
                 meta = r.get("metadata", {})
-                rel = meta.get("rel_type", "related")
+                rel = meta.get("relation_raw") or meta.get("rel_type", "related")
                 from_id = meta.get("from_id", "")
                 to_id = meta.get("to_id", "")
                 key = f"{from_id}-{to_id}"
@@ -604,7 +613,9 @@ class KnowledgeGraph:
                 nodes.setdefault(b, {"id": b})
                 edges.append({
                     "from": a, "to": b,
-                    "relation": meta.get("rel_type", "related"),
+                    # 读回原串（自定义关系不再只剩 related）；4 类语义另给 relation_norm
+                    "relation": meta.get("relation_raw") or meta.get("rel_type", "related"),
+                    "relation_norm": meta.get("rel_type", "related"),
                     "reason": meta.get("reason", "")[:60],
                 })
             return {"nodes": nodes, "edges": edges}
@@ -617,17 +628,25 @@ class KnowledgeGraph:
         return {"name": name, "type": type, "attr": attr, "added": True}
 
     def add_edge(self, from_name: str, to_name: str, relation: str) -> dict:
-        """添加关系边（委托 add_relation）。"""
+        """添加关系边（委托 add_relation）。
+
+        自定义关系不再在这里被折叠成 related 后丢掉原串：原串传下去由
+        add_relation 归一存 rel_type/relation + 原串存 relation_raw，
+        返回值同时给出 relation（原串）与 relation_norm（4 类语义）。
+        """
         try:
             rid = add_relation(
                 from_id=from_name,
                 to_id=to_name,
-                rel_type=relation if relation in ("updates", "extends", "derives", "related") else "related",
+                rel_type=relation,
                 reason="手动添加",
                 confidence=1.0,
                 metadata={"entity_a": from_name, "entity_b": to_name, "source": "manual"},
             )
-            return {"from": from_name, "to": to_name, "relation": relation, "edge_id": rid, "added": bool(rid)}
+            norm = relation if relation in ("updates", "extends", "derives", "related") else "related"
+            return {"from": from_name, "to": to_name, "relation": relation,
+                    "relation_raw": relation, "relation_norm": norm,
+                    "edge_id": rid, "added": bool(rid)}
         except Exception as e:
             return {"from": from_name, "to": to_name, "relation": relation, "error": str(e), "added": False}
 

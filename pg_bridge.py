@@ -448,7 +448,27 @@ def _row_to_item(row) -> dict:
 # 就会"没有时间"（2026-10-10 实测：dsh 侧正是踩到这个缺口）
 _META_SEL = ("meta || jsonb_build_object('profile', profile, 'isLatest', is_latest, "
              "'timestamp', COALESCE(EXTRACT(EPOCH FROM created_at), "
-             "NULLIF(meta->>'timestamp', '')::float8)) AS meta")
+             "NULLIF(meta->>'timestamp', '')::float8), "
+             # topic/session_id/role/source 是**真列**（add_memory 把它们 pop 出 meta），
+             # 早期不在这里回填 → 检索结果 metadata 里根本没有 topic，于是所有
+             # 「按 topic 分组」的读侧判据（_fold_value_changes 换值折叠、
+             # _mark_value_conflicts 冲突暴露）全都分组为空、静默失效
+             # （2026-10-19 实测：云闸 40层/100层 两条都不带 topic，新旧并列）。
+             "'topic', COALESCE(topic, ''), "
+             "'session_id', COALESCE(session_id::text, ''), "
+             "'role', COALESCE(role, ''), "
+             "'source', COALESCE(source, '')) AS meta")
+
+# graph_edges 的 metadata 视图：表里只有列（id/entity_a/entity_b/relation/content），
+# 没有 meta jsonb，读侧 metadata 全靠这里重建。约定：**relation 列存原串**
+# （自定义关系不再被折叠成 related 丢掉原串），relation_norm 给归一后的 4 类语义。
+# 2026-10-19 β5：此前列里写的是归一值，读侧又连 rel_type 都不给 → 读回永远 related。
+_EDGE_META_SEL = ("jsonb_build_object('type','relation','entity_a',entity_a,"
+                  "'entity_b',entity_b,'relation',relation,'relation_raw',relation,"
+                  "'relation_norm', CASE WHEN relation IN "
+                  "('updates','extends','derives','related') THEN relation ELSE 'related' END,"
+                  "'rel_type', CASE WHEN relation IN "
+                  "('updates','extends','derives','related') THEN relation ELSE 'related' END)")
 
 
 # ── 公开 API（与 chroma_bridge 同名同签名）────────────────────────
@@ -521,7 +541,11 @@ def add_memory(content: str, metadata: dict = None, memory_id: str = None,
     if meta.get("type") == "relation" or ("entity_a" in meta and "entity_b" in meta):
         ea = meta.get("entity_a", "") or ""
         eb = meta.get("entity_b", "") or ""
-        rel = meta.get("relation", "") or ""
+        # relation 列取原串：写入方（knowledge_graph.add_relation）把原串放 relation_raw、
+        # 归一值放 rel_type/relation。历史故障：该列自 PG 化以来一直写入空串/None（8 万条真值全丢），
+        # 且早期只写归一值 → 自定义关系读回全变 related（2026-10-19 β5 修复）。
+        rel = (meta.get("relation_raw") or meta.get("relation")
+               or meta.get("rel_type") or "")
         mv = _ef()([content or " "])[0]
         with c.cursor() as cur:
             cur.execute("""INSERT INTO boshi.graph_edges
@@ -665,9 +689,7 @@ def _search_edges(query: str, top_k: int, rel_type: str = None):
     """在 graph_edges 表里做语义检索（Chroma 时代边与记忆同表，PG 里必须分表查）。"""
     c = _conn()
     v = _vec_literal(_ef()([query or " "])[0])
-    sql = ("""SELECT id, content,
-              jsonb_build_object('type','relation','entity_a',entity_a,
-                                 'entity_b',entity_b,'relation',relation) AS meta,
+    sql = ("""SELECT id, content,""" + _EDGE_META_SEL + """ AS meta,
               embedding <=> %s::vector AS dist
               FROM boshi.graph_edges""")
     ps = [v]
@@ -1692,6 +1714,13 @@ _RERANK_LOG = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "rerank_server.log"))
 _RERANK_LAST_SPAWN = [0.0]          # 上次「尝试」拉起（含失败）的时间 → 冷却判据
 _RERANK_LAST_START = [0.0]          # 上次真正发出 Popen 的时间（观测用）
+# 空闲卸载可观测（2026-10-19）：真正的 600s 计时在 llama-server 进程里
+# （--sleep-idle-seconds），本进程看不到它的状态；但「最后一次成功重排」是等价锚点
+# ——超过 sleep_after 没成功重排，权重就很可能已让出显存。把它暴露成
+# idle_sec / asleep_likely / wakes，运维不必再靠猜（原状态里只有一个 ts，看不出空闲多久）。
+_RERANK_SLEEP_AFTER = int(os.environ.get("BOSHI_RERANK_SLEEP_SEC", "600"))
+_RERANK_WAKE_COUNT = [0]            # 本进程按需拉起「服务不在」的次数
+_RERANK_LAST_WAKE = [0.0]
 
 
 def _rerank_endpoint():
@@ -1808,8 +1837,11 @@ def _set_rerank_status(ok: bool, reason: str = "", detail: str = "") -> None:
 
 
 def rerank_status() -> Dict[str, Any]:
-    """重排运行状态快照（ok/reason/detail/ts + 配置 + 按需拉起），供 doctor/人工核对。"""
+    """重排运行状态快照（ok/reason/detail/ts + 配置 + 按需拉起 + 空闲卸载推断），供 doctor/人工核对。"""
     free = _VRAM_CACHE["free"]
+    now = time.time()
+    last_ok = _RERANK_LAST_OK[0]
+    idle = (now - last_ok) if last_ok else None
     return {"enabled": _RERANK_ON, "url": _RERANK_URL, "ok": _RERANK_STATUS["ok"],
             "reason": _RERANK_STATUS["reason"], "detail": _RERANK_STATUS["detail"],
             "ts": _RERANK_STATUS["ts"], "pool": _RERANK_POOL,
@@ -1820,7 +1852,13 @@ def rerank_status() -> Dict[str, Any]:
             "down_until": _RERANK_DOWN_UNTIL[0],
             "autostart": _RERANK_AUTOSTART, "port_alive": _rerank_port_alive(),
             "spawn_cooldown": _RERANK_SPAWN_COOLDOWN,
-            "last_spawn": _RERANK_LAST_SPAWN[0], "last_start": _RERANK_LAST_START[0]}
+            "last_spawn": _RERANK_LAST_SPAWN[0], "last_start": _RERANK_LAST_START[0],
+            # ── 空闲卸载可观测 ──
+            "sleep_after_sec": _RERANK_SLEEP_AFTER,
+            "last_ok": last_ok,
+            "idle_sec": round(idle, 1) if idle is not None else None,
+            "asleep_likely": bool(idle is not None and idle >= _RERANK_SLEEP_AFTER),
+            "wakes": _RERANK_WAKE_COUNT[0], "last_wake": _RERANK_LAST_WAKE[0]}
 
 
 
@@ -1846,6 +1884,8 @@ def _rerank_items(query: str, items: list, top_k: int) -> list:
         if not _ensure_rerank():
             return items[:k]
         woke_now = True
+        _RERANK_WAKE_COUNT[0] += 1
+        _RERANK_LAST_WAKE[0] = time.time()
     else:
         woke_now = False
     # 显存预检：只有「模型很可能已经睡了」时才查显存（wake 需 +650MiB）；
@@ -2039,6 +2079,130 @@ def _fold_value_changes(items: list) -> list:
     return items
 
 
+# β4（2026-10-19）：同主题数值冲突「暴露」而非「裁决」。
+#
+# 缘起：实测「云闸的开闸宽度当前设定为 40 层」→ 后来写入「已调整为 100 层」→
+# 查「云闸的开闸宽度现在设定多少？」，旧值仍排 top1（rr 6.88 conf high）、新值第二
+# （rr 5.26）。_fold_value_changes 的判据是「去数字后整句同构」，这两句措辞不同
+# （「当前设定为」vs「已调整为」）→ 永不配对；detect_conflicts 又要槽位交集，
+# 且只在离线可调。于是「同一设定的两个值」在检索里谁也不让谁，agent 无从知道有冲突。
+#
+# 这里只做两件事，绝不自动判定真伪、绝不写库（更不写 is_latest=false）：
+#   1) 给冲突双方打 conflict/conflict_role/conflict_with/conflict_values 标记；
+#   2) 把较新的一条排到较旧的之前（只调位置，score 不动）。
+# 判据（全部可调/可关）：
+#   BOSHI_CONFLICT_EXPOSE=0 关闭 ｜ BOSHI_CONFLICT_COS=0.88（两条正文余弦）
+#   BOSHI_CONFLICT_MIN_GAP=60（秒，时间戳差太近的不算「新旧」）
+_CONFLICT_ON = os.environ.get("BOSHI_CONFLICT_EXPOSE", "1") == "1"
+_CONFLICT_COS = float(os.environ.get("BOSHI_CONFLICT_COS", "0.88"))
+_CONFLICT_MIN_GAP = float(os.environ.get("BOSHI_CONFLICT_MIN_GAP", "60"))
+_UNIT_AFTER_NUM = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(层|个|条|台|张|次|天|秒|分钟|小时|周|月|年|人|GB|GiB|MB|MiB|KB|%|ms|t/s|tok/s)?",
+    re.IGNORECASE)
+
+
+def _value_tokens(text: str) -> set:
+    """正文里的量值集合：{(数值串, 单位小写)}。「40 层」→ {("40","层")}，无单位记 ""。"""
+    out = set()
+    for num, unit in _UNIT_AFTER_NUM.findall(text or ""):
+        out.add((num.rstrip("."), (unit or "").strip().lower()))
+    return out
+
+
+def _doc_cos(texts: dict) -> dict:
+    """{(id_a, id_b): cosine} —— 只对候选对算，失败返回空（降级为不判冲突）。"""
+    try:
+        import math
+        ids = list(texts)
+        vecs = {}
+        for i in ids:
+            v = _ef()([texts[i] or " "])[0]
+            vecs[i] = v
+        sims = {}
+        for x in range(len(ids)):
+            for y in range(x + 1, len(ids)):
+                a, b = ids[x], ids[y]
+                va, vb = vecs[a], vecs[b]
+                dot = sum(p * q for p, q in zip(va, vb))
+                na = math.sqrt(sum(p * p for p in va)) or 1.0
+                nb = math.sqrt(sum(q * q for q in vb)) or 1.0
+                sims[(a, b)] = sims[(b, a)] = dot / (na * nb)
+        return sims
+    except Exception:            # noqa: BLE001  冲突标记是增强项，坏了一律不标
+        return {}
+
+
+def _mark_value_conflicts(items: list) -> list:
+    """同 topic + 数值互斥 + 正文高度相似 → 双向打 conflict 标记，并把新的排前面。
+
+    不写库、不改 score、不判真伪：只让「这里有两个互斥值、哪个更新」对 agent 可见。
+    """
+    if not _CONFLICT_ON or len(items) < 2:
+        return items
+    from collections import defaultdict
+
+    by_topic = defaultdict(list)
+    for it in items:
+        md = it.get("metadata") or {}
+        if md.get("is_latest") is False or md.get("superseded"):
+            continue                      # 已折叠的旧版本不再重复标冲突
+        topic = str(md.get("topic") or "")
+        if not topic:
+            continue
+        vals = _value_tokens(it.get("content", ""))
+        if not vals:
+            continue
+        by_topic[topic].append((it, vals))
+
+    pairs = []
+    for grp in by_topic.values():
+        if len(grp) < 2:
+            continue
+        texts = {str(it["id"]): (it.get("content") or "") for it, _ in grp}
+        sims = _doc_cos(texts)
+        for i in range(len(grp)):
+            for j in range(i + 1, len(grp)):
+                a, va = grp[i]
+                b, vb = grp[j]
+                if va == vb:
+                    continue                  # 数值完全相同 → 纯重复，交给常规去重
+                if sims.get((str(a["id"]), str(b["id"])), 0.0) < _CONFLICT_COS:
+                    continue
+                ua = {u for _, u in va if u}
+                ub = {u for _, u in vb if u}
+                if ua and ub and not (ua & ub):
+                    continue                  # 单位完全不同 → 很可能不是同一量
+                ma, mb = (a.get("metadata") or {}), (b.get("metadata") or {})
+                ta = float(ma.get("timestamp") or ma.get("created_at") or 0.0)
+                tb = float(mb.get("timestamp") or mb.get("created_at") or 0.0)
+                if not ta or not tb or abs(ta - tb) <= _CONFLICT_MIN_GAP:
+                    continue                  # 判不出新旧 → 不标（宁可漏报不误报）
+                old, new = (a, b) if ta <= tb else (b, a)
+                pairs.append((old, new, va, vb))
+
+    for old, new, va, vb in pairs:
+        for me, other, role, mv, ov in ((old, new, "older", va, vb),
+                                        (new, old, "newer", vb, va)):
+            mm = me.setdefault("metadata", {})
+            mm["conflict"] = True
+            mm["conflict_role"] = role
+            mm["conflict_with"] = str(other["id"])
+            mm["conflict_values"] = {"mine": sorted(map(list, mv)),
+                                     "other": sorted(map(list, ov))}
+            mm["conflict_note"] = ("同主题存在互斥数值，未自动判定真伪；"
+                                   "较新的一条已排在前面，请结合上下文确认")
+        # 新的排前面：只调位置（就地搬移，其余条目相对顺序不变）
+        try:
+            p_old = items.index(old)
+            p_new = items.index(new)
+            if p_new > p_old:
+                items.pop(p_new)
+                items.insert(p_old, new)
+        except ValueError:
+            pass
+    return items
+
+
 # β2：重排在线时用 relevance/confidence 暴露可置信度（在 _rerank_items 内写入）。
 # 重排降级（服务死/OOM 静默回退）时结果没有 relevance —— 在 search_memory 末尾给
 # 每条补 confidence="unknown"，让 agent 知道「这条是未重排的融合序，别全信」。
@@ -2192,13 +2356,15 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
     # β3：同一设定的新旧值折叠（取新弃旧，不写库）——放在最终 return 前，
     # 让「当前设定」类 query 读到的是新值而非字面更匹配的旧值。
     items = _fold_value_changes(items)
+    # β4：措辞不同、句式不同构的「同设定两值」折叠抓不到 → 这里补一层冲突暴露
+    # （只标记 + 把新的排前面，不判真伪、不写库）。
+    items = _mark_value_conflicts(items)
 
     if include_graph:      # 需要图谱联想时，并入边表结果（与 Chroma 后端行为对齐）
         v = _vec_literal(_ef()([query or " "])[0])
         with c.cursor() as cur:
             cur.execute("""
-                SELECT id, content, jsonb_build_object('type','relation',
-                       'entity_a',entity_a,'entity_b',entity_b,'relation',relation) AS meta,
+                SELECT id, content, """ + _EDGE_META_SEL + """ AS meta,
                        embedding <=> %s::vector AS dist
                 FROM boshi.graph_edges ORDER BY embedding <=> %s::vector LIMIT %s
             """, (v, v, int(min(top_k, 100))))
@@ -2317,7 +2483,15 @@ def get_graph_count() -> dict:
 
 
 def delete_memory(memory_id: str):
-    """删除一条记忆（含同名图谱边）。契约与 chroma_bridge 一致：返回 True/False。"""
+    """删除一条记忆（含同名图谱边）。
+
+    返回**行数**而不是 bool（#4：delete 幂等但无状态区分——删不存在的 ID 也回
+    {success:true}，导致测试残留被误判成「清理完成」）：
+      >0 = 真的删掉了（memories 或同名 graph_edges 行）
+       0 = 不存在（not_found）
+      -1 = 后端异常（error，与 not_found 必须能分开）
+    0/正数在布尔语境下仍为假/真，老调用方 `if delete_memory(x)` 行为不变。
+    """
     c = _conn()
     try:
         with c.cursor() as cur:
@@ -2325,9 +2499,9 @@ def delete_memory(memory_id: str):
             n = cur.rowcount
             cur.execute("DELETE FROM boshi.graph_edges WHERE id = %s", (memory_id,))
             n += cur.rowcount
-        return n > 0
+        return int(n)
     except Exception:  # noqa: BLE001
-        return False
+        return -1
 
 
 def delete_memories(ids: list):
@@ -2382,9 +2556,7 @@ def get_by_id(memory_id: str):
         row = cur.fetchone()
         if row:
             return {"id": str(row[0]), "content": row[1] or "", "metadata": row[2] or {}}
-        cur.execute("""SELECT id, content,
-                       jsonb_build_object('type','relation','entity_a',entity_a,
-                                          'entity_b',entity_b,'relation',relation) AS meta
+        cur.execute("""SELECT id, content,""" + _EDGE_META_SEL + """ AS meta
                        FROM boshi.graph_edges WHERE id = %s""", (memory_id,))
         row = cur.fetchone()
         if row:
@@ -2392,11 +2564,42 @@ def get_by_id(memory_id: str):
     return None
 
 
+def find_edge(entity_a: str, entity_b: str, relation_norm: str = None,
+              relation_raw: str = None):
+    """按实体对 + 关系找一条已存在的边 ID，找不到返回 ""。
+
+    用途：add_relation 的去重。原实现拉 get_all_relations() 再在内存里比，
+    PG 化后边表有 8 万+ 行、且函数带 LIMIT 10000 → 既慢又漏（超窗口的边永不去重）。
+
+    关系比较口径：**原串优先**。relation 列存的是原串，只有当归一值相同时才算同一条边；
+    否则「引用」和「不同关系」都会被归一成 related 而互相顶掉（实测会少写边）。
+    4 类标准关系的原串 == 归一值，两种比较等价。
+    """
+    try:
+        c = _conn()
+        sql = "SELECT id FROM boshi.graph_edges WHERE entity_a = %s AND entity_b = %s"
+        ps = [entity_a, entity_b]
+        if relation_raw:
+            sql += (" AND (relation = %s OR (relation IN ('updates','extends','derives','related')"
+                    " AND relation = %s))")
+            ps += [relation_raw, relation_norm or relation_raw]
+        elif relation_norm:
+            sql += (" AND (CASE WHEN relation IN ('updates','extends','derives','related')"
+                    " THEN relation ELSE 'related' END) = %s")
+            ps.append(relation_norm)
+        sql += " LIMIT 1"
+        with c.cursor() as cur:
+            cur.execute(sql, ps)
+            row = cur.fetchone()
+            return str(row[0]) if row else ""
+    except Exception:
+        return ""
+
+
 def get_all_relations(top_k: int = 10000) -> list:
     c = _conn()
     with c.cursor() as cur:
-        cur.execute("""SELECT id, content, jsonb_build_object('type','relation',
-                       'entity_a',entity_a,'entity_b',entity_b,'relation',relation) AS meta
+        cur.execute("""SELECT id, content,""" + _EDGE_META_SEL + """ AS meta
                        FROM boshi.graph_edges LIMIT %s""", (int(top_k),))
         return [{"id": str(r[0]), "content": r[1], "metadata": r[2]} for r in cur.fetchall()]
 

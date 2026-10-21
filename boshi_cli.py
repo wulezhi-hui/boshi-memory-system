@@ -120,6 +120,22 @@ def _fmt_status(result: dict):
     print(f"  知识图谱: {kg.get('nodes', 0)} 节点 / {kg.get('edges', 0)} 边")
     if result.get("backend"):
         print(f"  检索后端: {result['backend']}")
+    ident = result.get("identity") or {}
+    if ident:
+        src = {"env": "BOSHI_PROFILE 环境变量",
+               "hermes_home": "HERMES_HOME 推导",
+               "default": "默认值（既无 BOSHI_PROFILE 也无 profile 型 HERMES_HOME）",
+               "unknown": "未知"}.get(ident.get("source"), ident.get("source"))
+        print(f"  记忆归属: {ident.get('profile')}  （来源: {src}）")
+        print(f"  默认范围: {ident.get('default_scope', 'self')}"
+              + ("   ⚠ 该 profile 未在 profiles.json 登记" if ident.get("profile_known") is False else ""))
+        if ident.get("differs_from_hermes_home"):
+            print(f"  ⚠ 身份漂移: BOSHI_PROFILE={ident.get('env_boshi_profile')} "
+                  f"但 HERMES_HOME 指向 {ident.get('hermes_home_profile')}")
+        if ident.get("source") == "default":
+            print("     ↳ 裸进程(无环境变量)默认 default：此时看不到 opencode/dsh 等 "
+                  "BOSHI_PROFILE 进程写入的记忆，是「身份不同」不是「记忆丢了」。"
+                  " 要看全库：boshi search \"...\" --all")
     print(f"  数据目录: {result.get('chroma_dir', '未知')}")
 
 
@@ -161,8 +177,11 @@ def _fmt_recent(results: list):
 # ═══════════════════════════════════════════
 
 def cmd_search(args):
+    scope = getattr(args, "scope", None)
+    if getattr(args, "scope_all", False):
+        scope = "all"
     result = search(query=args.query, top_k=args.top_k, source=args.source,
-                    scope=getattr(args, "scope", None),
+                    scope=scope,
                     since=_parse_when(getattr(args, "since", None)),
                     until=_parse_when(getattr(args, "until", None)))
     _fmt_search(result)
@@ -180,10 +199,14 @@ def cmd_save(args):
 
 def cmd_delete(args):
     result = delete(memory_id=args.memory_id)
-    if result.get("success"):
-        print(f"✅ 已删除: {result['deleted']}")
+    st = result.get("status")
+    if st == "deleted":
+        print(f"✅ 已删除: {result['deleted']} (rows={result.get('rows')})")
+    elif st == "not_found":
+        print(f"⚪ 本就没有这条记忆: {result['deleted']}  (not_found，未做任何变更)")
     else:
-        print(f"❌ 删除失败: {result}")
+        print(f"❌ 删除失败: {result.get('error') or result}")
+    return 0 if result.get("success") else 1
 
 
 def cmd_edit(args):
@@ -382,6 +405,8 @@ def main():
     p_search.add_argument("--source", choices=["all", "vector", "hybrid", "graph"], default="all", help="检索策略")
     p_search.add_argument("--scope", choices=["self", "all"], default=None,
                           help="记忆归属范围：self=只读本 profile（默认，见 ~/.boshi/profiles.json）；all=全库")
+    p_search.add_argument("--all", dest="scope_all", action="store_true",
+                          help="快捷方式：等同 --scope all（跨 profile 查全库，含 opencode/dsh 等）")
     p_search.add_argument("--since", default=None,
                           help="起始时间：7d / 24h / 2026-10-01 / ISO / epoch")
     p_search.add_argument("--until", default=None,
@@ -505,7 +530,9 @@ def main():
         parser.print_help()
         sys.exit(0)
 
-    args.func(args)
+    rc = args.func(args)
+    if isinstance(rc, int):     # 子命令可返回退出码（如 delete 的 not_found → 1）
+        sys.exit(rc)
 
 
 if __name__ == "__main__":

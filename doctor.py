@@ -212,7 +212,117 @@ def check_rerank(sec):
         free = st["vram_free_mib"]
         if free < st["vram_min"]:
             warn(sec, f"显存余量 {free}MiB < 门槛 {st['vram_min']}MiB（精排会被主动跳过）")
+    # #3：10 分钟闲置卸载计时器原本完全不可观测（日志里只有 launch/release，没有任何
+    # idle 字样）。这里把「上次成功、静默多久、预计何时卸、被拉起过几次」摊开——
+    # 用户看到「精排突然变慢/掉分」时能判断是不是刚好被卸载后冷启动。
+    try:
+        sleep_after = st.get("sleep_after_sec")
+        idle = st.get("idle_sec")
+        wakes = st.get("wakes")
+        if sleep_after:
+            parts = [f"闲置卸载阈值 {int(sleep_after)}s"]
+            if idle is None:
+                parts.append("本进程还没成功调用过（无 idle 数据）")
+            else:
+                parts.append(f"距上次成功 {int(idle)}s")
+                if st.get("asleep_likely"):
+                    parts.append("→ 模型很可能已卸载（下次检索需冷启动，首查会慢）")
+            if wakes:
+                lw = st.get("last_wake") or 0
+                parts.append(f"本进程已按需拉起 {wakes} 次"
+                             + (f"，最近 {time.strftime('%H:%M:%S', time.localtime(lw))}" if lw else ""))
+            ok(sec, "；".join(parts) + f"（llama.cpp --sleep-idle-seconds 由 BOSHI_RERANK_SLEEP_SEC 控制）")
+    except Exception:
+        pass
     return st
+
+
+def check_identity(sec, c):
+    """#2：记忆归属身份是否「说清了自己是谁」。
+
+    现状（缺陷根因）：裸 CLI 进程既没有 BOSHI_PROFILE 也没有 profile 型 HERMES_HOME
+    → resolve_profile() 恒回 default；而 MCP server 与 opencode 插件把 BOSHI_PROFILE
+    钉成 opencode。于是同一个人在两个进程里看到的是两片记忆，用户会误判成「跨进程丢失」。
+    这里不改默认值（改了会悄悄扩大别人的检索面），只把解析链与库内归属分布摆出来。
+    """
+    info = None
+    try:
+        import chroma_bridge as cb
+        info = cb.resolve_profile_info()
+    except Exception as ex:
+        try:
+            import pg_bridge as pb
+            info = pb.resolve_profile_info()
+        except Exception:
+            warn(sec, f"身份解析不可用：{ex}", "检查 ~/.boshi/chroma_bridge.py 是否可导入")
+            return None
+    src_txt = {"env": "BOSHI_PROFILE 环境变量",
+               "hermes_home": "HERMES_HOME 推导",
+               "default": "默认值（无环境变量）"}.get(info.get("source"), info.get("source"))
+    ok(sec, f"记忆归属 {info.get('profile')}（来源：{src_txt}；默认范围 "
+            f"{info.get('default_scope')}）")
+    if info.get("differs_from_hermes_home"):
+        warn(sec, f"身份漂移：BOSHI_PROFILE={info.get('env_boshi_profile')}，"
+                  f"但 HERMES_HOME 指向 profile「{info.get('hermes_home_profile')}」",
+             "两者不一致时以 BOSHI_PROFILE 为准；确认这是有意的（如 MCP 钉 opencode）")
+    if info.get("profile_known") is False:
+        warn(sec, f"profile「{info.get('profile')}」未在 ~/.boshi/profiles.json 登记",
+             "拼写错误会导致写到一片孤岛记忆里；登记后再检索")
+    known = info.get("known_profiles") or []
+    if c is not None:
+        try:
+            rows = _q(c, "SELECT COALESCE(NULLIF(profile,''),'(空)'), count(*) "
+                         "FROM boshi.memories WHERE is_latest GROUP BY 1 ORDER BY 2 DESC LIMIT 8")
+            dist = " ".join(f"{p}={n}" for p, n in rows)
+            ok(sec, f"库内归属分布 {dist}")
+            seen = {p for p, _ in rows}
+            hidden = [p for p in known if p not in seen]
+            if info.get("profile") == "default" and seen - {"default", "(空)"}:
+                ok(sec, "注意：本进程只看 default 一片；其它 profile 的记忆要用 "
+                        "`boshi search \"...\" --all` 才可见（不是记忆丢了）")
+            elif hidden:
+                pass
+        except Exception:
+            pass
+    return info
+
+
+def check_capability(sec):
+    """#5：本进程「现在真能用的能力」探针——裸 CLI 新进程缺 torch/服务没起时
+    过去只有一行 warning，agent 无从判断本轮检索是完整能力还是降级能力。"""
+    import pg_bridge as pb
+    caps = {}
+    try:
+        v = pb._ef()(["能力探针"])[0]
+        caps["embed"] = f"bge-m3 {len(v)}维"
+    except Exception as ex:
+        caps["embed"] = None
+        fail(sec, f"本进程嵌入不可用：{type(ex).__name__}: {ex}",
+             "在 ~/.boshi/venv 里跑（venv 的 python 才有 onnxruntime）："
+             "~/.boshi/venv/Scripts/python.exe -m doctor")
+    st = {}
+    try:
+        st = pb.rerank_status() or {}
+    except Exception:
+        pass
+    if st.get("enabled") and st.get("ok"):
+        caps["rerank"] = "在线"
+    elif st.get("enabled"):
+        caps["rerank"] = f"降级({st.get('reason') or 'unknown'})"
+    else:
+        caps["rerank"] = "关闭"
+    try:
+        import boshi_core as bc
+        caps["version"] = bc.__version__
+        cb = bc._get_chroma()
+        caps["backend"] = "%s(%s)" % (cb.backend_name(), cb.backend_source())
+    except Exception:
+        pass
+    caps["fusion"] = (os.environ.get("BOSHI_SEARCH_FUSION", "auto") or "auto").lower()
+    ok(sec, "本进程能力：" + " ｜ ".join(f"{k}={v}" for k, v in caps.items() if v))
+    if caps.get("rerank", "").startswith("降级"):
+        warn(sec, f"本轮检索会用降级路径（{caps['rerank']}）：结果可信度按融合序对待")
+    return caps
 
 
 def check_embed(sec):
@@ -510,6 +620,7 @@ def main(argv):
 
     c = check_pg(SA)
     check_plugin(SA)
+    check_identity(SA, c)
     check_tables(SA, c)
     check_rerank(SA)
     check_embed(SA)
@@ -524,6 +635,7 @@ def main(argv):
     if not fast:
         check_slots(SC)
         check_fm_stats(SC, c)
+        check_capability(SC)
         check_search(SC)
         check_semantic(SC)
 
