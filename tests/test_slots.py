@@ -137,6 +137,43 @@ class TestFourSegmentVersion(unittest.TestCase):
         self.assertEqual(r["versions"], [])
 
 
+class TestVersionPrefixCase(unittest.TestCase):
+    """大写 `V` 前缀（2026-10-22）：库里的 `MiMo V2.5` / `Qwen V4.1` 之前整颗漏抽。
+
+    定案口径：抽提层 `[vV]` 都收；存储层保留原串（槽位是原文片段，不改写）；
+    归一化只发生在比较层 `pg_bridge._fm_ver`（剥 `^[vV]\\s*`），两边过同一函数。
+    """
+
+    def test_uppercase_v_three_seg(self):
+        self.assertIn("V2.5", slots.extract("MiMo V2.5 这个总参多少？")["versions"])
+        self.assertIn("V4.1", slots.extract("Qwen-Image V4.1 已发布")["versions"])
+
+    def test_uppercase_v_four_seg(self):
+        self.assertIn("V0.1.44.1", slots.extract("升级到 V0.1.44.1 后正常")["versions"])
+
+    def test_uppercase_v_kept_verbatim(self):
+        # 不改写成小写：槽位值必须是原文连续子串（可溯源）
+        self.assertEqual(slots.extract("对比 GLM V2.6 / V2.5")["versions"], ["V2.6", "V2.5"])
+
+    def test_letter_before_v_not_version(self):
+        # `AV1.2` / `SV2.0`：V 前是字母，不是版本前缀
+        self.assertEqual(slots.extract("AV1.2 编码 与 SV2.0 都不算版本")["versions"], [])
+
+    def test_single_segment_v_not_version(self):
+        self.assertEqual(slots.extract("V2 接口已上线")["versions"], [])
+
+    def test_uppercase_v_not_ip(self):
+        # 大写前缀的 4 段号不可能是 IP，无条件收；真 IP 仍然不收
+        self.assertIn("V1.2.3.4", slots.extract("固件 V1.2.3.4")["versions"])
+        self.assertEqual(slots.extract("IP 172.16.0.219 访问")["versions"], [])
+
+    def test_v_prefixed_after_equals_is_version(self):
+        # `=` 后面的裸数字是参数值（`_KW_LENB=0.5`），但带 v/V 前缀的是版本赋值
+        self.assertIn("V4.1", slots.extract("deepseek-flash=V4.1-Flash 峰时报价")["versions"])
+        self.assertIn("v0.7.21", slots.extract("hermes-web-ui=v0.7.21 已装")["versions"])
+        self.assertEqual(slots.extract("参数 _KW_LENB=0.5 别进 versions")["versions"], [])
+
+
 class TestExtraction(unittest.TestCase):
     def setUp(self):
         self.r = slots.extract(T1)

@@ -43,12 +43,14 @@ _RE_CLAUSE = re.compile(r"[^。；;，,\n]{0,40}")
 # 不做全库裸整数，否则日期、ID、随机数全进倒排。
 RE_NUM_KW = re.compile(r"(?:build|ctx|上下文长度|上下文|阈值|上限)[^\d\n]{0,4}(\d{2,7})(?![\d.])")
 # 版本号：v1.2 / 1.2.3；负向断言挡住 IP 片段与带单位的数字
-RE_VER = re.compile(r"(?<![\w.])(v?\d+\.\d+(?:\.\d+)?)(?![\d.\w])")
+# 2026-10-22：`v?` → `[vV]?`。库里有 39 行写成 `MiMo V2.5` / `Qwen V4.1` / `GLM V2.6`，
+# 大写 V 之前整颗漏抽（V 是 \w，负向断言 `(?<![\w.])` 把裸 4 段的回退路径也堵死）。
+RE_VER = re.compile(r"(?<![\w.])([vV]?\d+\.\d+(?:\.\d+)?)(?![\d.\w])")
 # 四段版本号（2026-10-20 补）：`0.1.44.1` 这类 4 段号上面最多只到 3 段抓不到，实测全库有 209 行含 4 段号。
 # 两条规则分开，因为**无 v 前缀的 4 段号与 IP 语法完全不可区分**（`0.1.44.1` vs `172.16.0.219`）：
-#   RE_VER4_V —— 有 v 前缀不可能是 IP，无条件收；
+#   RE_VER4_V —— 有 v/V 前缀不可能是 IP，无条件收；
 #   RE_VER4   —— 裸 4 段：任一节 >255 就不可能是 IP，直接收；全是合法 IP 节（≤255）时只认版本语境。
-RE_VER4_V = re.compile(r"(?<![\w.])(v\d+\.\d+\.\d+\.\d+)(?![\d.\w])")
+RE_VER4_V = re.compile(r"(?<![\w.])([vV]\d+\.\d+\.\d+\.\d+)(?![\d.\w])")
 RE_VER4 = re.compile(r"(?<![\w.])(\d+\.\d+\.\d+\.\d+)(?![\d.\w])")
 # 裸 4 段号赖以成立的版本语境词（近邻 ±12 字符内出现）
 _VER4_CTX = ("版本", "版号", "升到", "升级", "降级", "回滚", "发布", "固件", "内核", "更新到")
@@ -298,7 +300,10 @@ def _versions(text: str) -> List[str]:
             segs = tok.split(".")
             if len(segs) == 2 and len(segs[0]) > 3:   # 太长的整数段多半是 IP/数字
                 continue
-            if s and text[s - 1] in "=＝~":        # `_KW_LENB=0.5` 是参数值不是版本
+            if s and text[s - 1] in "=＝~" and tok[0] not in "vV":
+                # `_KW_LENB=0.5` 是参数值不是版本。
+                # 但 `MODEL=V4.1` / `api=deepseek-flash=V4.1` 里的 v/V 前缀号是版本赋值，
+                # 带前缀就不可能是个纯数值参数（2026-10-22 补：`deepseek-flash=V4.1-Flash` 曾被误吞）。
                 continue
             ctx = re.split(r"[，,。；;、]", text[max(0, s - 12):s])[-1].strip()
             after = text[m.end(1):m.end(1) + 12]
