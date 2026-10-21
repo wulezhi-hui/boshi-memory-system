@@ -2102,6 +2102,9 @@ def _fold_value_changes(items: list) -> list:
 _CONFLICT_ON = os.environ.get("BOSHI_CONFLICT_EXPOSE", "1") == "1"
 _CONFLICT_COS = float(os.environ.get("BOSHI_CONFLICT_COS", "0.88"))
 _CONFLICT_MIN_GAP = float(os.environ.get("BOSHI_CONFLICT_MIN_GAP", "60"))
+# 槽位键闸门（2026-10-22 护栏 1）：差异数字必须落在**同名归属键**上才调序。
+# 关闭（=0）退回旧行为：只要同 topic + 数字互斥 + 高相似就调序。
+_CONFLICT_SLOT_GATE = os.environ.get("BOSHI_CONFLICT_SLOT_GATE", "1") == "1"
 _UNIT_AFTER_NUM = re.compile(
     r"(\d+(?:\.\d+)?)\s*(层|个|条|台|张|次|天|秒|分钟|小时|周|月|年|人|GB|GiB|MB|MiB|KB|%|ms|t/s|tok/s)?",
     re.IGNORECASE)
@@ -2138,10 +2141,68 @@ def _doc_cos(texts: dict) -> dict:
         return {}
 
 
+# ── 护栏 1（2026-10-22）：差异数字必须属于**同名归属键**才调序 ────────────
+# 反例（用户验收造的数据）：「大眼守卫每小时眨眼 72 次」vs「独眼守卫每小时眨眼 145 次」
+# —— 同模板、余弦 ≥0.88、同 profile，按旧判据会被打成 conflict 并把新的排前排，
+# 但这是两个对象的真实数字，谁新谁旧毫无意义。真实库里的对应例子是
+# 「218 端口 11424 的部署记录」vs「219 端口 5442 的部署记录」。
+#
+# 归属键的取法：数字所在分句里「主语 + 属性」的尾部短语（剥掉「当前设定为/已调整为」这类
+# 连接词）。**不能直接用 slots.py 的槽位键**：那里是粗分类（numbers/ports/...），上面两对
+# 都会落在 numbers 里，挡不住误配对。量值口径仍与 slots.py 一致（数值 + 单位）。
+# 判不出归属键（某一侧数字前面没有属性短语，如「已调整为 100 层」）时**不放行也不拦截**，
+# 沿用旧行为——β4 起因的那个真换值对正是这种句式，卡死它等于把功能关掉。
+_VALUE_CLAUSE_SEP = re.compile(r"[，,。；;：:\n]")
+_TRAIL_CONNECT = re.compile(
+    r"(?:当前|目前|现在|原本|原来|已|已经)?"
+    r"(?:设定为|设置为|设为|调整为|调为|改为|改成|更新为|修改为|设为|定为|"
+    r"为|是|约|达到|到|至|从|比|=|＝|~|～)+$")
+
+
+def _value_anchors(text: str) -> list:
+    """[(数值, 单位, 归属键)]。归属键为空串＝这个数字前面没有属性短语。"""
+    out, s = [], (text or "")
+    for m in _UNIT_AFTER_NUM.finditer(s):
+        num = m.group(1).rstrip(".")
+        unit = (m.group(2) or "").strip().lower()
+        head = s[:m.start()]
+        cut = 0
+        for sep in _VALUE_CLAUSE_SEP.finditer(head):
+            cut = sep.end()
+        lab = _TRAIL_CONNECT.sub("", head[cut:].strip())
+        lab = re.sub(r"\s+", "", lab.strip(" 　的,、"))
+        out.append((num, unit, lab[-12:]))
+    return out
+
+
+def _label_match(a: str, b: str) -> bool:
+    """两个归属键是否指同一设定：相等，或一方省略主语（「开闸宽度」vs「云闸的开闸宽度」）。"""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    return len(short) >= 2 and long_.endswith(short)
+
+
+def _same_value_slot(text_a: str, diffs_a: set, text_b: str, diffs_b: set):
+    """True＝同一设定（可调序）｜False＝分属不同设定（只打标）｜None＝判不出（沿用旧行为）。"""
+    la = [lab for num, unit, lab in _value_anchors(text_a)
+          if (num, unit) in diffs_a and lab]
+    lb = [lab for num, unit, lab in _value_anchors(text_b)
+          if (num, unit) in diffs_b and lab]
+    if not la or not lb:
+        return None
+    return any(_label_match(x, y) for x in la for y in lb)
+
+
 def _mark_value_conflicts(items: list) -> list:
     """同 topic + 数值互斥 + 正文高度相似 → 双向打 conflict 标记，并把新的排前面。
 
     不写库、不改 score、不判真伪：只让「这里有两个互斥值、哪个更新」对 agent 可见。
+    归属键对不上的对（不同对象/不同设定的数字）**只打标、不调序**，并把
+    `conflict_role` 置为 `unknown`、`conflict_same_slot=False`，让消费方知道
+    这里的先后顺序不代表新旧。
     """
     if not _CONFLICT_ON or len(items) < 2:
         return items
@@ -2184,28 +2245,43 @@ def _mark_value_conflicts(items: list) -> list:
                 if not ta or not tb or abs(ta - tb) <= _CONFLICT_MIN_GAP:
                     continue                  # 判不出新旧 → 不标（宁可漏报不误报）
                 old, new = (a, b) if ta <= tb else (b, a)
-                pairs.append((old, new, va, vb))
+                # 归谁管：两侧「差异数字」的归属键是否同名。None＝判不出，按旧行为放行
+                same = None
+                if _CONFLICT_SLOT_GATE:
+                    o_vals, n_vals = (va, vb) if old is a else (vb, va)
+                    same = _same_value_slot(old.get("content", ""), o_vals - n_vals,
+                                            new.get("content", ""), n_vals - o_vals)
+                pairs.append((old, new, va, vb, same))
 
-    for old, new, va, vb in pairs:
-        for me, other, role, mv, ov in ((old, new, "older", va, vb),
-                                        (new, old, "newer", vb, va)):
+    for old, new, va, vb, same in pairs:
+        reorder = same is not False           # 归属键对不上 → 只打标，不调序
+        for me, other, mv, ov in ((old, new, va, vb), (new, old, vb, va)):
             mm = me.setdefault("metadata", {})
             mm["conflict"] = True
-            mm["conflict_role"] = role
+            if reorder:
+                mm["conflict_role"] = "older" if me is old else "newer"
+                mm["conflict_note"] = ("同主题存在互斥数值，未自动判定真伪；"
+                                       "较新的一条已排在前面，请结合上下文确认")
+            else:
+                # 两个数字分属不同对象/设定（如「大眼守卫…72 次」vs「独眼守卫…145 次」），
+                # 先后顺序不代表新旧：role 显式置 unknown，避免消费方拿位置当证据。
+                mm["conflict_role"] = "unknown"
+                mm["conflict_note"] = ("检测到相近正文里的不同数值，但归属不同对象/设定，"
+                                       "不是同一设定的新旧值；勿据此判断哪个是当前值")
+            mm["conflict_same_slot"] = (None if same is None else (same is not False))
             mm["conflict_with"] = str(other["id"])
             mm["conflict_values"] = {"mine": sorted(map(list, mv)),
                                      "other": sorted(map(list, ov))}
-            mm["conflict_note"] = ("同主题存在互斥数值，未自动判定真伪；"
-                                   "较新的一条已排在前面，请结合上下文确认")
-        # 新的排前面：只调位置（就地搬移，其余条目相对顺序不变）
-        try:
-            p_old = items.index(old)
-            p_new = items.index(new)
-            if p_new > p_old:
-                items.pop(p_new)
-                items.insert(p_old, new)
-        except ValueError:
-            pass
+        # 护栏 2：只交换配对内部两条的位置（其余条目下标不变），双方都留在结果里；
+        # 不写 is_latest、不改 score——真降级仍只走 resolve_conflict。
+        if reorder:
+            try:
+                p_old = items.index(old)
+                p_new = items.index(new)
+                if p_new > p_old:
+                    items[p_old], items[p_new] = items[p_new], items[p_old]
+            except ValueError:
+                pass
     return items
 
 

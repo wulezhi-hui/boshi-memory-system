@@ -327,6 +327,72 @@ class TestValueConflictExposure(unittest.TestCase):
         self.assertFalse(pb._CONFLICT_ON and os.environ.get("BOSHI_CONFLICT_EXPOSE") == "0")
 
 
+class TestConflictSlotGate(unittest.TestCase):
+    """护栏 1/2：归属键不同 → 只打标不调序；判不出 → 沿用旧行为；只交换配对内部两条。"""
+
+    def setUp(self):
+        self._cos = pb._doc_cos
+        self._gate = pb._CONFLICT_SLOT_GATE
+
+    def tearDown(self):
+        pb._doc_cos = self._cos
+        pb._CONFLICT_SLOT_GATE = self._gate
+
+    def _cos_hi(self, *ids):
+        return lambda texts: {(a, b): 0.95 for a in ids for b in ids if a != b}
+
+    def test_different_subjects_marked_but_order_kept(self):
+        # 同模板、同 profile、余弦 0.95，但数字属于两个不同守卫 → 不得把新的排前面
+        a = _item("a", "大眼守卫每小时眨眼 72 次", "守卫频率", 1000.0)
+        b = _item("b", "独眼守卫每小时眨眼 145 次", "守卫频率", 2000.0)
+        pb._doc_cos = self._cos_hi("a", "b")
+        out = pb._mark_value_conflicts([a, b])
+        self.assertEqual([i["id"] for i in out], ["a", "b"], "分属不同对象 → 位置不动")
+        for it in out:
+            self.assertTrue(it["metadata"].get("conflict"), "仍要打标，让人知道有不同数值")
+            self.assertEqual(it["metadata"].get("conflict_role"), "unknown")
+            self.assertFalse(it["metadata"].get("conflict_same_slot"))
+            self.assertIn("归属不同对象", it["metadata"]["conflict_note"])
+
+    def test_ports_on_different_hosts_not_reordered(self):
+        a = _item("a", "218 端口 11424 的部署记录", "部署", 1000.0)
+        b = _item("b", "219 端口 5442 的部署记录", "部署", 2000.0)
+        pb._doc_cos = self._cos_hi("a", "b")
+        out = pb._mark_value_conflicts([a, b])
+        self.assertEqual([i["id"] for i in out], ["a", "b"])
+        self.assertEqual({i["metadata"].get("conflict_role") for i in out}, {"unknown"})
+
+    def test_same_attr_reorders_even_if_one_side_omits_subject(self):
+        # β4 的原始场景：新值那句只说「已调整为 100 层」，判不出归属键 → 沿用旧行为
+        a = _item("a", "云闸的开闸宽度当前设定为 40 层", "云闸宽度", 1000.0)
+        b = _item("b", "已调整为 100 层", "云闸宽度", 2000.0)
+        pb._doc_cos = self._cos_hi("a", "b")
+        out = pb._mark_value_conflicts([a, b])
+        self.assertEqual(out[0]["id"], "b", "同一设定换值仍要让新值在前")
+        self.assertEqual({i["metadata"].get("conflict_role") for i in out},
+                         {"older", "newer"})
+        self.assertIsNone(out[0]["metadata"].get("conflict_same_slot"),
+                          "判不出归属键时标 None，不假装已确认同槽位")
+
+    def test_swap_only_touches_the_pair(self):
+        # 护栏 2：只交换配对两条的位置，中间那条下标不变，两条都还在结果里
+        a = _item("a", "云闸的开闸宽度为 40 层", "云闸宽度", 1000.0)
+        mid = _item("m", "云闸日志在 J:/logs 下", "云闸宽度", 1500.0)
+        b = _item("b", "云闸的开闸宽度为 100 层", "云闸宽度", 2000.0)
+        pb._doc_cos = self._cos_hi("a", "m", "b")
+        out = pb._mark_value_conflicts([a, mid, b])
+        self.assertEqual([i["id"] for i in out], ["b", "m", "a"])
+        self.assertEqual(len(out), 3)
+
+    def test_gate_off_restores_legacy_reorder(self):
+        pb._CONFLICT_SLOT_GATE = False
+        a = _item("a", "大眼守卫每小时眨眼 72 次", "守卫频率", 1000.0)
+        b = _item("b", "独眼守卫每小时眨眼 145 次", "守卫频率", 2000.0)
+        pb._doc_cos = self._cos_hi("a", "b")
+        out = pb._mark_value_conflicts([a, b])
+        self.assertEqual(out[0]["id"], "b", "关掉闸门＝旧行为")
+
+
 # ── #3 卸载计时器可观测 ────────────────────────────────────────
 
 class TestRerankVisibility(unittest.TestCase):
