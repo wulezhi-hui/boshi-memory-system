@@ -165,6 +165,46 @@ def current_profile() -> str:
     return _get_chroma().resolve_profile()
 
 
+# ── β2 写侧碎片门：无实词锚点的自动采集短碎片，不该当成「记忆」入库 ──────
+# 根因实证（2026-10-19 缺陷验收）：auto-save 把口语碎片「补」「为什么？」「怎么回事？」
+# 存成记忆行，离域 query（水晶怎么消磁）静默降级后命中这些碎片拿到接近满分的伪距离。
+# 判据刻意保守——只拦「全虚词 / 单字 / 无实词核心」的极短行，带 ≥1 实词双字（装完/辅食）
+# 一律放行（宁可漏拦「改完了吗」也不误伤「婴儿辅食」这种真意图）。零模型、纯字符串。
+# 虚词白名单只收功能字（语气/代词/连词/助词），动词名词（改/装/补/修/辅/食）都是实词。
+_FUNC_CORE_CHARS = set("的了着过吗呢吧啊呀哦嘛么什怎么为哪这那也就都还又再很太最更"
+                       "个些之乎曾向对与及把被就才到从让给问干吗很")
+_BARE_QUERIES = set("为什么 为何 干嘛 怎么回事 怎么 咋办 怎么弄 怎么办 "
+                    "怎么回事呢 为什么这么慢 怎么没反应 怎么这么慢".split())
+
+
+def is_content_fragment(text: str, max_len: int = 12) -> bool:
+    """判「无实词锚点的短碎片」。max_len 默认 12（超过的长句直接放行）。
+
+    只用于**自动采集**（hermes_plugin sync_turn 的 role=user 行）。判定顺序：
+      1. 原文 > max_len → 放行（长句有信息量）
+      2. 含数字 或 ≥2连续ASCII字母 → 放行（型号/路径/参数值，如 2080Ti、100、J盘）
+      3. 去标点后命中裸疑问白名单（为什么/怎么回事/怎么这么慢…）→ 碎片
+      4. 剥掉虚词白名单后的实词核心 ≤1（全虚词/单字）→ 碎片；≥2 → 放行
+    """
+    s = (text or "").strip()
+    if not s or len(s) > max_len:
+        return False
+    # 强锚点：含数字 或 ≥2连续ASCII字母（2080Ti、100、J盘）→ 型号/参数/路径，放行
+    if any(ch.isdigit() for ch in s) or re.search(r"[A-Za-z]{2}", s):
+        return False
+    if not re.search(r"[\u4e00-\u9fff]", s):
+        # 无 CJK 汉字 且 无强锚点 → 纯标点/空白/单字母（「？」「？？」「，」「a」），
+        # 没有任何实词对象，判碎片。
+        return True
+    # 裸疑问短语（去标点原文命中白名单）：为什么/怎么回事/怎么这么慢…无实词对象
+    bare = re.sub(r"[^A-Za-z0-9\u4e00-\u9fff]", "", s)
+    if bare in _BARE_QUERIES:
+        return True
+    core = "".join(ch for ch in s if ch not in _FUNC_CORE_CHARS
+                   and not ch.isspace())
+    return len(core) <= 1                  # 全虚词(core=0) 或 单字实词(core=1)
+
+
 def save(content: str, topic: str = "external", metadata: dict = None,
          profile: str = None, upsert: bool = False) -> dict:
     """
@@ -191,6 +231,18 @@ def save(content: str, topic: str = "external", metadata: dict = None,
     if profile:
         meta["profile"] = profile
     # profile 未显式给出时，由 chroma_bridge.add_memory 按当前进程归属打标
+
+    # β2 写侧碎片门：只拦「自动采集的用户对话碎片」（hermes_plugin 的 role=user
+    # conversation 行）。手动 MCP save、助手短结论、事实层 upsert 一律放行——
+    # 宁可漏拦「装完了吗」也不误伤「婴儿辅食」这种真意图。返回 skipped 而非抛错，
+    # 让调用方（插件 sync_turn）知道这轮没入库但不报错。
+    if (meta.get("source") == "hermes_plugin"
+            and topic == "conversation"
+            and (meta.get("role") == "user" or meta.get("role") is None)
+            and is_content_fragment(content)):
+        return {"success": True, "skipped": True, "memory_id": None,
+                "reason": "content_fragment",
+                "content_preview": (content or "")[:40]}
 
     memory_id = cb.add_memory(content=content, metadata=meta, upsert=upsert)
 

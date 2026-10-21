@@ -160,9 +160,29 @@ def check_rerank(sec):
     except Exception:
         up = False
     if not up:
-        fail(sec, "精排端点 127.0.0.1:11437 不在（检索静默退回融合序）",
-             "启动 C:\\Users\\wulezhi\\projects\\BuddhistRAG\\start_llama_rerank.bat"
-             "（该服务无开机自启，重启电脑后必须手动起）")
+        if st.get("autostart"):
+            # 按需拉起已接上（2026-10-22）：端口不通不是故障，第一次真实检索会自己拉起来。
+            # 这里主动拉一次，把「拉不起来」在体检里就暴露出来，而不是等用户查询时静默降级。
+            t0 = time.time()
+            try:
+                up = pb._ensure_rerank()
+            except Exception as e:      # 拉起路径自身出错也不能把体检打挂
+                up = False
+                detail = f"{type(e).__name__}: {e}"
+            dt = time.time() - t0
+            if up:
+                ok(sec, f"精排未在运行 → 按需拉起成功（{dt:.1f}s，pid 见 "
+                        f"~/.boshi/logs/pg_autostart.log）")
+            else:
+                st2 = pb.rerank_status()
+                fail(sec, f"按需拉起失败（{dt:.1f}s）：{st2['reason']} "
+                          f"{st2.get('detail') or locals().get('detail') or ''}".strip(),
+                     "看 ~/.boshi/logs/rerank_server.log（拉起失败原因原样落盘）；"
+                     "显存 < 800MiB 时会主动跳过，先腾显存")
+        else:
+            fail(sec, "精排端点 127.0.0.1:11437 不在，且按需拉起已被关闭（检索静默退回融合序）",
+                 "去掉环境变量 BOSHI_RERANK_AUTOSTART=0，或手动启动 "
+                 "C:\\Users\\wulezhi\\projects\\BuddhistRAG\\start_llama_rerank.bat")
     else:
         # 进程内 _RERANK_STATUS 只反映「本进程上一次真实调用」，新会话刚起时是空的，
         # 直接读它会把「还没调过」误报成「上次失败」。所以这里主动打一发探针，
@@ -182,7 +202,7 @@ def check_rerank(sec):
             st = st2
         else:
             fail(sec, f"精排探针失败（{ms:.0f}ms）：{st2['reason']} {st2.get('detail') or ''}".strip(),
-                 "看 11437 进程日志；该服务无开机自启，重启后需手动起")
+                 "看 ~/.boshi/logs/rerank_server.log 与 11437 进程日志；按需拉起下次检索会重试（冷却 120s）")
     m = "D:/llama/models/bge-reranker-v2-m3-FP16.gguf"
     if os.path.exists(m):
         ok(sec, f"精排模型 {os.path.getsize(m) // 1024 // 1024}MB")
@@ -392,9 +412,48 @@ def check_search(sec):
             warn(sec, f"检索耗时 {ms:.0f}ms > 6s（会话注入有超时保护，会丢上下文）")
 
 
-# ══════════════════════════════════════════════════════════════
+def check_semantic(sec):
+    """β2 语义质量探针（2026-10-19 缺陷验收暴露的盲区）。
+
+    doctor 全绿只说明「基础设施在跑」，说明不了「检索结果可不可信」：精排降级时
+    离域题（水晶怎么消磁）照样拿到接近满分的融合伪距离，agent 无法判断该不该信。
+    现在每条结果带 relevance/confidence（重排后验概率三档），这里直接用两道题验
+    证系统**能**区分域内外：
+      · 离域题 top1 应为 confidence=low（库里没有相关答案 → 别全信）
+      · 在域题 top1 应为 confidence=high（库里确有答案 → 可信）
+    两道都 unknown → 重排没接上/旧代码 → 响亮 warn（β2 最危险的静默降级形态）。
+    注意：本探针会走真实检索，往 fm_stats 多记 ~2 条查询（doctor 是诊断工具，
+    噪声可接受；持续评测才需要 BOSHI_FM_STATS=0，那是 eval 脚本的事）。
+    """
+    import pg_bridge as pb
+    probes = (("水晶怎么消磁", "离域", "low"),
+              ("俱舍论是什么", "在域", "high"))
+    for q, kind, expect in probes:
+        try:
+            items = pb.search_memory(q, top_k=3)
+        except Exception as ex:
+            fail(sec, f"语义探针「{q}」检索失败：{ex}")
+            continue
+        if not items:
+            warn(sec, f"语义探针「{q}」零结果")
+            continue
+        md = items[0].get("metadata") or {}
+        conf, rel = md.get("confidence"), md.get("relevance")
+        if conf is None:
+            warn(sec, f"语义探针「{q}」无 confidence 标记（重排未接上/旧代码）"
+                     f" → agent 无法判断这条可不可信",
+                 "确认 11437 在线 + pg_bridge 是含 β2 的新版")
+        elif conf == expect:
+            ok(sec, f"语义探针「{q}」({kind}) top1 confidence={conf} relevance={rel}")
+        else:
+            warn(sec, f"语义探针「{q}」({kind}) 期望 {expect} 实为 {conf}"
+                     f"（relevance={rel}）→ 域外误判高 / 域内漏判",
+                 "比对全库 relevance 分布与阈值 BOSHI_REL_HIGH/MID")
+
+
+# ══════════════════════════════════════════════════════════════════
 # 修复项
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 def fix_ts():
     """回填 created_at 为空的历史行：取同 profile 最近一条有效时间，meta 打 derived 标记。
 
@@ -466,6 +525,7 @@ def main(argv):
         check_slots(SC)
         check_fm_stats(SC, c)
         check_search(SC)
+        check_semantic(SC)
 
     if c is not None:
         try:

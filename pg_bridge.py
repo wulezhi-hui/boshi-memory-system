@@ -365,6 +365,17 @@ def _cond(key: str, val) -> tuple:
         if isinstance(val, dict) and "$ne" in val:
             return ("TRUE" if val["$ne"] == "relation" else "FALSE", [])
         return ("meta->>'type' = %s", [val])
+    if key in ("session_id", "topic", "role", "source"):
+        # 真列（写入时 add_memory 把这几项 pop 出 meta 落成真列），**不在 meta jsonb 里**。
+        # 早期误按 `meta->>'session_id'` 查 → 永远 NULL → 过滤恒空（2026-10-19 β3 验收实测）。
+        col = key
+        if isinstance(val, dict):
+            for op, sqlop in (("$eq", "="), ("$ne", "IS DISTINCT FROM"),
+                              ("$gte", ">="), ("$lte", "<="), ("$gt", ">"), ("$lt", "<")):
+                if op in val:
+                    return ("%s %s %%s" % (col, sqlop), [val[op]])
+            return ("TRUE", [])
+        return ("%s = %%s" % col, [val])
     if isinstance(val, dict):
         for op, sqlop in (("$eq", "="), ("$ne", "IS DISTINCT FROM")):
             if op in val:
@@ -1625,6 +1636,15 @@ _VRAM_CACHE = {"t": 0.0, "free": None}
 _RERANK_STATUS: Dict[str, Any] = {"ok": None, "reason": "", "ts": 0.0, "detail": ""}
 _STATUS_LOG_AT = [0.0]
 
+# ── β2 置信度分级（重排后验概率 relevance 的阈值）─────────────────────────
+# 重排后验 p 是天然的相关性概率：bge-reranker 直接输出「这条跟 query 相关」的
+# 0~1 概率。实测 2026-10-19（重排在线）：在域题 top1 p 全 ≥0.95，离域题最高 0.42；
+# 分界干净压在 0.5。把它暴露成 relevance + confidence，agent 才知道「这条可不可信」
+# ——之前离域题静默降级后拿 0.30 融合伪距离满分离谱，分数高低完全不能判可信度。
+# 阈值可调：BOSHI_REL_HIGH / BOSHI_REL_MID。
+_RELEVANCE_HIGH = float(os.environ.get("BOSHI_REL_HIGH", "0.5"))
+_RELEVANCE_MID = float(os.environ.get("BOSHI_REL_MID", "0.3"))
+
 
 def _vram_free_mib():
     """当前空闲显存（MiB）；取不到返回 None（取不到就不阻断重排）。"""
@@ -1647,6 +1667,137 @@ def _vram_free_mib():
     return free
 
 
+# ── 重排服务按需拉起（2026-10-22）─────────────────────────────────────────
+# 缘起：11436 嵌入早有「按需拉起 + 空闲卸载」（BuddhistRAG/embed_client.py 的
+# ensure_service，DETACHED 隐藏窗口，用户 2026-10-10 批准并实测过），但重排 11437
+# 走的是另一条路径（本模块 _rerank_items 的 HTTP 直连），从没接这个钩子 —— 只靠
+# 手动跑 start_llama_rerank.bat，而那个 bat 里只有 llama.cpp 原生
+# --sleep-idle-seconds 600：**睡 = 让出 ~650MiB 显存、进程与端口都留着、请求即醒；
+# 它不会在服务没起时把服务拉起来**。后果：机器重启 / 进程被外部杀掉之后，检索会
+# 静默降级成融合序（relevance=null），表面一切正常、分数却不可信。
+# 这里把 embed_client 那套已验证的做法搬过来：
+#   端口不通 → 显存预检 → DETACHED 启动（脱离调用方进程树，父进程退出不连坐）
+#   → 轮询 /health 就绪 → 继续本次重排；任一步失败 → 照旧降级，绝不抛异常。
+# 开关：BOSHI_RERANK_AUTOSTART=0 关闭 ｜ BOSHI_RERANK_AUTOSTART_WAIT=秒（默认 25）
+#       BOSHI_RERANK_SPAWN_COOLDOWN=秒（默认 120，防拉起风暴）
+_RERANK_AUTOSTART = os.environ.get("BOSHI_RERANK_AUTOSTART", "1") == "1"
+_RERANK_AUTOSTART_WAIT = float(os.environ.get("BOSHI_RERANK_AUTOSTART_WAIT", "25"))
+_RERANK_SPAWN_COOLDOWN = float(os.environ.get("BOSHI_RERANK_SPAWN_COOLDOWN", "120"))
+_RERANK_LLAMA_DIR = os.environ.get("BOSHI_RERANK_LLAMA_DIR", r"D:\llama")
+_RERANK_GGUF = os.environ.get("BOSHI_RERANK_GGUF",
+                              os.path.join(_RERANK_LLAMA_DIR, "models",
+                                           "bge-reranker-v2-m3-FP16.gguf"))
+_RERANK_LOG = os.environ.get(
+    "BOSHI_RERANK_LOG",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "rerank_server.log"))
+_RERANK_LAST_SPAWN = [0.0]          # 上次「尝试」拉起（含失败）的时间 → 冷却判据
+_RERANK_LAST_START = [0.0]          # 上次真正发出 Popen 的时间（观测用）
+
+
+def _rerank_endpoint():
+    """从 _RERANK_URL 抠出 (host, port)；默认 127.0.0.1:11437。"""
+    m = re.match(r"^https?://([^/:]+)(?::(\d+))?", _RERANK_URL or "")
+    if not m:
+        return "127.0.0.1", 11437
+    return m.group(1), int(m.group(2) or 11437)
+
+
+def _rerank_port_alive(timeout: float = 0.4) -> bool:
+    import socket
+    host, port = _rerank_endpoint()
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _rerank_ready(timeout: float = 1.0) -> bool:
+    """就绪 = /health 返回 2xx（睡眠中的实例也返回 200，请求会把它唤醒）。"""
+    import urllib.request
+    host, port = _rerank_endpoint()
+    try:
+        with urllib.request.urlopen("http://%s:%d/health" % (host, port), timeout=timeout) as r:
+            return 200 <= getattr(r, "status", 200) < 300
+    except Exception:                # noqa: BLE001
+        return False
+
+
+def _spawn_detached(cmd: list, logpath: str, cwd: str) -> int:
+    """脱离调用方进程树 + 隐藏控制台启动（父进程退出不连坐）。"""
+    d = os.path.dirname(logpath)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    fh = open(logpath, "ab")
+    kw = dict(stdin=subprocess.DEVNULL, stdout=fh, stderr=fh, close_fds=True, cwd=cwd)
+    if os.name == "nt":
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+        try:      # 优先彻底脱离 Job：agent/终端跑在 job 里，不脱离会被一并清理
+            p = subprocess.Popen(cmd, creationflags=(DETACHED_PROCESS |
+                                                     CREATE_NEW_PROCESS_GROUP |
+                                                     CREATE_BREAKAWAY_FROM_JOB), **kw)
+        except OSError:                   # 不在 job 中时 breakaway 会失败 → 退回
+            p = subprocess.Popen(cmd, creationflags=(DETACHED_PROCESS |
+                                                     CREATE_NEW_PROCESS_GROUP), **kw)
+    else:
+        p = subprocess.Popen(cmd, start_new_session=True, **kw)
+    return p.pid
+
+
+def _start_rerank_service() -> int:
+    """沿用 start_llama_rerank.bat 的同一套参数（参数变了分数就变，别乱动）。"""
+    exe = os.path.join(_RERANK_LLAMA_DIR, "llama-server.exe")
+    if not os.path.exists(exe):
+        raise RuntimeError("找不到 llama-server：%s" % exe)
+    if not os.path.exists(_RERANK_GGUF):
+        raise RuntimeError("找不到重排模型：%s" % _RERANK_GGUF)
+    host, port = _rerank_endpoint()
+    cmd = [exe, "-m", _RERANK_GGUF, "--rerank",
+           "--host", host, "--port", str(port),
+           "-c", "8192", "-b", "4096", "-ub", "4096",
+           "--sleep-idle-seconds", "600", "-ngl", "99"]
+    pid = _spawn_detached(cmd, _RERANK_LOG, _RERANK_LLAMA_DIR)
+    _RERANK_LAST_START[0] = time.time()
+    _log("rerank 按需拉起：pid=%d port=%s（日志 %s）" % (pid, port, _RERANK_LOG))
+    return pid
+
+
+def _ensure_rerank() -> bool:
+    """确保 11437 可用：已起 → True；没起 → 拉起并等就绪。失败返回 False（绝不抛）。"""
+    if _rerank_port_alive():
+        return True
+    if not _RERANK_AUTOSTART:
+        _set_rerank_status(False, "service_down",
+                           "11437 未监听，且已禁用按需拉起（BOSHI_RERANK_AUTOSTART=0）")
+        return False
+    now = time.time()
+    if now - _RERANK_LAST_SPAWN[0] < _RERANK_SPAWN_COOLDOWN:
+        return False                     # 冷却中：别每次检索都连发 Popen
+    _RERANK_LAST_SPAWN[0] = now
+    free = _vram_free_mib()
+    if free is not None and free < _RERANK_VRAM_MIN:
+        _set_rerank_status(False, "vram_low",
+                           "按需拉起跳过：free=%dMiB < min=%dMiB" % (free, _RERANK_VRAM_MIN))
+        return False
+    try:
+        _start_rerank_service()
+    except Exception as e:               # noqa: BLE001
+        _set_rerank_status(False, "autostart_failed", "%s: %s" % (type(e).__name__, e))
+        return False
+    t0 = time.time()
+    while time.time() - t0 < _RERANK_AUTOSTART_WAIT:
+        if _rerank_port_alive() and _rerank_ready():
+            _VRAM_CACHE["t"] = 0.0        # 权重已上卡，显存变了 → 下次重查
+            _log("rerank 按需拉起就绪：%.1fs" % (time.time() - t0))
+            return True
+        time.sleep(0.25)
+    _set_rerank_status(False, "autostart_timeout",
+                       "%.0f 秒内未就绪，见 %s" % (_RERANK_AUTOSTART_WAIT, _RERANK_LOG))
+    return False
+
+
 def _set_rerank_status(ok: bool, reason: str = "", detail: str = "") -> None:
     _RERANK_STATUS.update(ok=ok, reason=reason, ts=time.time(), detail=detail[:200])
     if ok:
@@ -1657,7 +1808,7 @@ def _set_rerank_status(ok: bool, reason: str = "", detail: str = "") -> None:
 
 
 def rerank_status() -> Dict[str, Any]:
-    """重排运行状态快照（ok/reason/detail/ts + 配置），供 doctor/人工核对。"""
+    """重排运行状态快照（ok/reason/detail/ts + 配置 + 按需拉起），供 doctor/人工核对。"""
     free = _VRAM_CACHE["free"]
     return {"enabled": _RERANK_ON, "url": _RERANK_URL, "ok": _RERANK_STATUS["ok"],
             "reason": _RERANK_STATUS["reason"], "detail": _RERANK_STATUS["detail"],
@@ -1666,7 +1817,10 @@ def rerank_status() -> Dict[str, Any]:
             "blend": {"w_rk": _BLEND_W_RK, "w_fu": _BLEND_W_FU,
                       "k": _BLEND_K, "head": _BLEND_HEAD},
             "vram_free_mib": free, "vram_min": _RERANK_VRAM_MIN,
-            "down_until": _RERANK_DOWN_UNTIL[0]}
+            "down_until": _RERANK_DOWN_UNTIL[0],
+            "autostart": _RERANK_AUTOSTART, "port_alive": _rerank_port_alive(),
+            "spawn_cooldown": _RERANK_SPAWN_COOLDOWN,
+            "last_spawn": _RERANK_LAST_SPAWN[0], "last_start": _RERANK_LAST_START[0]}
 
 
 
@@ -1686,9 +1840,18 @@ def _rerank_items(query: str, items: list, top_k: int) -> list:
         return items[:k]
     if time.time() < _RERANK_DOWN_UNTIL[0]:      # 熔断中：直接走融合序
         return items[:k]
+    # 按需拉起：服务没起（机器重启 / 被外部杀 / 从没启动）→ 拉起再重排；
+    # 拉不起来（显存不够 / 冷却中 / 启动失败）→ 本次降级走融合序。
+    if not _rerank_port_alive():
+        if not _ensure_rerank():
+            return items[:k]
+        woke_now = True
+    else:
+        woke_now = False
     # 显存预检：只有「模型很可能已经睡了」时才查显存（wake 需 +650MiB）；
     # 刚成功调用过（≤_RERANK_WARM_SEC）说明权重还在卡上，直接调，不做无谓拦截。
-    if time.time() - _RERANK_LAST_OK[0] > _RERANK_WARM_SEC:
+    # 刚被我们拉起 = 权重已加载，跳过预检（否则刚起来就被自己的显存检查挡掉）。
+    if not woke_now and time.time() - _RERANK_LAST_OK[0] > _RERANK_WARM_SEC:
         free = _vram_free_mib()
         if free is not None and free < _RERANK_VRAM_MIN:
             _set_rerank_status(False, "vram_low",
@@ -1757,6 +1920,11 @@ def _rerank_items(query: str, items: list, top_k: int) -> list:
         md = it.get("metadata")
         if isinstance(md, dict):
             md["rerank_score"] = round(lg, 4)
+            # β2：暴露重排后验概率 + 三档置信度。离域/无答案的 query 拿到的这条
+            # relevance 会很低（实测离域最高 ~0.42），调用方据此知道「别全信」。
+            md["relevance"] = round(p, 4)
+            md["confidence"] = ("high" if p >= _RELEVANCE_HIGH
+                                else "mid" if p >= _RELEVANCE_MID else "low")
     scored = [i for i in range(len(items)) if i not in missing]
     rk_rank = {i: r for r, i in enumerate(
         sorted(scored, key=lambda i: (items[i]["score"], i)))}
@@ -1805,6 +1973,75 @@ def _rerank_items(query: str, items: list, top_k: int) -> list:
         out.append(it)
     return out[:k]
 
+
+# ── β3 换值折叠：结果内「同一设定的新旧值」取新弃旧 ─────────────────────
+# 库已有 upsert（旧行 is_latest=false + 新行 supersedes）和 detect_conflicts/
+# resolve_conflict，但**检索没接上**：agent 问「当前设定」时，旧值行因字面更匹配
+# query 仍顶到 top1（实测 40 vs 100：旧 0.9976 > 新 0.9777），读到已失效值。
+#
+# 判据（纯字符串、零模型、零 SQL）：同 topic + 去数字正文相等 + 数字部分不同
+#   = 「同一事实改了个数」。跨 session 的数值互斥是噪声（实测 80 对全废：
+#   「256 的 vllm」vs「4% 的养老金」碰巧数值不重叠但不是同一设定），所以必须
+#   限定同 topic；去数字归一相等又比「数值互斥」更强（排掉同主题不同事）。
+# 只改结果顺序与标记，**不写库**（真降级留给 resolve_conflict），让 agent 读新值。
+_NUM_BODY_RE = re.compile(r"[\d.,]+")
+
+
+def _norm_value_body(text: str) -> str:
+    """去数字归一：数字/小数/千分位逗号 → '#'，空白去掉。「设定为 40」/「设定为 100」→「设定为#」相等。"""
+    return _NUM_BODY_RE.sub("#", (text or "").replace(" ", ""))
+
+
+def _fold_value_changes(items: list) -> list:
+    """结果内换值对折叠：同 topic、去数字正文相等、数字不同 → 旧值标 superseded
+    并甩到新值后面。零模型、纯字符串、不写库。"""
+    if len(items) < 2:
+        return items
+    from collections import defaultdict
+
+    def _ts(it):
+        md = it.get("metadata") or {}
+        return float(md.get("timestamp") or md.get("created_at") or 0.0)
+
+    by_topic = defaultdict(list)
+    for it in items:
+        md = it.get("metadata") or {}
+        by_topic[str(md.get("topic") or "")].append(it)
+
+    folded = False
+    for grp in by_topic.values():
+        if len(grp) < 2:
+            continue
+        norm = [_norm_value_body(it.get("content", "")) for it in grp]
+        for i in range(len(grp)):
+            for j in range(i + 1, len(grp)):
+                if norm[i] != norm[j]:
+                    continue                     # 去数字后不等 → 不是「同一事实换值」
+                a, b = grp[i], grp[j]
+                raw_a = (a.get("content") or "").strip()
+                raw_b = (b.get("content") or "").strip()
+                if raw_a == raw_b:
+                    continue                     # 数字也相同 = 完全重复，交给常规去重
+                old, new = (a, b) if _ts(a) <= _ts(b) else (b, a)
+                om = old.setdefault("metadata", {})
+                om["superseded"] = True
+                om["superseded_by"] = str(new["id"])
+                om["value_superseded"] = True
+                om["note"] = "数值已被同主题更新值取代，读「当前设定」请用新值"
+                try:
+                    old["score"] = round(max(float(new.get("score") or 0.0), 0.0) + 0.5, 6)
+                except Exception:
+                    old["score"] = 1.0
+                folded = True
+    if folded:
+        # 稳定排序：只有旧值 score 被拉远，其余保序；结果此时全是记忆（未混图谱边）
+        items.sort(key=lambda x: (float(x.get("score") or 0.0), str(x.get("id") or "")))
+    return items
+
+
+# β2：重排在线时用 relevance/confidence 暴露可置信度（在 _rerank_items 内写入）。
+# 重排降级（服务死/OOM 静默回退）时结果没有 relevance —— 在 search_memory 末尾给
+# 每条补 confidence="unknown"，让 agent 知道「这条是未重排的融合序，别全信」。
 
 
 def search_memory(query: str, top_k: int = 5, where: dict = None,
@@ -1937,6 +2174,24 @@ def search_memory(query: str, top_k: int = 5, where: dict = None,
                     items = (_pick + list(items))[:int(top_k)]
         except Exception:              # 增强项，坏了退回主链路结果
             pass
+
+    # β2 降级打标：重排在线时 _rerank_items 已给每条写 relevance/confidence；
+    # 重排静默降级（服务死/OOM/显存不足）时结果里没有 relevance，这里补
+    # confidence="unknown"，让 agent 知道「这批是未重排的融合序，分数不能当可信度」。
+    if _RERANK_ON:
+        _rr_online = any(
+            "relevance" in (it.get("metadata") or {}) for it in items)
+        if not _rr_online:
+            for it in items:
+                _md = it.setdefault("metadata", {})
+                if "relevance" not in _md:
+                    _md["relevance"] = None
+                    _md["confidence"] = "unknown"
+                    _md["note"] = "重排未生效（静默降级），分数不可作相关性判据"
+
+    # β3：同一设定的新旧值折叠（取新弃旧，不写库）——放在最终 return 前，
+    # 让「当前设定」类 query 读到的是新值而非字面更匹配的旧值。
+    items = _fold_value_changes(items)
 
     if include_graph:      # 需要图谱联想时，并入边表结果（与 Chroma 后端行为对齐）
         v = _vec_literal(_ef()([query or " "])[0])
