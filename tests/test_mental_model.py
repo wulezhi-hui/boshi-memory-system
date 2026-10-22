@@ -241,8 +241,11 @@ class PluginTest(unittest.TestCase):
             src = f.read()
         self.assertIn("def _with_mm", src)
         self.assertIn("def _mental_model_prefix", src)
-        # 页在前、本轮召回在后
-        self.assertIn('mm + ("\\n\\n" + text if text else "")', src)
+        # 2026-10-22：拼接顺序改为 心智模型页 → 本会话态 → 本轮召回。
+        # 断言实现体而不是旧的字面量 mm + (...) —— 会话态插在中间，
+        # 旧断言留在原处会让这条测试永远红。
+        self.assertIn("parts = [x for x in (mm, ss, text) if x]", src)
+        self.assertIn('return "\\n\\n".join(parts)', src)
 
 
 if __name__ == "__main__":

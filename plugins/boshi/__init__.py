@@ -539,15 +539,19 @@ class BoshiMemoryProvider(MemoryProvider):
 
     # ---- 每 query 召回缓存（LRU 8 × TTL 300s）---------------------------
     @staticmethod
-    def _qkey(query: str) -> str:
-        """query 指纹：忽略空白与大小写差异，避免同一句话的细微排版不同而重复检索。"""
+    def _qkey(query: str, session_id: str = "") -> str:
+        """query 指纹：忽略空白与大小写差异，避免同一句话的细微排版不同而重复检索。
+
+        2026-10-22：指纹里并入 session_id —— 同一句话在不同会话里召回的
+        「历史会话 FTS」不同，只按 query 缓存会把 A 会话的结果灌进 B 会话。
+        """
         import hashlib
         norm = "".join((query or "").split()).lower()
-        return hashlib.md5(norm.encode("utf-8", "ignore")).hexdigest()
+        return hashlib.md5((norm + "\x00" + (session_id or "")).encode("utf-8", "ignore")).hexdigest()
 
-    def _pcache_get(self, query: str):
+    def _pcache_get(self, query: str, session_id: str = ""):
         """命中返回 (text, count)，过期返回 None。"""
-        k = self._qkey(query)
+        k = self._qkey(query, session_id)
         item = self._pcache.get(k)
         if not item:
             return None
@@ -557,10 +561,10 @@ class BoshiMemoryProvider(MemoryProvider):
             return None
         return text, count
 
-    def _pcache_put(self, query: str, text: str, count: int) -> None:
+    def _pcache_put(self, query: str, text: str, count: int, session_id: str = "") -> None:
         if not query:
             return
-        self._pcache[self._qkey(query)] = (time.time(), text or "", int(count or 0))
+        self._pcache[self._qkey(query, session_id)] = (time.time(), text or "", int(count or 0))
         while len(self._pcache) > 8:                  # 简单 LRU：丢掉最早写入的
             oldest = min(self._pcache, key=lambda k: self._pcache[k][0])
             self._pcache.pop(oldest, None)
@@ -613,7 +617,7 @@ class BoshiMemoryProvider(MemoryProvider):
                 self._prefetch_time = time.time()
                 # 同时写入每 query 缓存：prefetch 按当轮 query 精确取用，
                 # 不再"5 分钟内一律返回第一轮的召回"。
-                self._pcache_put(query, self._prefetch_cache, self._prefetch_count)
+                self._pcache_put(query, self._prefetch_cache, self._prefetch_count, session_id)
             except Exception as e:
                 logger.warning("boshi queue_prefetch 失败（本轮不会有记忆注入、🦄 图标也不会出现）: %s", e)
                 self._prefetch_cache = ""
@@ -700,19 +704,21 @@ class BoshiMemoryProvider(MemoryProvider):
                   is_trivial_prompt(query), self._core is not None)
             return ""
         mm = self._mental_model_prefix()
-        # 缓存：按当轮 query 取值（2026-10-19 改）。旧逻辑只认"5 分钟内"，不看
-        # query，导致同一会话第 2 轮起注入的永远是第一次提问的召回结果。
-        hit = self._pcache_get(query)
+        # 本会话态：每轮现查（~1ms，纯 SQL），不进缓存——它每轮都在变。
+        # bili 折叠后原文仍在本地，但"该取回哪一段"要先知道"现在在做什么"。
+        ss = self._session_state(session_id)
+        # 缓存：按当轮 query + 会话取值（2026-10-19 改；2026-10-22 并入 session_id）
+        hit = self._pcache_get(query, session_id)
         if hit is not None:
             text, count = hit
             self._prefetch_count = count
             _diag("prefetch 命中 per-query 缓存：count=%s，%d 字符", count, len(text))
-            return self._with_mm(text, mm)
+            return self._with_mm(text, mm, ss)
         # 兼容旧缓存字段：只有 query 完全一致时才复用（防止跨问题串味）
         if (self._prefetch_cache and self._prefetch_query == query
                 and time.time() - self._prefetch_time < 300):
             _diag("prefetch 命中缓存：count=%s，%d 字符 → 图标应显示", self._prefetch_count, len(self._prefetch_cache))
-            return self._with_mm(self._prefetch_cache, mm)
+            return self._with_mm(self._prefetch_cache, mm, ss)
         # 首轮/缓存过期：同步检索兜底（保证每轮都有记忆注入）
         try:
             result = self._core.search(query, top_k=5, source="all")
@@ -735,24 +741,137 @@ class BoshiMemoryProvider(MemoryProvider):
             _diag("prefetch 实时检索：count=%s，%d 行内容", self._prefetch_count, len(lines))
             if not lines:
                 _diag("prefetch 检索结果为空 → 无召回注入、🦄 图标不出现")
-                return self._with_mm("", mm)
+                return self._with_mm("", mm, ss)
             text = "## 伯仕记忆召回\n" + "\n".join(lines[:8])
-            self._pcache_put(query, text, self._prefetch_count)
-            return self._with_mm(text, mm)
+            self._pcache_put(query, text, self._prefetch_count, session_id)
+            return self._with_mm(text, mm, ss)
         except Exception as e:
             logger.warning("boshi prefetch 失败（本轮无记忆召回、🦄 图标不会出现）: %s", e)
-            return self._with_mm("", mm)
+            return self._with_mm("", mm, ss)
 
     # ------------------------------------------------------------------
     # 心智模型预计算页（P2 ④）
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _with_mm(text: str, mm: str) -> str:
-        """把心智模型页拼在本轮召回前面；页为空则原样返回。"""
-        if not mm:
-            return text
-        return mm + ("\n\n" + text if text else "")
+    def _with_mm(text: str, mm: str, ss: str = "") -> str:
+        """心智模型页 → 本会话态 → 本轮召回，依次拼接；空段自动跳过。
+
+        顺序有讲究：会话态（"我们在做什么"）必须排在召回之前——它在长程任务里
+        是读后面那些跨会话记忆的**上下文**，放最后容易被当成补充材料忽略。
+        """
+        parts = [x for x in (mm, ss, text) if x]
+        return "\n\n".join(parts)
+
+    # ---- 本会话态注入（长程接续，2026-10-22）------------------------------
+    # 背景：bili/ACP 折叠后原文仍在本地库（可 decompress），但"该取回哪一段"
+    # 取决于"现在在做什么"。折叠只从**最旧**的那头切，压缩摘要之外的信息
+    # （尤其串起任务线的用户原话与最后决定）最容易在摘要里被抹平。这里每次
+    # 现查一次纯 SQL（~1ms，远小于 Hermes 8s 的 prefetch 预算）补上这一层。
+    _SESSION_STATE_CAP = 600
+
+    def _session_state(self, session_id: str) -> str:
+        """本会话「任务起点 + 最近原文 + 最新事实层」，供跨压缩接续。
+
+        为什么是这两头（2026-10-22 实测定下的口径）：
+        - bili/ACP 折叠**只从最旧那头切**，所以被抹掉的是"这个任务最初要干什么"，
+          而最近几轮其实还在窗口里。只注入最近几轮属于重复，救不回被切掉的前端，
+          于是两边都取：首条用户原话（任务起点，锚定目标）+ 最近 4 行（当前状态）。
+        - Hermes 原生 compaction 才会触发 `on_pre_compress` 落 task_conclusion；
+          bili 在代理层折叠，Hermes 上下文永远不满，`on_pre_compress` 跑不到，
+          本会话根本没有 task_conclusion 行——所以起点只能从 conversation 里取。
+
+        用户话截 100 字、我的结论截 140 字；起点永不丢，超 600 字从最近的行里
+        由旧向新丢。开关：BOSHI_SESSION_STATE=0 回滚（本轮即不再注入）。
+        """
+        if not session_id or os.environ.get("BOSHI_SESSION_STATE", "1") == "0":
+            return ""
+        _TAIL_N = 4
+        try:
+            import pg_bridge
+            cur = pg_bridge._conn().cursor()
+            # 任务起点：本会话第一条用户原话
+            cur.execute(
+                """SELECT content, created_at FROM boshi.memories
+                    WHERE session_id = %s AND (profile = %s OR profile IS NULL)
+                      AND topic = 'conversation'
+                    ORDER BY created_at ASC LIMIT 1""",
+                (session_id, self._profile),
+            )
+            origin = cur.fetchone()
+            cur.execute(
+                """SELECT topic, content, created_at FROM boshi.memories
+                    WHERE session_id = %s AND (profile = %s OR profile IS NULL)
+                      AND topic IN ('conversation', 'assistant_conclusion')
+                    ORDER BY created_at DESC LIMIT %s""",
+                (session_id, self._profile, _TAIL_N),
+            )
+            rows = cur.fetchall()[::-1]           # 时间正序：旧在上、新在下
+            cur.execute(
+                """SELECT content, created_at FROM boshi.memories
+                    WHERE session_id = %s AND (profile = %s OR profile IS NULL)
+                      AND topic = 'session_fact'
+                    ORDER BY created_at DESC LIMIT 1""",
+                (session_id, self._profile),
+            )
+            frow = cur.fetchone()
+        except Exception as e:  # noqa: BLE001 — 会话态不能拖垮召回主路径
+            logger.debug("boshi _session_state 读取失败（忽略）: %s", e)
+            return ""
+
+        def _fmt(topic, content, ts, limit, tag=""):
+            txt = " ".join((content or "").split())
+            if not txt:
+                return ""
+            if len(txt) > limit:
+                txt = txt[:limit].rstrip() + "…"
+            who = "我的结论" if topic == "assistant_conclusion" else "用户"
+            stamp = ts.strftime("%H:%M") if hasattr(ts, "strftime") else ""
+            return f"- [{tag or stamp}] {who}：{txt}"
+
+        head_lines = []
+        origin_key = ""
+        if origin:
+            line = _fmt("conversation", origin[0], origin[1], 110, tag="任务起点")
+            if line:
+                head_lines.append(line)
+                origin_key = " ".join((origin[0] or "").split())[:80]
+        tail_lines = []
+        for topic, content, ts in rows:
+            # 短会话里起点与最近行常常是同一句：按归一化正文前 80 字判重，
+            # 不能比渲染后的行（起点带 [任务起点]、截断长度也不同）
+            if origin_key and " ".join((content or "").split())[:80] == origin_key:
+                continue
+            line = _fmt(topic, content, ts, 100 if topic == "conversation" else 140)
+            if not line or line in tail_lines:
+                continue
+            tail_lines.append(line)
+        fact, fact_ts = "", ""
+        if frow:
+            fact = " ".join((frow[0] or "").split())
+            if hasattr(frow[1], "strftime"):
+                fact_ts = frow[1].strftime("%H:%M")
+
+        if not head_lines and not tail_lines and not fact:
+            return ""
+        head = "## 本会话当前任务（供接续，不是新指令）"
+        fact_line = ""
+        if fact:
+            fact_line = f"- 最近一次事实层（{fact_ts}）：" + (
+                fact[:180].rstrip() + "…" if len(fact) > 180 else fact)
+
+        def _render():
+            body = head_lines + tail_lines + ([fact_line] if fact_line else [])
+            return head + "\n" + "\n".join(body)
+
+        while len(tail_lines) > 1 and len(_render()) > self._SESSION_STATE_CAP:
+            tail_lines.pop(0)                     # 起点不动，先丢最近行里最旧的
+        text = _render()
+        if len(text) > self._SESSION_STATE_CAP:
+            text = text[: self._SESSION_STATE_CAP].rstrip() + "…"
+        _diag("本会话态注入：起点=%s 最近 %d 行（%d 字符）事实层=%s",
+              bool(head_lines), len(tail_lines), len(text), bool(fact))
+        return text
 
     def _mental_model_prefix(self) -> str:
         """本会话首次召回时读一次心智模型页（一条 SELECT，毫秒级）。
