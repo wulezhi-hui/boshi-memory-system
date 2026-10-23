@@ -1,11 +1,12 @@
 name: boshi
-version: 1.0.0
-description: "伯仕记忆系统 — Hermes 记忆 provider：持久化 + 热度调度 + 知识图谱（复用 ~/.boshi/boshi_core.py 数据层）"
-# 这些依赖不是 Hermes 核心依赖，必须由插件显式声明：
-# PM 会把它们并入当前环境，并在每次 `hermes update` 重建环境后自动重装。
-python_dependencies:
-  - "chromadb>=1.5,<2"
-  - "onnxruntime>=1.20,<2"
-  - "transformers>=4.40,<6"
-  - "numpy>=1.26,<3"
-  - "pyyaml>=6,<7"
+version: 1.0.1
+description: "伯仕记忆系统 — Hermes 记忆 provider：持久化 + 热度调度 + 知识图谱（数据层经 boshi venv 子进程 RPC 复用 ~/.boshi/boshi_core.py）"
+# 2026-10-23 架构变更（py3.14 兼容）：
+#   hermes 侧插件**不再进程内 import 数据层**。数据层（boshi_core/chroma_bridge/
+#   pg_bridge + onnxruntime/psycopg）跑在伯仕自己的 venv（~/.boshi/venv, py3.11），
+#   由 boshi_rpc_server.py 作为常驻子进程承载，插件经 JSON-lines RPC 调用。
+#   因此 hermes 插件环境**不再需要**任何重依赖——下面的 5 项（onnxruntime/
+#   chromadb/transformers/numpy/pyyaml）在 Python 3.14 上无法解析（onnxruntime
+#   无 3.14 wheel），曾导致 hermes PM 自动禁用本插件、🦄 图标消失。清空后，
+#   插件环境可在任意 hermes 解释器版本下正常构建。
+python_dependencies: []

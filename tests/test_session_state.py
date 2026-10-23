@@ -14,7 +14,6 @@ BOSHI_SESSION_STATE=0 可回滚。
 - 超长从最旧丢、单行截断；
 - 缓存指纹并入 session_id（跨会话不串味）。
 """
-import datetime
 import os
 import sys
 import types
@@ -49,71 +48,61 @@ if "agent" not in sys.modules:
                         "tools": tools, "tools.registry": reg})
 
 import boshi  # noqa: E402
-import pg_bridge  # noqa: E402
 
 CAP = boshi.BoshiMemoryProvider._SESSION_STATE_CAP
 
 
-# ---- 假连接：按 SQL 形状分派（起点 ASC / 最近 DESC / 事实层）----
-class _FakeCur:
-    def __init__(self, origin, rows, fact):
-        self._origin, self._rows, self._fact = origin, rows, fact
-        self._mode = None
-
-    def execute(self, sql, params=None):
-        if "session_fact" in sql:
-            self._mode = "fact"
-        elif "ORDER BY created_at ASC" in sql:
-            self._mode = "origin"
-        else:
-            self._mode = "rows"
-
-    def fetchall(self):
-        return list(self._rows)
-
-    def fetchone(self):
-        if self._mode == "fact":
-            return self._fact
-        if self._mode == "origin":
-            return self._origin
-        return None
+# ---- 按 RPC 缝打桩：_session_state 走 `self.p._core.rpc_session_state(...)`，
+#      返回 {"origin","rows","fact"}（ts 已是 "HH:MM" 字符串，服务器侧格式化）。----
+def _tsstr(hh, mm=0):
+    return f"{hh:02d}:{mm:02d}"
 
 
-class _FakeConn:
-    def __init__(self, origin, rows, fact):
-        self._cur = _FakeCur(origin, rows, fact)
-
-    def cursor(self):
-        return self._cur
+def _rowd(topic, text, hh, mm=0):
+    return {"topic": topic, "content": text, "ts": _tsstr(hh, mm)}
 
 
-def _ts(hh, mm=0):
-    return datetime.datetime(2026, 10, 22, hh, mm)
+class _FakeCore:
+    """替身 _VenvCore：只在 rpc_session_state 上按注入的 data 应答，可模拟异常。"""
+
+    def __init__(self, data=None, raise_exc=None):
+        self._data = data or {"origin": None, "rows": [], "fact": None}
+        self.raise_exc = raise_exc
+
+    def rpc_session_state(self, session_id, profile, tail_n=4):
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return self._data
+
+    def search(self, *a, **k):
+        return {"total": 0, "results": []}
+
+    def save(self, *a, **k):
+        return {}
 
 
-def _row(topic, text, hh, mm=0):
-    return (topic, text, _ts(hh, mm))
-
-
-MISSING = object()   # 库里没有这条（fetchone 返回 None）
+MISSING = object()   # 库里没有这条（dict 里对应 None）
 
 
 class HelperTest(unittest.TestCase):
     def setUp(self):
         self.p = boshi.BoshiMemoryProvider({})
         self.p._profile = "default"
-        self._orig = pg_bridge._conn
 
     def tearDown(self):
-        pg_bridge._conn = self._orig
+        self.p._core = None
         os.environ.pop("BOSHI_SESSION_STATE", None)
 
     def _wire(self, origin, rows, fact):
-        pg_bridge._conn = lambda: _FakeConn(
-            None if origin is MISSING else origin,
-            rows,
-            None if fact is MISSING else fact,
-        )
+        data = {
+            "origin": None if origin is MISSING else origin,
+            "rows": rows,
+            "fact": None if fact is MISSING else fact,
+        }
+        self.p._core = _FakeCore(data)
+
+    def _wire_error(self, exc):
+        self.p._core = _FakeCore(raise_exc=exc)
 
     # 1) 拼接顺序
     def test_with_mm_order(self):
@@ -122,26 +111,25 @@ class HelperTest(unittest.TestCase):
         self.assertEqual(boshi.BoshiMemoryProvider._with_mm("RECALL", "", ""), "RECALL")
         self.assertEqual(boshi.BoshiMemoryProvider._with_mm("", "MM", "SS"), "MM\n\nSS")
 
-    # 2) 回滚开关 / 空 id
+    # 2) 回滚开关 / 空 id（都不触碰数据层）
     def test_switch_and_empty(self):
         os.environ["BOSHI_SESSION_STATE"] = "0"
+        self.p._core = _FakeCore()
         self.assertEqual(self.p._session_state("s1"), "")
         os.environ.pop("BOSHI_SESSION_STATE")
         self.assertEqual(self.p._session_state(""), "")
 
-    # 3) 查库异常不能抛
+    # 3) RPC 异常不能抛
     def test_db_error_is_silent(self):
-        def boom():
-            raise RuntimeError("pg down")
-        pg_bridge._conn = boom
+        self._wire_error(RuntimeError("pg down"))
         self.assertEqual(self.p._session_state("s1"), "")
 
     # 4) 渲染：表头、起点在首行、时间正序、角色标签、单行截断
     def test_render_origin_first_then_chronological(self):
-        origin = ("最早的那句话" + "起" * 200, _ts(9))
-        rows = [_row("assistant_conclusion", "第一答" + "乙" * 300, 9, 1),
-                _row("conversation", "第一问" + "甲" * 200, 9, 2)]
-        self._wire(origin, rows, ("决策：走 PG", _ts(9, 3)))
+        origin = {"content": "最早的那句话" + "起" * 200, "ts": _tsstr(9)}
+        rows = [_rowd("conversation", "第一问" + "甲" * 200, 9, 1),
+                _rowd("assistant_conclusion", "第一答" + "乙" * 300, 9, 2)]
+        self._wire(origin, rows, {"content": "决策：走 PG", "ts": _tsstr(9, 3)})
         out = self.p._session_state("s1")
         self.assertTrue(out.startswith("## 本会话当前任务"))
         body = out.split("\n", 1)[1].split("\n")
@@ -153,9 +141,9 @@ class HelperTest(unittest.TestCase):
 
     # 5) 超长先丢最近行里最旧的，起点永不丢
     def test_trim_tail_first_keeps_origin(self):
-        origin = ("任务起点原话", _ts(9))
-        rows = [_row("conversation", f"第{i}问" + "字" * 90, 9, i) for i in (5, 4, 3, 2, 1)]
-        self._wire(origin, rows, ("事实" * 100, _ts(9, 6)))
+        origin = {"content": "任务起点原话", "ts": _tsstr(9)}
+        rows = [_rowd("conversation", f"第{i}问" + "字" * 90, 9, i) for i in (1, 2, 3, 4, 5)]
+        self._wire(origin, rows, {"content": "事实" * 100, "ts": _tsstr(9, 6)})
         out = self.p._session_state("s1")
         self.assertLessEqual(len(out), CAP)
         self.assertIn("任务起点原话", out)             # 起点必须留下
@@ -164,15 +152,15 @@ class HelperTest(unittest.TestCase):
 
     # 6) 起点与最近行重合时不重复
     def test_origin_dedupe(self):
-        same = ("只有一轮的会话", _ts(9))
-        rows = [("conversation", "只有一轮的会话", _ts(9))]
+        same = {"content": "只有一轮的会话", "ts": _tsstr(9)}
+        rows = [{"topic": "conversation", "content": "只有一轮的会话", "ts": _tsstr(9)}]
         self._wire(same, rows, MISSING)
         out = self.p._session_state("s1")
         self.assertEqual(out.count("只有一轮的会话"), 1)
 
     # 7) 只有事实层也必须能出（不能因为没原文就整块丢掉）
     def test_fact_only(self):
-        self._wire(MISSING, [], ("决策：只留事实", _ts(9, 10)))
+        self._wire(MISSING, [], {"content": "决策：只留事实", "ts": _tsstr(9, 10)})
         out = self.p._session_state("s1")
         self.assertIn("最近一次事实层（09:10）", out)
 
@@ -197,13 +185,17 @@ class HelperTest(unittest.TestCase):
 
 
 class RealDbTest(unittest.TestCase):
-    """真实库：本会话（mtntnmgwkbvkac）应能取到会话态。"""
+    """真实库：本会话（mtntnmgwkbvkac）应能取到会话态（走真 RPC 子进程）。"""
 
     SID = "mtntnmgwkbvkac"
 
     def setUp(self):
         self.p = boshi.BoshiMemoryProvider({})
         self.p._profile = "default"
+        self.p.initialize(self.SID)   # 拉起 boshi venv RPC 子进程
+
+    def tearDown(self):
+        self.p.shutdown()
 
     def test_real_session_state(self):
         out = self.p._session_state(self.SID)

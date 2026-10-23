@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import sys
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -56,6 +57,134 @@ def _diag_once(key: str, msg: str, *args) -> None:
     if _DIAG and key not in _diag_seen:
         _diag_seen.add(key)
         logger.info("boshi[诊断] " + msg, *args)
+
+
+# ── boshi venv RPC（2026-10-23：hermes 升到 py3.14 后 onnxruntime 无 3.14 wheel，
+#    内联 sys.path 导入数据层 import 不动 → hermes 自动禁用插件 → 🦄 消失。
+#    数据层本体健康（跑在 ~/.boshi/venv, py3.11）。改为把数据层当**常驻子进程**，
+#    经 JSON-lines RPC 调用，hermes 解释器版本从此无关。零 LLM、零生成不变。）──
+_RPC_SERVER = BOSHI_HOME / "boshi_rpc_server.py"
+
+
+def _find_boshi_python() -> Optional[Path]:
+    """定位能跑数据层的 Python（伯仕 venv 优先，跨平台）。"""
+    cands = [
+        BOSHI_HOME / "venv" / "Scripts" / "python.exe",   # Windows
+        BOSHI_HOME / "venv" / "bin" / "python",           # posix
+    ]
+    for c in cands:
+        if c.exists():
+            return c
+    return None
+
+
+class _RpcClient:
+    """伯仕数据层 RPC 客户端：spawn 一个 boshi venv 子进程，JSON-lines 通信。
+
+    线程安全（Hermes 的 prefetch 走后台线程、sync_turn 走主线程），一次只发一条、
+    锁住 request+response，响应按顺序读回，不会串。子进程死了自动重启。
+    """
+
+    def __init__(self, profile: str = "") -> None:
+        self._profile = profile or ""
+        self._proc: Optional[subprocess.Popen] = None
+        self._lock = threading.Lock()
+        self._req_id = 0
+
+    def _ensure(self) -> subprocess.Popen:
+        if self._proc is not None and self._proc.poll() is None:
+            return self._proc
+        py = _find_boshi_python()
+        if py is None or not _RPC_SERVER.exists():
+            raise RuntimeError("找不到 boshi venv Python 或 boshi_rpc_server.py")
+        env = dict(os.environ)
+        if self._profile:
+            env["BOSHI_PROFILE"] = self._profile
+        p = subprocess.Popen(
+            [str(py), str(_RPC_SERVER)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, env=env, cwd=str(BOSHI_HOME),
+        )
+        ready = p.stdout.readline()
+        try:
+            rj = json.loads(ready.decode("utf-8"))
+            if not rj.get("ready"):
+                raise RuntimeError("RPC 握手失败: %s" % rj)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        self._proc = p
+        _diag_once("rpc", "boshi RPC 子进程已启动（py=%s profile=%s pid=%s）",
+                   py.name, self._profile or "-", rj.get("pid"))
+        return p
+
+    def call(self, target: str, fn: str, args=(), kwargs=None, timeout: float = 60):
+        kwargs = kwargs or {}
+        with self._lock:
+            p = self._ensure()
+            self._req_id += 1
+            req = {"id": self._req_id, "target": target, "fn": fn,
+                   "args": list(args), "kwargs": kwargs}
+            p.stdin.write((json.dumps(req, default=str) + "\n").encode("utf-8"))
+            p.stdin.flush()
+            line = p.stdout.readline()
+            if not line:
+                raise RuntimeError("boshi RPC 子进程意外退出")
+            resp = json.loads(line.decode("utf-8"))
+            if not resp.get("ok"):
+                raise RuntimeError("boshi RPC %s.%s 失败: %s" % (target, fn, resp.get("error")))
+            return resp.get("result")
+
+    def close(self) -> None:
+        with self._lock:
+            if self._proc is not None:
+                try:
+                    self._proc.stdin.close()
+                    self._proc.terminate()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._proc = None
+
+
+class _VenvCore:
+    """RPC 代理：鸭子实现 boshi_core 模块接口，全部转发到 boshi venv 子进程。
+
+    provider 里所有 `self._core.<method>(...)` 无需改动，只是背后从
+    「进程内 import 的模块」变成「跨 venv 子进程」。
+    """
+
+    def __init__(self, rpc: _RpcClient) -> None:
+        self._rpc = rpc
+
+    def search(self, *a, **k):
+        return self._rpc.call("boshi_core", "search", a, k)
+
+    def save(self, *a, **k):
+        return self._rpc.call("boshi_core", "save", a, k)
+
+    def status(self, *a, **k):
+        return self._rpc.call("boshi_core", "status", a, k)
+
+    def profile(self, *a, **k):
+        return self._rpc.call("boshi_core", "profile", a, k)
+
+    def get_latest_by_topic(self, *a, **k):
+        return self._rpc.call("boshi_core", "get_latest_by_topic", a, k)
+
+    def get_mental_model(self, *a, **k):
+        return self._rpc.call("boshi_core", "get_mental_model", a, k)
+
+    def backend_name(self, *a, **k):
+        return self._rpc.call("chroma_bridge", "backend_name", a, k)
+
+    def rpc_session_state(self, *a, **k):
+        return self._rpc.call("rpc", "session_state", a, k)
+
+    def rpc_ping(self, *a, **k):
+        return self._rpc.call("rpc", "ping", a, k)
 
 
 def _ensure_runtime_deps() -> bool:
@@ -293,7 +422,9 @@ class BoshiMemoryProvider(MemoryProvider):
             os.environ.setdefault("BOSHI_PROFILE", self._profile)
         except Exception:
             pass
-        self._core = None          # boshi_core 模块（惰性导入）
+        self._core = None          # boshi venv RPC 代理（_VenvCore），惰性初始化
+        self._rpc = None          # _RpcClient 子进程句柄
+        self._avail = None        # is_available 缓存（避免反复 spawn 子进程探测）
         self._session_id = ""
         self._agent_context = "primary"
         # prefetch 缓存（queue_prefetch 后台线程写入，prefetch 读取）
@@ -320,11 +451,11 @@ class BoshiMemoryProvider(MemoryProvider):
         return "boshi"
 
     def is_available(self) -> bool:
-        """后端感知的可用性检查（2026-10-10 修，事故驱动）。
+        """后端感知的可用性检查（2026-10-23 起走 boshi venv RPC）。
 
-        - `backend = pg`     → 要求 `psycopg` 可导入。**缺它会让所有 PG 查询静默失败**：
-          prefetch 拿不到记忆 → 🦄 图标消失、记忆也不写入（异常被吞在 debug 级）
-        - `backend = chroma` → 检查 `chroma_db` 目录（原逻辑）
+        hermes 解释器（py3.14 等）已无法内联 import 数据层（onnxruntime 无 3.14
+        wheel），改为 spawn 一个 boshi venv（py3.11）子进程做 `ping` 探测：
+        数据层本体健康即视为可用。结果缓存到 `self._avail`，避免反复 spawn。
 
         注意：**不在这里探测数据库是否在线** —— PG 由 Windows 服务 / 钩子按需拉起，
         在这里判"不可用"会让 provider 被停用、图标消失。
@@ -332,77 +463,68 @@ class BoshiMemoryProvider(MemoryProvider):
         if not (BOSHI_HOME / "boshi_core.py").exists():
             _diag_once("avail", "is_available=False（缺 ~/.boshi/boshi_core.py）")
             return False
-        _ensure_runtime_deps()   # 裸环境（WebUI worker）先补齐 psycopg/chromadb 等
+        if _find_boshi_python() is None or not _RPC_SERVER.exists():
+            _diag_once("avail", "is_available=False（缺 boshi venv Python 或 boshi_rpc_server.py）")
+            return False
+        if self._avail is not None:
+            return self._avail
         try:
-            if str(BOSHI_HOME) not in sys.path:
-                sys.path.insert(0, str(BOSHI_HOME))
-            import chroma_bridge
-            if chroma_bridge.backend_name() == "pg":
-                import psycopg  # noqa: F401  （PG 后端的运行时必需依赖）
-                _diag_once("avail", "is_available=True（backend=pg，psycopg=%s）", psycopg.__version__)
-                return True
-            ok = (BOSHI_HOME / "chroma_db").is_dir()
-            _diag_once("avail", "is_available=%s（backend=chroma）", ok)
+            probe = _RpcClient(profile=self._profile)
+            r = probe.call("rpc", "ping")
+            probe.close()
+            ok = bool(r and r.get("ok"))
+            self._avail = ok
+            _diag_once("avail", "is_available=%s（backend=%s，经 boshi venv RPC）",
+                       ok, (r or {}).get("backend"))
             return ok
         except Exception as e:  # noqa: BLE001
-            _diag_once("avail", "is_available=False（异常：%s）→ provider 会被停用，图标必然不出现", e)
+            self._avail = False
+            _diag_once("avail", "is_available=False（RPC 探测异常：%s）→ provider 会被停用，图标必然不出现", e)
             return False
 
     def unavailable_reason(self) -> str:
         reasons = []
         if not (BOSHI_HOME / "boshi_core.py").exists():
             reasons.append("未找到 ~/.boshi/boshi_core.py")
-        try:
-            if str(BOSHI_HOME) not in sys.path:
-                sys.path.insert(0, str(BOSHI_HOME))
-            import chroma_bridge
-            if chroma_bridge.backend_name() == "pg":
-                try:
-                    import psycopg  # noqa: F401
-                except Exception:
-                    reasons.append(
-                        "PG 后端需要 psycopg，但当前 Python 环境没装"
-                        "（装法：uv pip install --python <hermes venv>/Scripts/python.exe \"psycopg[binary]\"）")
-            elif not (BOSHI_HOME / "chroma_db").is_dir():
-                reasons.append("未找到 ~/.boshi/chroma_db/ 目录")
-        except Exception as e:  # noqa: BLE001
-            reasons.append("无法解析伯仕后端：%s" % e)
-        return "；".join(reasons)   # 可用时返回空串（原来会误报"未安装"）
+        if _find_boshi_python() is None:
+            reasons.append("未找到 boshi venv 的 Python（~/.boshi/venv/Scripts/python.exe）")
+        elif not _RPC_SERVER.exists():
+            reasons.append("未找到 boshi_rpc_server.py")
+        else:
+            try:
+                probe = _RpcClient(profile=self._profile)
+                r = probe.call("rpc", "ping")
+                probe.close()
+                if not (r and r.get("ok")):
+                    reasons.append("伯仕数据层 ping 失败：%s" % ((r or {}).get("error")))
+            except Exception as e:  # noqa: BLE001
+                reasons.append("无法启动伯仕 RPC 子进程：%s" % e)
+        return "；".join(reasons)   # 可用时返回空串
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return []  # 本地 provider，无需额外配置
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        """连接 boshi 数据层（惰性导入 boshi_core）。"""
+        """连接伯仕数据层（2026-10-23 起：spawn boshi venv 子进程经 RPC，进程内不再 import 数据层）。"""
         self._session_id = session_id
         self._agent_context = kwargs.get("agent_context", "primary")
 
-        # 确保 ~/.boshi 在 sys.path 上，才能 import boshi_core
-        home = str(BOSHI_HOME)
-        if home not in sys.path:
-            sys.path.insert(0, home)
-        # 裸环境（WebUI 会话 worker 用的是空 site-packages 的 tools python）先补齐依赖
-        _ensure_runtime_deps()
-
-        # 尝试导入 boshi_core（会触发 chromadb 等依赖加载）
+        # 数据层跑在伯仕自己的 venv（py3.11，含 onnxruntime/psycopg），
+        # hermes 解释器版本（py3.14 等）从此不再影响可用性。
         try:
-            import boshi_core  # type: ignore
-            self._core = boshi_core
-            logger.info("boshi memory provider initialized (session=%s, ctx=%s)", session_id, self._agent_context)
-        except ImportError as e:
-            # 依赖缺失时的诊断和提示
-            missing = str(e).split("'")[1] if "'" in str(e) else "未知依赖"
+            rpc = _RpcClient(profile=self._profile)
+            self._core = _VenvCore(rpc)
+            self._rpc = rpc
+            logger.info(
+                "boshi memory provider initialized via boshi-venv RPC (session=%s, ctx=%s)",
+                session_id, self._agent_context)
+        except Exception as e:  # noqa: BLE001
             self._core = None
+            self._rpc = None
             logger.warning(
-                "boshi provider 初始化失败：缺少依赖 '%s'\n"
-                "解决方案：\n"
-                "  1. 运行 'pip install %s' 安装缺失依赖\n"
-                "  2. 或重新运行安装脚本：python ~/.boshi/install.py",
-                missing, missing
-            )
-        except Exception as e:
-            logger.warning("boshi provider initialize failed: %s", e)
-            self._core = None
+                "boshi provider 初始化失败（RPC spawn）：%s\n"
+                "排查：1) ~/.boshi/venv 是否完好  2) python ~/.boshi/boshi_rpc_server.py 能否启动  3) 依赖是否齐全",
+                e)
 
         # 起步自检：真跑一次检索，把"依赖缺失 / 后端不可用"这类**静默失忆**在会话一开始就暴露。
         # 2026-10-10 事故：Hermes venv 缺 psycopg → 查询全炸在惰性 import 上，
@@ -417,6 +539,12 @@ class BoshiMemoryProvider(MemoryProvider):
 
     def shutdown(self) -> None:
         self._core = None
+        if self._rpc is not None:
+            try:
+                self._rpc.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._rpc = None
         self._prefetch_cache = ""
         self._prefetch_count = 0
         self._prefetch_time = 0.0
@@ -786,71 +914,53 @@ class BoshiMemoryProvider(MemoryProvider):
         """
         if not session_id or os.environ.get("BOSHI_SESSION_STATE", "1") == "0":
             return ""
+        if self._core is None:
+            return ""
         _TAIL_N = 4
         try:
-            import pg_bridge
-            cur = pg_bridge._conn().cursor()
-            # 任务起点：本会话第一条用户原话
-            cur.execute(
-                """SELECT content, created_at FROM boshi.memories
-                    WHERE session_id = %s AND (profile = %s OR profile IS NULL)
-                      AND topic = 'conversation'
-                    ORDER BY created_at ASC LIMIT 1""",
-                (session_id, self._profile),
-            )
-            origin = cur.fetchone()
-            cur.execute(
-                """SELECT topic, content, created_at FROM boshi.memories
-                    WHERE session_id = %s AND (profile = %s OR profile IS NULL)
-                      AND topic IN ('conversation', 'assistant_conclusion')
-                    ORDER BY created_at DESC LIMIT %s""",
-                (session_id, self._profile, _TAIL_N),
-            )
-            rows = cur.fetchall()[::-1]           # 时间正序：旧在上、新在下
-            cur.execute(
-                """SELECT content, created_at FROM boshi.memories
-                    WHERE session_id = %s AND (profile = %s OR profile IS NULL)
-                      AND topic = 'session_fact'
-                    ORDER BY created_at DESC LIMIT 1""",
-                (session_id, self._profile),
-            )
-            frow = cur.fetchone()
+            data = self._core.rpc_session_state(session_id, self._profile, _TAIL_N)
         except Exception as e:  # noqa: BLE001 — 会话态不能拖垮召回主路径
-            logger.debug("boshi _session_state 读取失败（忽略）: %s", e)
+            logger.debug("boshi _session_state 读取失败（RPC，忽略）: %s", e)
             return ""
+        if not data:
+            return ""
+        origin = data.get("origin")          # {"content","ts"} 或 None
+        rows = data.get("rows") or []        # [{"topic","content","ts"}] 时间正序
+        frow = data.get("fact")             # {"content","ts"} 或 None
 
-        def _fmt(topic, content, ts, limit, tag=""):
+        def _fmt(content, ts, limit, who, tag=""):
             txt = " ".join((content or "").split())
             if not txt:
                 return ""
             if len(txt) > limit:
                 txt = txt[:limit].rstrip() + "…"
-            who = "我的结论" if topic == "assistant_conclusion" else "用户"
-            stamp = ts.strftime("%H:%M") if hasattr(ts, "strftime") else ""
-            return f"- [{tag or stamp}] {who}：{txt}"
+            return f"- [{tag or ts}] {who}：{txt}"
 
         head_lines = []
         origin_key = ""
         if origin:
-            line = _fmt("conversation", origin[0], origin[1], 110, tag="任务起点")
+            line = _fmt(origin.get("content"), origin.get("ts", ""), 110, "用户", tag="任务起点")
             if line:
                 head_lines.append(line)
-                origin_key = " ".join((origin[0] or "").split())[:80]
+                origin_key = " ".join((origin.get("content") or "").split())[:80]
         tail_lines = []
-        for topic, content, ts in rows:
+        for r in rows:
+            topic = r.get("topic")
+            content = r.get("content")
             # 短会话里起点与最近行常常是同一句：按归一化正文前 80 字判重，
             # 不能比渲染后的行（起点带 [任务起点]、截断长度也不同）
             if origin_key and " ".join((content or "").split())[:80] == origin_key:
                 continue
-            line = _fmt(topic, content, ts, 100 if topic == "conversation" else 140)
+            who = "我的结论" if topic == "assistant_conclusion" else "用户"
+            limit = 100 if topic == "conversation" else 140
+            line = _fmt(content, r.get("ts", ""), limit, who)
             if not line or line in tail_lines:
                 continue
             tail_lines.append(line)
         fact, fact_ts = "", ""
         if frow:
-            fact = " ".join((frow[0] or "").split())
-            if hasattr(frow[1], "strftime"):
-                fact_ts = frow[1].strftime("%H:%M")
+            fact = " ".join((frow.get("content") or "").split())
+            fact_ts = frow.get("ts", "")
 
         if not head_lines and not tail_lines and not fact:
             return ""
