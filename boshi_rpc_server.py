@@ -122,7 +122,18 @@ def ping() -> dict:
         import chroma_bridge
         backend = chroma_bridge.backend_name()
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": str(e), "backend": None}
+        import sys as _sys, os as _os, json as _json
+        venv_cfg = _os.path.join(_os.path.dirname(_sys.executable), "pyvenv.cfg")
+        return {
+            "ok": False, "error": str(e), "backend": None,
+            "debug": {
+                "exe": _sys.executable,
+                "pyvenv_cfg": _os.path.exists(venv_cfg),
+                "site_paths": [p for p in _sys.path if 'site-packages' in p.lower() or '.boshi' in p.lower()],
+                "boshi_pkgs": [p for p in _sys.path if 'pydantic_core' in p][:1],
+                "env_python": {k: v for k, v in _os.environ.items() if k.startswith(('PYTHON', 'BOSHI', 'VIRTUAL'))},
+            },
+        }
     return {"ok": True, "backend": backend, "ts": datetime.now().isoformat()}
 
 

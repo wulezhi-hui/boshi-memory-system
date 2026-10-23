@@ -98,6 +98,13 @@ class _RpcClient:
         if py is None or not _RPC_SERVER.exists():
             raise RuntimeError("找不到 boshi venv Python 或 boshi_rpc_server.py")
         env = dict(os.environ)
+        # 隔离解释器环境：hermes 主进程（py3.14）会把自己的插件 env 放在 PYTHONPATH 里，
+        # 3.11 的伯仕 venv 子进程若继承它，会从 3.14 目录捡到 pydantic_core 并报
+        # "No module named 'pydantic_core._pydantic_core'"（cp314 的 .pyd 加载不了）。
+        # 子进程只该认 ~/.boshi/venv 一个 site-packages。
+        for _k in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE"):
+            env.pop(_k, None)
+        env["PYTHONNOUSERSITE"] = "1"
         if self._profile:
             env["BOSHI_PROFILE"] = self._profile
         p = subprocess.Popen(
