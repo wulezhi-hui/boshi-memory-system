@@ -79,13 +79,80 @@ def _get_cached_ef():
         with _ef_load_lock:
             if _boshi_ef_instance is None:      # 双检：等锁期间别人可能已加载好
                 import onnxruntime as ort
-                from transformers import AutoTokenizer
 
-                tokenizer = AutoTokenizer.from_pretrained(str(BOSHI_MODEL_DIR))
+                tokenizer = _load_tokenizer()
                 session = ort.InferenceSession(str(ONNX_FILE), providers=["CPUExecutionProvider"])
                 input_names = [i.name for i in session.get_inputs()]
                 _boshi_ef_instance = _BoshiONNX(tokenizer, session, input_names)
     return _boshi_ef_instance
+
+
+def _load_tokenizer():
+    """加载 bge-m3 分词器：优先 tokenizers.Tokenizer.from_file（快路径）。
+
+    2026-11-06：`from transformers import AutoTokenizer` 冷加载实测 ~5s（transformers
+    全家桶 import 占大头），是「新会话首轮检索 17s > Hermes 8s prefetch 门 → 首轮召回
+    被丢」的主要构成之一。`tokenizers.Tokenizer.from_file` 只读 tokenizer.json，实测
+    ~0.8s，且 token ids 与 transformers 路线**逐 token 一致**（batch 内已验证）。
+
+    返回一个小适配器，接口覆盖本文件 `_encode` 用到的三种调用形态：
+      - `tokenizer(texts, padding=True, truncation=True, max_length=..., return_tensors="np")`
+        → dict {input_ids, attention_mask}（np.ndarray）
+      - 语义与 transformers `AutoTokenizer` 完全对齐（pad 到 batch 内最长、截断 512）
+    transformers 不可用时自动走此路径；`BOSHI_TOKENIZERS_ONLY=0` 可强制回旧路线。
+    """
+    import os
+
+    if os.environ.get("BOSHI_TOKENIZERS_ONLY", "1") != "0":
+        try:
+            from tokenizers import Tokenizer
+
+            tok = Tokenizer.from_file(str(BOSHI_MODEL_DIR / "tokenizer.json"))
+            # bge-m3 的 pad 是小写 "<pad>"=1（token_to_id("[PAD]") 为 None，
+            # 大写形式会静默落到 0=<s>，污染 padding 位置）
+            pad_id = tok.token_to_id("<pad>")
+            if pad_id is None:
+                pad_id = tok.token_to_id("[PAD]")
+            if pad_id is None:
+                pad_id = 0
+            return _FastTokenizerAdapter(tok, pad_id=pad_id, max_length=MAX_SEQ_LEN)
+        except Exception:  # noqa: BLE001  tokenizer.json 缺失/损坏时回退 transformers
+            pass
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(str(BOSHI_MODEL_DIR))
+
+
+class _FastTokenizerAdapter:
+    """tokenizers.Tokenizer 的 transformers 兼容薄壳（只覆盖 _encode 所需）。"""
+
+    def __init__(self, tok, pad_id: int, max_length: int):
+        self._tok = tok
+        self._pad_id = pad_id
+        self._max_length = max_length
+
+    def enable_truncation(self, max_length: int) -> None:
+        self._max_length = max_length
+
+    def __call__(self, texts: List[str], padding=True, truncation=True,
+                 max_length=None, return_tensors="np"):
+        if max_length:
+            self._max_length = max_length
+        if truncation:
+            self._tok.enable_truncation(max_length=self._max_length)
+        else:
+            self._tok.no_truncation()
+        encs = self._tok.encode_batch(list(texts))
+        ids = [e.ids for e in encs]
+        masks = [e.attention_mask for e in encs]
+        if padding:
+            width = max(len(x) for x in ids)
+            ids = [x + [self._pad_id] * (width - len(x)) for x in ids]
+            masks = [x + [0] * (width - len(x)) for x in masks]
+        return {
+            "input_ids": np.asarray(ids, dtype=np.int64),
+            "attention_mask": np.asarray(masks, dtype=np.int64),
+        }
 
 
 # ── 公共接口（chroma_bridge.py 兼容）────────────────────
