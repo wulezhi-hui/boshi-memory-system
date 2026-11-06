@@ -5,6 +5,12 @@
  * 本版由 dsh 侧维护；改动记录见 ~/.boshi/docs/伯仕工作日志.md
  * 与 ~/.boshi/docs/伯仕记忆系统v7.0_技术架构文档.md
  *
+ * 2026-10-24 v3.2 加固：callBridge 启动子进程前剔除父进程带入的
+ *   PYTHONPATH / PYTHONHOME / PYTHONSTARTUP / PYTHONUSERBASE，并置
+ *   PYTHONNOUSERSITE=1（对齐 hermes 侧同日修复——终端/IDE 的 Python 包
+ *   路径会污染 3.11 venv 子进程的 sys.path，实测引发 ABI 冲突崩溃）。
+ *   日志 version 由 v3-dsh 改为 v3.2-dsh，便于按 plugin-start 确认新码。
+ *
  * 职责（四件套）：
  *   1. sync_turn   每轮把用户消息存入伯仕
  *   2. prefetch    每轮异步召回，注入后续步骤的系统提示词
@@ -195,6 +201,22 @@ export default {
     }
 
     // ---------------- bridge ----------------
+    // 2026-10-24 环境净化：只透传非 Python 注入型的父进程环境变量，
+    // 再固定编码 / 禁用用户 site-packages / 打上归属标记。
+    function pythonEnv() {
+      const env = {}
+      for (const [k, v] of Object.entries(process.env)) {
+        // Windows 环境变量键不区分大小写，用正则兜住大小写变体
+        if (/^PYTHON(PATH|HOME|STARTUP|USERBASE)$/i.test(k)) continue
+        env[k] = v
+      }
+      env.PYTHONIOENCODING = 'utf-8'
+      env.PYTHONNOUSERSITE = '1'
+      env.BOSHI_PROFILE = PROFILE
+      env.BOSHI_BACKEND = BACKEND
+      return env
+    }
+
     function callBridge(args, onResult) {
       try {
         const handle = subprocess.spawn({
@@ -206,7 +228,7 @@ export default {
             stderr: 'ignore',
           },
           graceMs: 30000,
-          env: { ...process.env, PYTHONIOENCODING: 'utf-8', BOSHI_PROFILE: PROFILE, BOSHI_BACKEND: BACKEND },
+          env: pythonEnv(),
         })
         handle.done.then(() => {
           if (typeof onResult !== 'function') return
@@ -457,7 +479,7 @@ export default {
 
     log({
       op: 'plugin-start',
-      version: 'v3-dsh',
+      version: 'v3.2-dsh',
       profile: PROFILE,
       backend: BACKEND,
       minChars: MIN_CHARS,

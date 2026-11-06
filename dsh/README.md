@@ -166,6 +166,18 @@ cd ~/.boshi/dsh && node test-boshi-auto-memory.v3.mjs
 
 ## 变更记录
 
+- **2026-10-24（dsh 侧 v3.2）**：callBridge 启动子进程前做环境净化——剔除父进程带入的
+  `PYTHONPATH` / `PYTHONHOME` / `PYTHONSTARTUP` / `PYTHONUSERBASE`（正则匹配，兜住
+  Windows 大小写变体），并置 `PYTHONNOUSERSITE=1`、覆写 `PYTHONIOENCODING=utf-8`，
+  其余变量照常透传。对齐 hermes/伯仕侧同日修复：从带 Python 包路径的终端/IDE 启动
+  DSH 时，这些变量会污染 `~/.boshi/venv`(3.11) 子进程的 `sys.path`，实测引发
+  py3.14 `pydantic_core` `.pyd` 的 ABI 冲突崩溃。日志 `plugin-start` 的 `version`
+  由 `v3-dsh` 改为 `v3.2-dsh`，重启 DSH 后可据此确认新码生效（改动在模块内，
+  ESM 缓存下需重启；`cordis.patch.yml` 的 `?v=4` 无需变更——重启后进程全新
+  即加载新内容，且实测对话中途改 yml 会触发插件树重组、丢失本回合归档）。
+  新增专项测试 `test-env-sanitize.v32.mjs`；回归 `test-boshi-auto-memory.v3.mjs`
+  28 项全过。部署副本已与 `boshi-auto-memory.v3.1.mjs` 同步。
+  详见 `../docs/伯仕工作日志.md` 同日条目
 - **2026-10-10（dsh 侧 v3）**：写入校验 + 失败落 spool + 本地日志 + 助手结论归档 + 过滤可配；
   `agent/session-start` → `agent/created`；spawn env 展开 `process.env`；入口加 `?v=N`。
   详见 `../docs/伯仕工作日志.md` 同日条目

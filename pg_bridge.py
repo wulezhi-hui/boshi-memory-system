@@ -1728,6 +1728,60 @@ _RERANK_SLEEP_AFTER = int(os.environ.get("BOSHI_RERANK_SLEEP_SEC", "600"))
 _RERANK_WAKE_COUNT = [0]            # 本进程按需拉起「服务不在」的次数
 _RERANK_LAST_WAKE = [0.0]
 
+# ── 跨进程「拉起锁」（2026-10-24，方案 A）──────────────────────────────────
+# 毛病：上面的冷却判据 _RERANK_LAST_SPAWN 是**进程内**变量，而会去拉起 11437 的
+# 调用方是多个互不相干的进程 —— boshi_mcp_server.py 每个 OpenCode 会话各起一份
+# （2026-10-24 08:13 实测同时存在 3 对），外加 BuddhistRAG/rerank_client.py
+# （另一个仓库、另一套代码）。两个进程同时探到端口空 → 同时 Popen → 11437 上出现
+# 两个 llama-server：抢到端口的是活的，另一个永远当孤儿（铁证 pg_autostart.log：
+# 04:10 / 05:31 / 08:05 三回都是**同一秒成对**的 pid，各留约 1.2~1.4GB 常驻内存）。
+# 解法：把「要不要拉起」的裁决从进程内变量换成**文件锁**（O_CREAT|O_EXCL 原子建文件），
+# 语义与 BuddhistRAG/rerank_client.py 里的镜像实现**必须一致**（改这里请同步改那边）：
+#   抢到锁 → 先二次确认端口（可能别人刚起好）→ 确实没有才 Popen → **持锁到就绪**才释放
+#   没抢到 → 绝不 Popen，只等就绪（有人正在拉，等它就行）
+# 锁文件放 D:\llama\：两个仓库都写得进，且和 llama-server 同目录，便于人工排查。
+# 环境变量：RERANK_SPAWN_LOCK（两边通用）＞ BOSHI_RERANK_LOCK（仅本模块）
+_RERANK_LOCK_FILE = (os.environ.get("RERANK_SPAWN_LOCK")
+                     or os.environ.get("BOSHI_RERANK_LOCK")
+                     or os.path.join(_RERANK_LLAMA_DIR, ".rerank_spawn.lock"))
+_RERANK_LOCK_STALE = float(os.environ.get("BOSHI_RERANK_LOCK_STALE", "180"))
+
+
+def _rerank_lock_acquire(path: str, max_age: float = _RERANK_LOCK_STALE) -> bool:
+    """抢占拉起锁；陈锁（>max_age 秒没更新，说明持锁进程崩在半路）可接管。"""
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        if os.path.exists(path):
+            if time.time() - os.path.getmtime(path) > max_age:
+                os.remove(path)
+            else:
+                return False
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, ("%d %s" % (os.getpid(), _dt.now().isoformat(timespec="seconds"))).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+    except Exception:                # noqa: BLE001  锁本身出错 → 当作没抢到，宁可少拉不可重复拉
+        return False
+
+
+def _rerank_lock_touch(path: str) -> None:
+    """持锁期间续期（等就绪的过程可能较慢，避免被别人误判成陈锁抢走）。"""
+    try:
+        os.utime(path, None)
+    except Exception:                # noqa: BLE001
+        pass
+
+
+def _rerank_lock_release(path: str) -> None:
+    try:
+        os.remove(path)
+    except Exception:                # noqa: BLE001
+        pass
+
 
 def _rerank_endpoint():
     """从 _RERANK_URL 抠出 (host, port)；默认 127.0.0.1:11437。"""
@@ -1799,8 +1853,22 @@ def _start_rerank_service() -> int:
     return pid
 
 
+def _rerank_wait_ready(limit: float) -> bool:
+    """在 limit 秒内等 11437 就绪（端口通 + /health 2xx）。用于「别人正在拉起」时干等。"""
+    t0 = time.time()
+    while time.time() - t0 < limit:
+        if _rerank_port_alive() and _rerank_ready():
+            return True
+        time.sleep(0.25)
+    return False
+
+
 def _ensure_rerank() -> bool:
-    """确保 11437 可用：已起 → True；没起 → 拉起并等就绪。失败返回 False（绝不抛）。"""
+    """确保 11437 可用：已起 → True；没起 → 拉起并等就绪。失败返回 False（绝不抛）。
+
+    拉起前必须抢到**跨进程**拉起锁（见 _rerank_lock_acquire）。实测同秒成对拉起
+    就是这个函数原先只靠进程内冷却、挡不住多个 boshi_mcp_server 进程并发。
+    """
     if _rerank_port_alive():
         return True
     if not _RERANK_AUTOSTART:
@@ -1811,26 +1879,47 @@ def _ensure_rerank() -> bool:
     if now - _RERANK_LAST_SPAWN[0] < _RERANK_SPAWN_COOLDOWN:
         return False                     # 冷却中：别每次检索都连发 Popen
     _RERANK_LAST_SPAWN[0] = now
-    free = _vram_free_mib()
-    if free is not None and free < _RERANK_VRAM_MIN:
-        _set_rerank_status(False, "vram_low",
-                           "按需拉起跳过：free=%dMiB < min=%dMiB" % (free, _RERANK_VRAM_MIN))
+    # ── 跨进程拉起锁：抢到才允许 Popen；抢不到说明有别的进程（含 BuddhistRAG）正在拉 ──
+    if not _rerank_lock_acquire(_RERANK_LOCK_FILE):
+        if _rerank_wait_ready(min(_RERANK_AUTOSTART_WAIT, 15.0)):
+            _VRAM_CACHE["t"] = 0.0
+            _log("rerank 拉起由其它进程完成（拉起锁被占用），已复用，本次未重复启动")
+            return True
+        _set_rerank_status(
+            False, "spawn_lock_busy",
+            "拉起锁被其它进程持有且 %s 秒内未就绪；锁文件 %s（陈锁 >%.0fs 自动接管）"
+            % (min(_RERANK_AUTOSTART_WAIT, 15.0), _RERANK_LOCK_FILE, _RERANK_LOCK_STALE))
         return False
     try:
-        _start_rerank_service()
-    except Exception as e:               # noqa: BLE001
-        _set_rerank_status(False, "autostart_failed", "%s: %s" % (type(e).__name__, e))
-        return False
-    t0 = time.time()
-    while time.time() - t0 < _RERANK_AUTOSTART_WAIT:
+        # 拿到锁≠端口空：可能上一个持锁者刚起好，必须二次确认，否则白拉一个
         if _rerank_port_alive() and _rerank_ready():
-            _VRAM_CACHE["t"] = 0.0        # 权重已上卡，显存变了 → 下次重查
-            _log("rerank 按需拉起就绪：%.1fs" % (time.time() - t0))
+            _VRAM_CACHE["t"] = 0.0
+            _log("rerank 已由其它进程拉起，直接复用（未启动新实例）")
             return True
-        time.sleep(0.25)
-    _set_rerank_status(False, "autostart_timeout",
-                       "%.0f 秒内未就绪，见 %s" % (_RERANK_AUTOSTART_WAIT, _RERANK_LOG))
-    return False
+        free = _vram_free_mib()
+        if free is not None and free < _RERANK_VRAM_MIN:
+            _set_rerank_status(False, "vram_low",
+                               "按需拉起跳过：free=%dMiB < min=%dMiB" % (free, _RERANK_VRAM_MIN))
+            return False
+        try:
+            _start_rerank_service()
+        except Exception as e:               # noqa: BLE001
+            _set_rerank_status(False, "autostart_failed", "%s: %s" % (type(e).__name__, e))
+            return False
+        # 持锁等到就绪再放锁：否则第二个进程会在模型还在加载（端口未通）时抢锁重复拉起
+        t0 = time.time()
+        while time.time() - t0 < _RERANK_AUTOSTART_WAIT:
+            _rerank_lock_touch(_RERANK_LOCK_FILE)
+            if _rerank_port_alive() and _rerank_ready():
+                _VRAM_CACHE["t"] = 0.0        # 权重已上卡，显存变了 → 下次重查
+                _log("rerank 按需拉起就绪：%.1fs" % (time.time() - t0))
+                return True
+            time.sleep(0.25)
+        _set_rerank_status(False, "autostart_timeout",
+                           "%.0f 秒内未就绪，见 %s" % (_RERANK_AUTOSTART_WAIT, _RERANK_LOG))
+        return False
+    finally:
+        _rerank_lock_release(_RERANK_LOCK_FILE)
 
 
 def _set_rerank_status(ok: bool, reason: str = "", detail: str = "") -> None:
@@ -1858,6 +1947,9 @@ def rerank_status() -> Dict[str, Any]:
             "down_until": _RERANK_DOWN_UNTIL[0],
             "autostart": _RERANK_AUTOSTART, "port_alive": _rerank_port_alive(),
             "spawn_cooldown": _RERANK_SPAWN_COOLDOWN,
+            "spawn_lock": _RERANK_LOCK_FILE,
+            "spawn_lock_age": (round(time.time() - os.path.getmtime(_RERANK_LOCK_FILE), 1)
+                               if os.path.exists(_RERANK_LOCK_FILE) else None),
             "last_spawn": _RERANK_LAST_SPAWN[0], "last_start": _RERANK_LAST_START[0],
             # ── 空闲卸载可观测 ──
             "sleep_after_sec": _RERANK_SLEEP_AFTER,

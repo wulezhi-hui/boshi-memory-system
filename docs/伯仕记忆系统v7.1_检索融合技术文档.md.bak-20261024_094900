@@ -1,0 +1,1847 @@
+# 伯仕记忆系统 v7.1 — 检索融合技术文档
+
+> 版本：v7.1（2026-10-19）
+> 正本：`~/.boshi/pg_bridge.py`（活库代码）
+> 上一版：v7.0（2026-10-10 PG 后端切换）
+> 本版范围：**只动检索侧**（读路径）。写入侧（`plugins/boshi/__init__.py` 的 800 字符截断）留到 P2。
+
+---
+
+## 0. 阶段定位（本文件属 P1）
+
+| 阶段 | 内容 | 状态 |
+|:--|:--|:--|
+| **P0** | 存储后端迁移：ChromaDB → PostgreSQL 17 + pgvector，三库（boshi / buddhist / zhishiku）同实例 | ✅ 2026-10-10 完成 |
+| **P1** | **读路径**：补回关键词通道（BM25）+ 融合策略 + 计数/通道标记如实化 | ✅ 2026-10-19（本文件） |
+| **P1③** | **经验层**：可复用教训独立成层（质量门+复用门+双向链+独立召回通道，零模型） | ✅ 2026-10-20（见 §11.18） |
+| **P2** | **写路径**：把「`asst[:800]+"…"` 截断式存档」换成槽位化抽提 + 原文另存 | 🟢 已上线（规则抽提 v2，见 §8） |
+| **P2+** | 纯中文查询也走关键词、reranker、查询改写、写入侧结构化槽位上的字段级匹配 | ⬜ 依赖 P2 |
+
+P1 不解决「记忆存得好不好」，只解决「存进去的东西找不找得到」。天花板仍在 P2。
+
+### 0.1 后端归属定稿（2026-10-19）
+
+| 项 | 定稿 |
+|:--|:--|
+| 读写 | **全部走 PG**（`boshi.memories` / `boshi.graph_edges`） |
+| Chroma | **不动**。只作 Hermes 自带的历史全量库，不写入、不回补、不参与读写 |
+| 默认值位置 | **代码里**：`chroma_bridge._resolve_backend()` 末行 `return "pg", "代码默认"` |
+| backends.json | 降级为**例外表**，只在需要给某 profile 写 `chroma` 时才填（原 8 个显式键已删） |
+| 回滚 | 显式 `BOSHI_BACKEND=chroma`，或 backends.json 给该 profile 写 `chroma` |
+
+**为什么默认值必须在代码里**：配置文件会被重装/升级重置，一旦回落到 `chroma` 就是**静默丢记忆**——读写照常工作、不报错、没人会收到通知。代码里的默认值带不走。
+
+**为什么不反向补齐 Chroma**：按 id 逐条比对，1,499 条记忆只在 PG、Chroma 里一条都没有（全在 10-10 之后写入）。反向补要动 Chroma、要写回一份过期数据、还要长期双向同步——纯增量复杂度，收益为零。用户定「不动它」。
+
+**已验证**（5 个全新进程）：现状 → `pg/代码默认`；**删掉配置文件（模拟升级重置）→ 仍是 `pg/代码默认`**；`BOSHI_BACKEND=chroma` → `chroma/环境变量`；文件给 default 写 chroma → `chroma/backends.json[default]`；恢复后 → `pg/代码默认`。
+
+## 1. 问题：切 PG 之后少了一条腿
+
+v7.0 把存储从 Chroma 切到 Postgres + pgvector 后，`pg_bridge.search_memory()` 的实现是：
+
+```sql
+SELECT ... ORDER BY embedding <=> %s::vector LIMIT %s
+```
+
+单路纯余弦。而 Chroma 时代的检索是「向量 + 关键词」双路。后果是**字面特征召回整体失效**：
+
+| 查询意图 | 纯向量实际返回 |
+|:--|:--|
+| `tensor-split 显存` | 「显存放不下怎么办？」（泛泛而谈，无 tensor-split） |
+| `ComfyUI 显存不足` | 「跑之前，先查看进程…」（无关） |
+| `Qwen3.6-27B QLoRA` | `qwen3.8-27b-q80`（型号被语义吃掉，金标 doc 排到第 116 名） |
+
+原因不是向量模型差，而是 embedding 对「型号 / 端口 / 参数名 / 数字」这类**低语义高区分度**的 token 天然模糊：
+`Qwen3.6-27B` 与 `Qwen3.8-27B` 在向量空间几乎同义。这类特征必须靠字面通道。
+
+## 2. 设计
+
+三层，全部在 `pg_bridge.py` 内，无新依赖（不用 reranker、不用 jieba、不引 BM25 库）。
+
+### 2.1 分词
+
+- `_kw_tokens(query) -> [(token, weight)]`：查询侧，带权重。
+  - ASCII 型号/路径/端口：3.0
+  - 数字（≥2 位）：2.5
+  - 中文连续段（整段）：3.0；段长 ≥3 时另出全部 bigram：1.0
+  - `len < 2` 丢弃；去重保首现；截断 16 个 token
+- `_doc_tokens(text)`：文档侧索引 token（中文整段 + bigram，单字不入索引）。
+- `_norm_ascii(tok)`：去掉 `_ - . / ,`，使 `IQ4_XS` ≡ `iq4xs` ≡ `IQ4-XS`。
+
+### 2.2 关键词通道（进程内 BM25）
+
+语料只有 ~6000 条、平均 323 字符（≈119 tokens），全量入内存建倒排完全可行：
+
+- `_kw_index(c, cond, params)`：`docs=[(id, content, meta, dl)]` + `postings={token: [(doc_idx, tf)]}` + `avgdl`。
+  - 失效条件：`count(*)` 或 `max(created_at)` 变化，或超过 `_KW_TTL=180s`
+  - 缓存：`_KW_CACHE` 键 `(cond, tuple(params))`，上限 4 份，`_KW_LOCK` 保护
+- `_kw_channel(c, toks, k, cond, params)`：
+  - BM25：`idf = log(1 + (N - df + 0.5) / (df + 0.5))`，`score = Σ w·idf·tf/(tf + k1·(1 - b + b·dl/avgdl))`，`k1=1.2`、`b=0.50`
+  - 协调因子 coord：`scores *= 命中主词权重 / 主词总权重`（主词 = `w >= 2.5`；bigram 不进分母）
+  - 输出两个分数：`kw`（相对 top1，仅供展示）、**`kw_abs`**（绝对 idf 加权覆盖率 ∈ [0,1]，可跨文档比较 —— 融合用它）
+
+**`_kw_abs()` 的两个补丁（都踩过坑）**：
+
+1. **原文归一化**：`low_n = _norm_ascii(low)`，判定 `tok in low or tok in low_n`。
+   缺这句时，库里写 `IQ4_XS` 的文档在 `IQ4XS` 查询下判零命中，整段排序崩掉。
+2. **长度阻尼**：`cov /= 1.0 + _KW_LENB * max(0, dl/avgdl - 1)`，`_KW_LENB = 0.5`。
+   不加时「如实回答，分三层说…」这类长文靠零星 substring 命中霸榜。
+3. 中文主词（≥3 字）做 bigram 部分信用：`_KW_PARTIAL + (1-_KW_PARTIAL)·m/grams`，`_KW_PARTIAL = 0.85`。
+
+### 2.3 融合
+
+```python
+# _score_merge
+f = (wv*(1 - dist) + wk*kw_abs) / (wv + wk)     # wv=0.45, wk=0.55
+score = 1 - (0.60 + 0.40*min(f, 1))             # 单调压到 0.6~1.0
+```
+
+- 只被关键词通道捞到的文档，`_cosine_for_ids()` 批量补算真实余弦（否则 v=0，白占便宜）。
+- `_rrf_merge`（名次融合 `1/(60+rank)`）保留可切，但**默认不用**：实测会埋掉「单通道第 1」——
+  「退休 养老金」金标 vec#1 但 kw 零命中（1/61=0.0164），被「两通道各 ~5 名」的文档（2/65）压出 top5。
+- `_has_anchor(query)`：`[A-Za-z][A-Za-z0-9_.+\-]{1,}|\d{2,}`。`auto` 模式下无锚点 → 纯向量。
+
+## 3. 验收（8 条固定 query，vector vs auto）
+
+| query | 纯向量 top1 | auto top1 | 判定 |
+|:--|:--|:--|:--|
+| 佛教微调 数据集 | 不是佛教微调，是通用的 | 同（无锚点走向量） | 持平 |
+| IQ4XS 解码速度 | 甜点只能是xxs… | 官方 Accio-Lab 量化版（含 IQ4_XS） | 召回改善，主题偏 |
+| tensor-split 显存 | 显存放不下怎么办？ | 218双2080Ti 启动调优定稿 | ✓ 改善 |
+| 17891 代理 | 我现在打开代理 | 代理端口为17891 | ✓ 改善 |
+| 退休 养老金 | 基础养老金2146.72 | 同（无锚点） | 持平 |
+| ComfyUI 显存不足 | 跑之前，先查看进程 | 单张3060 12GB共卡…必须串行 | ✓ 改善 |
+| hermes-web-ui 升级 | 升级hermes-web-ui | 同，分差 0.0172→0.0031 | ✓ 改善 |
+| Qwen3.6-27B QLoRA | qwen3.8-27b-q80 | A800 训练 Qwen3.6-27B（金标 #116→#2） | ✓ 改善 |
+
+**6 改善 / 2 持平 / 0 退化。**
+
+性能：关键词索引冷建 ~1.0s、热态 4ms；向量热态 42~58ms、冷态 5.5~6.8s（拉起 11436 嵌入服务）；
+8 query 冷态 7.2s、热态 30~1225ms。
+
+## 4. 计数与可观测性修复
+
+| 位置 | 旧行为 | 新行为 |
+|:--|:--|:--|
+| `pg_bridge.get_total_count()` | `memories + graph_edges` → status 报 71241 | 只数 memories（6035） |
+| `pg_bridge.get_graph_count()` | 不存在 | `{nodes: 6879, edges: 65206}`，并入 `chroma_bridge._PUBLIC_API` |
+| `boshi_cli.py status` | 数据来自 chroma 旧快照（2251/10000） | pg 真值 + 新增「检索后端: pg(backends.json[default])」 |
+| `boshi_core.search(source="vector")` | 每条硬标 `source="vector"` | 按 `channels` 标 `vector`/`kw`/`fused`；`sources` 为计数 dict |
+
+## 5. 开关
+
+```bash
+BOSHI_SEARCH_FUSION=auto     # 默认：有锚点(型号/数字)才融合
+BOSHI_SEARCH_FUSION=vector   # 回滚到 P1 之前的纯余弦
+BOSHI_SEARCH_FUSION=score    # 所有 query 都融合（含纯中文）
+BOSHI_SEARCH_FUSION=rrf      # 名次融合，保留不推荐
+BOSHI_RRF_K=60
+BOSHI_BM25_B=0.50            # 长度归一强度
+BOSHI_KW_PARTIAL=0.85        # 中文主词 bigram 部分信用
+BOSHI_KW_LENB=0.5            # kw_abs 长度阻尼
+BOSHI_KW_TTL=180             # 索引缓存 TTL(秒)
+BOSHI_KW_MIN=0.05            # 关键词候选相对阈值
+```
+
+回滚粒度是**进程级 env**：不设 = `auto`；设 `vector` = 完全等价于 v7.0 行为。
+
+## 6. 限制 / 未做
+
+- **纯中文 query 仍只走向量**。`auto` 的锚点门槛是刻意的：BM25 不辨否定，实测把
+  「不是佛教微调，是通用的」顶到第一。要覆盖中文查询，得等 P2 写入侧抽提落地
+  （写入时落结构化槽位，才有可靠的字段级关键词匹配）。
+- 评测集只有 8 条手写 query，**不可对其调参**（实测：调 `_KW_PARTIAL` 一条变好一条变差）。
+- 索引是进程内缓存，写入高峰最多落后 `_KW_TTL`（180s）。
+- **是否需要重启**：MCP / 网关 / web-ui 都是常驻进程，进程启动时 import 的模块不会自动更新。
+  与 2026-10-11 的 MCP 协议修复同性质 —— 只改文件不重启，跑着的入口仍走旧逻辑。
+- 未做：reranker、查询改写、IDF 加权之外的实体扩展。这些等 P2 抽提之后按需上。
+
+## 6.1 2026-10-19 常驻进程检验（新增已知问题）
+
+- **Ekko Studio 桥是进程内 AgentPool**（`bridge_pool.py` 的 `class AgentPool` / `class AgentSession`），
+  会话不换进程 → 新开聊天**不会**重载模块；Ekko 侧吃到 P1 必须重启 App / 桥。
+  opencode 相反：每会话 spawn 新 MCP，新会话天然是新代码。
+- **每个进程独占一份 bge-m3**：`onnx_embed.py:85` 是
+  `ort.InferenceSession(str(ONNX_FILE), providers=["CPUExecutionProvider"])`，纯进程内推理。
+  已有检索行为的 MCP 进程 RSS ≈ **808MB**，未检索的 ~96MB（惰性加载，`pg_bridge._ef()`）。
+  多入口常驻时内存线性叠加 —— 需要共享嵌入服务，但那是独立于 P2 的工程。
+- **MCP 进程无回收**：实测 2026-10-19 12:31→12:45 内 opencode 连开 6 个 MCP 进程无一退出，
+  8 个常驻合计约 1.2GB。排查方向在 opencode 侧生命周期，不在 boshi 侧。
+
+## 7. 与 P2 的关系
+
+P1 只补「怎么找」。写入侧仍把整段助手回复 `asst[:800] + "…"` 直接存成一条记忆
+（`plugins/boshi/__init__.py:645-646`），导致：
+
+- 1305 / 6035 条（≈71% 的 `assistant_conclusion`）撞上 800 字符墙，尾部信息被物理截断。
+- 截断文本会产生「假匹配」：`[2026-07-02] DeepSeek-R1…--tensor-s` 这种半截 token 被 BM25 的 substring
+  规则匹配到，是 `tensor-split 显存` 榜首一度跑偏的直接原因之一。
+
+P2 要做的是把「截断式存档」换成「槽位化抽提 + 原文另存」：`statement / subject / files / decisions /
+open_questions / reusable_experience / boundary_envs / confidence`，事实层每会话恰好 1 条、经验层 0~N 条设门槛。
+搜索质量的天花板在写入侧，不在检索侧 —— 这是对比 PilotDeck 2.0 / Hindsight / Hy Memory 2.0 三篇之后的共同结论。
+
+## 8. P2 落地：规则抽提 v2（2026-10-19）
+
+### 8.1 为什么是规则，不是 LLM 混合
+
+三条真实结论上对照 `slots.py` / `MiniCPM5-2.6B-F16` / `qwen3.5-4b-buddhist-q8_0` 后定稿：**只用规则**。
+
+| 维度 | 规则 | qwen3.5-4B Q8 | MiniCPM5-2.6B F16 |
+|:--|:--|:--|:--|
+| 耗时/条 | **0.35 ms** | ≈5.3 s（46-52 tok/s） | 1.2-2.8 s |
+| 硬事实（flags） | 5/5、1/1 | 6/6、16/16、15/15 | **4/4、0/0、0/0（漏）** |
+| `decisions` | 少但逐字 | 0/2 改写、3/3、1/3（**不稳**） | **全空** |
+| `statement` | 结构修好后可用 | 好 | 好 |
+| 显存/文件 | 0 | 5.32 GB / 4.3 GB | 5.37 GB / 4.7 GB |
+
+否决理由：① 候选池 1,741 条里 **1,124 条（64.5%）是旧 801 字截断**，瓶颈是数据残缺不是抽提质量；② `statement` 只是索引元数据，检索召回走原文向量 + BM25；③ 成本差 1.5 万倍且与 ComfyUI 抢卡。**重议条件**：`statement` 对检索命中率有可测提升 + `decisions` 逐字率 >90% + 离线批时间可接受，三条同时成立。
+
+### 8.2 结构修复（真 bug）
+
+旧 `_sentences()` 先 `re.split('(?<=[。！？；\n])')` 再 `strip(' \t-*#>')`，于是 `## 一、…（结论）` 这种标题被 strip 成正常句子占掉 `statement`；按 `\n` 切句又把「当前状态一句话：」切成独立空引子。基线 `stmt_len_avg` 仅 **38.6**。
+
+v2 改为**先识别标题行、再切块、块内只按句末标点切句**：`_is_heading(raw)`（`#{1,6} ` / 纯粗体无句读 / 短编号项且无句读，且必须**在 strip 之前**判定）→ `_blocks()` 丢标题行、块内行原样保留 → `_sentences()` 块内 `(?<=[。！？；])` 切 → `_statement()` 取首个 len≥24 的句子 → `_clip()` 在标点处截断。
+
+**块内行必须原样保留**：先删行标记再合并会让槽位值不再是原文连续子串（实测严格子串率 **87.2%**）；切块方案下 **100.00%（1472/1472）**。
+
+### 8.3 实测（400 条完整记录）
+
+| 指标 | 基线 | v2 |
+|:--|:--|:--|
+| 严格子串率 | 100% | **100.00%** |
+| verbatim | 100% | **100%** |
+| `stmt_len_avg` | 38.6 | **79.4** |
+| `bad_statement%` | 4.5 | **3.5**（剩余为有内容的列表项，检测器口径） |
+| `decisions` fill | 20.2 | **22.8** |
+| `open_questions` fill | 20.2 | 18.0（标题行被剔的自然下降） |
+| `ports` fill | 3.5 | **5.8**（补裸端口关键词后） |
+| `numbers` fill | 38.2 | **41.0**（补 build/ctx 裸整数后） |
+
+### 8.3.1 真实进程跑通（当日 17:40 补测）
+
+**线上真实对话行（非测试）即已落槽位**：
+
+- 17:26:25 `len=804, slots 非空, raw_len=804`（旧代码会截成 801+`…`）
+- 17:36:11 `len=490, slots 非空, raw_len=490`
+
+说明 bridge worker 已被空闲 GC 换新：`bridge_broker.py:23 IDLE_TIMEOUT_SECONDS = 30*60`，`_gc_idle_workers()` 在 accept 循环里按 `last_used_at` 回收，下一个请求 `_worker_for_profile()` 未命中即 `subprocess.Popen(--worker-profile …)` 起新进程重新 import 插件。**换代码不需要杀进程。**
+
+**全新进程端到端 11/11 PASS**（`scratch/p2_live_run.py`，不清理数据）：原文全存 / `raw_len` 正确 / meta 不重复存 slots / slots 非空 / statement 非标题引子 / flags / numbers / decisions 逐字 / 检索命中 / 返回原文 / `BOSHI_WRITE_SLOTS=0` 回落。
+
+### 8.3.2 跑通过程中发现的槽位漏抓（已修）
+
+`RE_EP` 只认 `IP:port`，「端口沿用 8199」「8199 做反推」这类中文口语全漏（实测 `ports=[]`）；`numbers` 只认带单位数字，`build 11118`、`ctx 131072` 进不了倒排。
+
+- `RE_EP_KW` + `_ports()`：关键词所在分句内扫裸端口（按 `[。；;，,]` 截断，避免把后面的 build 号当端口）
+- `RE_NUM_KW`：仅 `build|ctx|上下文长度|上下文|阈值|上限` 后的裸整数；不做全库裸整数（日期/ID 会污染倒排）
+- `_versions` 负向：`=`/`～` 后的小数、紧邻 `阈值/参数/系数/阻尼/温度/比例/概率/权重/占比/得分` 的小数都不算版本号；上下文只取同一分句（按标点切，不按空白切）
+
+存量 `slots IS NULL` 的记录由 `_doc_text()` 回落全文，BM25 与改造前一致，无需回填。
+
+### 8.4 `decisions` 的天花板
+
+宽意图正则当近似真值：应抓 287 句，规则只抓 85，覆盖 **29.6%**。经抽样否掉的标记：`就按`（流程非决策）、`切成`（切割动作）、`保留/方案/口径/只用/最终`（宽正则 40%+ 命中但多非决策）、裸 `定为`（误配「判定为可疑」）。保留的高精度标记：`我建议`、`切(?:换)?到`、`改用`、`(?<![判认指规])定为`。
+
+**更高精度的决策信号在用户侧**（「就按你的建议来」「好，这个选择ok了」），但 `sync_turn` 目前只抽 `assistant_conclusion`，扩到用户话语属写路径变更，未做。
+
+### 8.5 回滚
+
+`BOSHI_WRITE_SLOTS=0` → 回到 `asst[:800] + "…"` 旧行为（e2e 断言 4 已验证：len=801、末字符 `…`、slots 空）。
+
+## 9. 槽位该不该进 BM25？A3 对照实验（2026-10-19，结论：不该）
+
+P2 的原始设想是「有 slots 的行，BM25 文档用 `statement + 槽位值` 替代全文」，理由是压缩后更精准、避免长文半截 token 制造假匹配。这一设想此前**从未量化验证**。A3 就是补这次量化。
+
+### 9.1 实验设置
+
+- 语料：线上 6,108 条 `slots IS NULL` 的记录批量抽提（A2，1.1s 抽完；**55.2% = 3,371 条抽不出任何槽位**，多为 31–36 字的 user 短消息）。
+- 评测：`C:/Users/wulezhi/AppData/Local/hermes/cache/scratch/a3_eval.py`，8 条固定 query × {auto, rrf} = 16 次检索，结果落 `~/.boshi/logs/a3_<tag>.json`。
+- 对照方式：`a3_eval2.py` 按变体 monkeypatch `pg_bridge._doc_text`（**不改代码文件**），变体间只差这一层。
+- baseline = 槽位全空时的线上排序（A2 写库前采集）。
+
+QUERIES（8 条）：`tensor-split 显存 双卡 2080Ti` / `端口 8199 反推模型 llama-server` / `MTP 上下文 64K 吞吐` / `伯仕记忆 槽位 截断 801` / `ComfyUI 低显存 2080Ti 爆显存` / `微调 QLoRA 3090 成本 多少钱` / `qwen3_5 家族 不可训练 fp16` / `fsck 机械盘 nofail 挂载超时`。
+
+### 9.2 结果
+
+| 变体 | top1 与 baseline 相同 | top5 平均重叠 | auto top1=user | auto top5=user |
+|:--|:--|:--|:--|:--|
+| baseline（槽位全空） | — | — | 0/8 | 0/40 |
+| 纯槽位替代全文（A2 全量） | **7/16** | 2.56/5 | **4/8** | **15/40** |
+| guard 0.6（槽位短于原文 60% 回退全文） | 15/16 | 4.50/5 | 0/8 | 0/40 |
+| additive（全文 + 槽位值） | 14/16 | 4.50/5 | 0/8 | 0/40 |
+
+退化实例（纯槽位替代）：`伯仕记忆 槽位 截断 801` 的 top1 变成 *「设置成4096 就截断对于长任务多轮工具调用是不是不友好？」*；`微调 QLoRA 3090 成本 多少钱` 的 top1 变成 *「5090 32g 训练3.8版的27b模型，速度能比3090…快多少？」*；`ComfyUI 低显存 2080Ti 爆显存` 的 auto top1 也换成了一条用户短问。
+
+### 9.3 机制：BM25 的长度归一化反过来奖励被压缩的短文档
+
+槽位文本把一条 1,500–2,000 字的 assistant 结论压成 `statement + 槽位值`（1,880/6,108 行 doc_text 不到原文一半，部分只剩一两百字）。BM25 的 `dl/avgdl` 归一化因此**奖励**这些短文档：同样命中「截断」「4096」这些词，短文档得分更高；三十来字的用户小问天然最短，直接被顶到第一。这层压缩对排序是净负收益，不是正收益。
+
+guard 0.6 / additive 两种变体都只是**打平** baseline（15–14/16、4.50/5），没有任何一条 query 变好 —— 说明槽位文本对 BM25 的贡献 ≈ 0，它现阶段的正确用途是**元数据**（留给 P2+ 的字段级匹配），不是排序文本。
+
+### 9.4 决定与实施
+
+1. **回滚 A2**：`UPDATE boshi.memories SET slots=NULL WHERE id = ANY(%s::uuid[])`，影响 6,108 行；回滚后 6,117 条 / 带槽位 9 条（全是插件实时写入的新行，len=raw_len）。A2 的回滚清单在 `~/.boshi/logs/a2-ids-<ts>.txt`。
+2. **改读路径**（`~/.boshi/pg_bridge.py:709 _doc_text`）：默认**恒用原文**，slots 只当元数据。实测改后 top1 与 baseline 逐条一致（`logs/a3_after_code.json`）。
+3. **留实验开关**：`BOSHI_KW_DOC=content|guard|additive|slots`（默认 content），`BOSHI_KW_GUARD` 可调 guard 阈值 —— 日后做 P2+ 字段级匹配实验时不必再改代码。
+4. **slots 数据不丢**：抽提本身有价值（端口/数字/flags/decisions 进倒排的入口在 P2+ 字段级匹配），只是不进 BM25 文档文本。
+
+### 9.5 A1 原文回填的执行与后果（2026-10-19 19:31 完成）
+
+apply 实测：**1,072 条 / 25.9 分钟**（0.69 条/s，bge-m3 ONNX CPU，分批 4 条）。核对：1,126 条快照 id 全部在库，**1,072 条满足「新长度 > 801 且前 800 字与快照逐字一致 且 `length(content)=raw_len`」**（1072/1126），新长度均值 **1,439**（中位 1,264、最大 28,892）；仍为 801+`…` 的剩 **54** 条（state.db 找不到更长原文，见 `logs/backfill-miss.jsonl`）；`embedding IS NULL` = 0。
+
+排序影响（同一套 8 query × auto/rrf，tag=`after_backfill` vs baseline）：
+
+| 指标 | baseline | after_backfill |
+|:--|:--|:--|
+| top1 相同 | — | **11/16** |
+| top5 平均重叠 | — | 4.12/5 |
+| auto top1=user | 0/8 | 0/8 |
+| auto top5=user | 0/40 | 0/40 |
+
+5 条 top1 变化逐条判定：
+
+| query | 模式 | baseline top1 | 现在 top1 | 判定 |
+|:--|:--|:--|:--|:--|
+| MTP 上下文 64K 吞吐 | auto | `fe9a07a3`（136 字，确认已改 ctx 64K） | `4873034f`（676 字，vLLM `--max-num-seqs` 讨论） | 略退（偏离 MTP） |
+| 伯仕记忆 槽位 截断 801 | auto | `f04baf28`（230 字，slots 全 NULL 现状） | `a2bbc610`（414 字，文档 6.1 已知问题） | 持平 |
+| ComfyUI 低显存 2080Ti 爆显存 | auto | `b7718197`（调研：常见问题与解决） | `bc1f04e6`（调研：环境优化与加速/低显存模式） | 略好 |
+| 微调 QLoRA 3090 成本 | **rrf** | `46c07ee6`（1,109 字成本推导） | `570b227a`（335 字「太贵了不训练」） | 退，但 **auto 模式未变** |
+| qwen3_5 家族 不可训练 fp16 | auto | `9dcd55a1`（1,270 字「Turing 不能训 qwen3_5」） | `3ef6aad6`（621 字 40M 玩具模型） | 退，原答案落到 **第 3** |
+
+**漂移归因（实测，不是推测）**：`BOSHI_BM25_B` 从默认 0.50 扫到 0.35、0.20，8 条 query 的 top1/top5 **逐条完全不变**。原因是融合前各通道做 min-max 归一，BM25 的 `b` 只改变绝对分、不改变通道内相对次序 → 通道权重不变时融合结果不动。故这批 top1 漂移**只能来自向量侧**（1,072 条 content 变了 → embedding 重算），不是「文档变长拖累 BM25」。（`BOSHI_BM25_B`/`BOSHI_BM25_K1` 在 `pg_bridge.py:573-574`，env 可调。）
+
+**结论**：A1 达到设计目的（1,072 条原文与向量都对齐完整原文、54 条缺失如实留档），代价是 8 query 里 5 条 top1 换人，其中 2 条略退、1 条略好、2 条持平，原答案在 2 条退化 query 上仍留在 top3。判据（≥14/16）**未达标（11/16）** —— 记录在案，不当作"通过"。
+
+## 10. 检索质量的绝对度量：35 条 gold 评测（A5/A6/A7，2026-10-19 夜）
+
+### 10.1 为什么必须换判据
+
+A3/A1 用的判据是「top1 是否换人」，量的是**稳定性**，不是**正确性**。A5 测出当前索引 top1 只有 60% 正确——在 top1 本身六成对的前提下，"top1 相同 11/16" 既不能证明变好也不能证明变差。故补一套**有 gold 的绝对度量**：判据从"答案换没换"改成"答案有没有被捞到前 N"。
+
+### 10.2 评测集构造
+
+`~/.boshi/eval/cases.py`：35 条 `(query, gold_id8, anchor)`。gold 取自各 profile 的 `assistant_conclusion` / `troubleshooting` / `project` 条目，`anchor` 是该条必须**逐字包含**的字面串（`0x384`、`22528`、`upload_state`、`5165`…）。`eval/check_gold.py` 逐条核对「存在 + `is_latest` + anchor 命中」，当前 **35/35 全过**。
+
+**踩过的坑（指标全错的假象）**：首次评测忘了传 `scope`，`search_memory` 默认按当前 profile 过滤（`pg_bridge.py:388` `_default_scope`），跨 profile 的 gold 直接不可见 → auto top1 只有 37%、纯向量 8.6%。**评测必须显式 `scope="all"`**，否则量的是过滤条件不是检索质量。
+
+### 10.3 结果（`top_k=5` → `k_each=20`，即每通道 20 候选；scope=all）
+
+| 模式 | top1 | top3 | top5 |
+|:--|:--|:--|:--|
+| **auto**（加权分融合） | **21/35 = 60%** | 30/35 = 86% | 32/35 = 91% |
+| rrf | 12/35 = 34% | 26 | 29 |
+| vector（纯向量，回滚态） | 6/35 = 17% | 10 | 11 |
+
+三点结论：
+
+1. **融合是真有效的**：auto 的 top1 是纯向量的 3.5 倍。P0/P1 这条线站得住。
+2. **rrf 明显弱于加权分融合**（34% vs 60%）——线上默认 `auto` 的选择被 gold 数据证实，不是口味问题。
+3. **纯向量 top1 只有 17% 不是嵌入的锅**：实测 query 与 gold 的余弦 **0.795**，全库平均 **0.610**。真正原因是库里存在大量**同主题的用户提问**，对"提问式 query"来说它们在语义上比"结论"更近。top1 掉的是**排序层**而非**召回层**（top5 也才 11/35，说明确实排得靠后）。
+
+### 10.4 A6 角色先验：无效，落档不采纳
+
+针对 10.3 第 3 点的直接修法：查询是问句时，对 `role='user'` 的候选加"池内跨度 × δ"的距离惩罚。δ ∈ {0.5, 1.0, 1.5, 3.0}，也试过"不限问句、全部施加"和"额外罚 `topic='conversation'`"：
+
+- top1 **21/35 一条不动**
+- 只有 2~3 条 gold 从第 4 名升到第 3/2 名（`c6db5b3f`、`91492b69`、`e83a096c`）
+
+**不采纳**：换不动 top1 的排序改动，收益不抵"检索语义变更"的回归风险。
+
+### 10.5 A7：top_k 敏感性——根因是「池污染」，已修并复测通过
+
+同一批 35 条 query，只改 `top_k`（`k_each = min(max(top_k*4, 20), 100)`）的原始表现：
+
+| top_k | top1 | top3 | top5 |
+|:--|:--|:--|:--|
+| 5 | 21/35 (60%) | 30 | **32** |
+| 10 | 21/35 (60%) | 27 | 31 |
+| 20 | 21/35 (60%) | 26 | 29 |
+| 50 | 21/35 (60%) | 26 | 29 |
+| 100 | 21/35 (60%) | 26 | 29 |
+
+top1 恒定，但 **top3/top5 随请求条数变差**——同一查询「要 5 条」和「要 20 条」，第 3~5 名会变。
+
+**先验证过的错误假设**（留档，避免以后重走）：以为是「截断尺子（原始 BM25 分）与融合尺子（`kw_abs`）不是同一个量」，于是把关键词通道改成按 `kw_abs` 排序后截断。结果 k=5 时 top3/top5 **降到 27/29**（比原 30/32 更差）——说明方向错了。
+
+**真实机制**：融合是**绝对分**加权（`pg_bridge.py:954` `_score_merge`：`f = (wv*(1-dist) + wk*kw_abs)/(wv+wk)`，没有池内 min-max 归一），所以池子越大**只会加入**新文档，不会重排已有文档。而 BM25 原始分的长尾是噪声：这些文档 `kw_abs` 中等（0.2~0.3）、余弦低，单通道都不该进前 5，但池子一到 80 条就挤进融合池、把真 gold 顶出前 5。
+→ 问题在**池子大小**，不在排序尺子。附带解释了 §9.5 的一个疑点：`BOSHI_BM25_B` 从 0.50 调到 0.20 结果逐位不变，因为**融合吃的是 `kw_abs`**（由 idf 覆盖率 + `_KW_LENB` 决定），`B` 只影响原始 BM25 分，而原始分只用于池内排序；池子只有 20 条时，改 `B` 没让任何一条候选的进出发生变化。
+
+**修法**（`pg_bridge.py:583` `_KW_POOL_CAP`，默认 20，`BOSHI_KW_POOL_CAP=0` 可回滚旧行为）：
+关键词通道候选数**与 top_k 解耦，固定 20 条**；向量通道仍随 `k_each` 增长（top_k=100 时向量 100 条、关键词 20 条，融合池最多 120）。
+
+复测（`eval/a7_poolsize.py`，默认参数）：
+
+| top_k | 5 | 10 | 20 | 50 | 100 |
+|:--|:--|:--|:--|:--|:--|
+| top1 | 21 | 21 | 21 | 21 | 21 |
+| top3 | 30 | 30 | 30 | 30 | 30 |
+| top5 | 32 | 32 | 32 | 32 | 32 |
+
+五档完全一致（top5 漏召仍为 `70cd3d35` `d2ccef88` `0ce918be`）。验收线 *top1 ≥ 21/35 且 top5@k20 ≥ 32* **达标**，且 k=5 基线未退化（21/30/32）。
+
+延迟（本机热态，6 条代表 query 各跑 2 轮）：`top_k=5` 56 → 55 ms，`top_k=20` 62 → 55 ms（少算 60 条长尾的 kw_abs，略快）。
+
+**代价（如实记录）**：`top_k > 20` 时关键词通道只贡献 20 条候选，理论上存在「第 21 名之后的关键词强命中」拿不到的情况；当前评测集里没有这种样本（35 条 gold 的 top5 召回不受影响）。要再接大 top_k 场景（如批量导出），应重跑 A7 并把 cap 调到 50/100 比较。
+
+
+## 11. P2+ 字段级匹配：查询里的字面量抬升（2026-10-20，默认开）
+
+### 11.1 动机与前任实验的教训
+
+§9 的 A3 已经证明**槽位文本整篇替换 BM25 文档是净负收益**（长度归一化奖励短文档）。P2+ 换了问法：不碰文档，只问**"query 里出现的字面字段（端口 / 版本 / 开关 / 路径），候选的同一字段是否也有"**。这类值（`8199`、`0.1.44.1`、`--tensor-split`、`D:/llama`）的匹配是精确的，不受文档长度、分词断裂影响。
+
+### 11.2 实现（`pg_bridge.py:1046-1130`，`_field_match`）
+
+- 对 query 跑一次 `slots.extract()`，取 `_FM_KEYS` 里的字段；候选侧按 id 批量 `SELECT id::text, slots FROM boshi.memories WHERE id::text = ANY(%s)`，`slots IS NULL` 的历史行**现场从 content 抽**（不为检索写库）。
+- 命中判定 `_fm_hits`：同字段**双向包含**即命中，值先 `_fm_norm`（小写、去空白、去首尾标点）；`_fm_norm` 只做形态归一，不改字。
+- 抬升：`gain = min(_FM_MAX, _FM_STEP × Σ权重)`，写回 `it["score"] = 1 - min(1, sim + gain)`，并记 `field_hits` / `field_gain` 便于后续排查。任何异常直接退回原排序（检索永不因本特性失败）。
+- 候选池：`pool_k = top_k × _FM_POOL(3)`，让"本来没进前几名"的字面命中还有机会被抬进来；`BOSHI_FIELD_MATCH=0` 时 `pool_k = top_k`，代码路径与 P2+ 之前等价。
+- **槽位仍不进 BM25 文档**（`_doc_text` 口径不变，`BOSHI_KW_DOC=content`）。
+
+参数默认：`_FM_STEP=0.10`、`_FM_MAX=0.30`、`_FM_POOL=3`、`_FM_W={ports:1.0, versions:1.0, flags:1.0, files:0.8, numbers:0.4}`。
+
+### 11.3 `numbers` 被踢出默认集合（扫描结论）
+
+`scratch/sweep_field_match.py` 在 auto 模式下扫 8 组（含 `numbers` 的 5 字段 × 步长 .10/.15/.25/.40；去掉 `numbers` 的 4 字段 × .15/.25/.40；只留 ports/versions/flags 的 lit3）：
+
+| 组合 | top1 | top3 | top5 | 名次变动 |
+|:--|:--|:--|:--|:--|
+| baseline（fm off） | 20 | 30 | 32 | — |
+| 含 numbers，四档步长 | 20 | 30 | 32 | 都是 3 条：`7d944c53` 1→2、`e79e3fe9` 3→1、`08e4fa8e` 3→2 |
+| 不含 numbers（三档） | 20 | 30 | 32 | **0 条** |
+| lit3 | 20 | 30 | 32 | **0 条** |
+
+两个事实：① 35 条 gold 里**没有一条 query 带 ports/versions/flags/files 字面量**（四类命中数为 0）——所以 A5 对这四个字段完全不敏感；② 唯一触发的是 `numbers`，而它是净 0（1 条上升、1 条下降），且 `218`/`24`/`5` 这类数字跨语境复用，属歧义字面量。
+
+→ 默认集合改为 **`ports, versions, flags, files`**；`numbers` 可用 `BOSHI_FM_KEYS=ports,versions,flags,files,numbers` 显式打开。
+
+### 11.4 定向验收：A8（40 条字面量 gold）
+
+A5 无法评价本特性（见 11.3），故补 `eval/a8_field_gold.py`：从库里挑 `slots` 含 `ports`/`versions`/`flags` 的记忆（端口 14 条、版本 14 条、开关 12 条），用「**字面量 + 该条内容里的 2~3 个关键词**」拼成查询（语义弱、字面量强，正是本特性的目标场景），gold = 该条记忆 id。这批 query 天然偏向"字面量必须起作用"，因此它测的是**目标人群上的增益**，不代表全量流量收益。
+
+| 模式 | top1 | top3 | top5 |
+|:--|:--|:--|:--|
+| fm off | 25/40 (62.5%) | 32 | 36 |
+| fm on（4 字段） | **29/40 (72.5%)** | **33** | 36 |
+
+**+4 top1、+1 top3、top5 不变**，且与"含 numbers 的 5 字段版"结果完全相同（29/33/36）——再次说明增益来自高精度四字段，`numbers` 只贡献噪声。
+
+同时 A5 回归（35 条真 query）：auto **20/30/32，与 fm off 逐条一致**（`logs/a5_p2plus_fm4k.json`）；rrf 12/27/29、vector 8/12/13（纯向量模式 top1 6→8）。
+
+### 11.5 为什么要说清 A5 的 21→20
+
+上一版基线是 **21**/30/32，本轮 fm off 测得 **20**/30/32。逐条 diff 只有一处：`55cc3251` rank 1→2，与 `8055b300` 互换，两条正文前缀完全相同（都是「P4进度(218四期中医知识库): tensor版32B-VL服务验收通过…」）——**近似重复条目的名次互换**，不是语义退化。fm 关闭时代码路径与 P2+ 之前等价（`pool_k=top_k`、向量池 `max(k_each,20)` 不变），差异来自库在 12 小时内的新增写入改变了 df 与向量池竞争。检索指标跨天比较必须重跑 baseline，不能拿昨天的数字当今天的分母。
+
+### 11.6 成本与开关
+
+| 项 | 值 |
+|:--|:--|
+| 延迟 | 35 条 query 各跑 2 轮：fm off 71.7~73.7 ms/q，fm on 73.6~73.7 ms/q → 开销 ≤2 ms（<3%） |
+| 额外查询 | 每次检索 1 条 `id = ANY(...)` 的 slots 查询（≤ =3×top_k 个 id）+ query 侧一次 `extract()`（纯正则） |
+| 开关 | `BOSHI_FIELD_MATCH=0` 关闭；`BOSHI_FM_KEYS` / `BOSHI_FM_STEP` / `BOSHI_FM_MAX` / `BOSHI_FM_POOL` 可调 |
+| 缺槽位时 | 候选侧现场从 content 抽，不需要先回填 |
+
+### 11.7 结论
+
+在**真 query 上净中性**（0 涨 0 跌，延迟 +2ms）、在**字面量 query 上 +10 个百分点 top1** → 开默认。若日后线上发现数字类误抬升，第一步先把 `BOSHI_FIELD_MATCH=0` 关掉再定位，不要动 BM25 口径。
+
+### 11.8 资产
+
+| 文件 | 作用 |
+|:--|:--|
+| `~/.boshi/scratch/sweep_field_match.py` | 8 组参数扫描（进程内 monkeypatch，省去反复加载嵌入） |
+| `~/.boshi/eval/a8_field_gold.py` | 40 条字面量 gold 自动构造 + fm on/off 对比 |
+| `~/.boshi/logs/sweep_field_match.json` `a8_field_gold.json` `a5_p2plus_fm4k.json` | 结果快照 |
+
+**A8 的局限（如实记录）**：gold 由"含该字面量的记忆"反推，构造上偏向字面量有效；它回答的是"字面量抬升能否把目标条从后几名提到 top1"，不能回答"线上会不会抬错"。后者要等真实 query 分布积累（下一步可给 `field_gain` 打点统计命中率）。
+
+
+### 11.9 活体验证发现的 query 侧盲区（2026-10-20 下午，已修）
+
+**症状**：P2+ 开默认后拿真实 query 实跑，`field_hits` **全是 None**——等于功能没生效。
+
+**根因**：`slots.py` 的抽提器是为**长文档**设计的，端口规则只扫「关键词**之后**」同一分句（`_ports()`，`slots.py:183-191`）：
+
+| 写法 | `slots.extract` 结果 |
+|:--|:--|
+| `端口 8199 监听了吗` | `ports: ['8199']` ✅ |
+| `8199 端口 llama-server 怎么配`（人真实提问） | 只有 `boundary_envs`/`statement`，无 ports ❌ |
+
+A8 的 query 是「字面量 + 关键词」拼的，而字面量本身抄自 slot 值 → **天然绕过抽提器盲区**，所以 A8 看不到这个问题。教训：定向验收集必须用*人真实会怎么说*来写 query，不能从要验证的字段值反推。
+
+**修法（`pg_bridge.py`，只改 query 侧，不动文档抽提语义）**：新增 `_fm_query_extra(query)` + `_RE_PORT_LOOKAHEAD`
+```python
+_RE_PORT_LOOKAHEAD = re.compile(
+    r"(?<![\d.])(\d{2,5})(?=[^\d。；;，,\n]{0,6}(?:端口|端口号|监听|port|PORT))")
+```
+数字在关键词前 6 字内即认端口，再按 `1..65535` 过滤。`_field_match` 里与 `sm.extract(query)` 的结果合并（仅当 `ports` 在 `_FM_KEYS` 内）。不改 `slots.py` 的理由：文档侧「端口 8199」早已抽全，改抽提器要重跑全量回填，blast radius 远大于收益。
+
+**修后实测**（`scope=all`，同一批真实 query）：
+
+| query | 修前 field_hits | 修后 |
+|:--|:--|:--|
+| `8199 端口 llama-server PE 反推怎么配` | 0 条 | 3 条（`ports`，gain 0.10） |
+| `8648 端口那个 web ui 是啥` | 0 条 | 2 条 |
+| `8199 端口` | 0 条 | 3 条 |
+
+回归：A5 `20/30/32`（与修前逐条一致）、A8 `25/32/36 → 29/33/36`（与修前一致）、`tests.test_field_match` 11 条全过（IP 不算端口、`131072`/`2026-10-20`/`v7.2` 不误抓、越界 99999 丢弃）。
+
+**顺手修的验收脚本 bug**：`eval/a8_field_gold.py` 基线原来用 `os.environ.pop("BOSHI_FIELD_MATCH")` 吃默认值；默认从 0 改成 1 之后基线跟着变成「开」，两栏数字一模一样（29/33/36 vs 29/33/36）差点被当成"零收益"。已改为显式 `= "0"`。**教训：用 pop 吃默认值的基线，在默认值变更后会静默失效。**
+
+### 11.10 4 段版本号：测得该做但暂不做（2026-10-20，**2026-10-21 已实施 → 见 §11.20**）
+
+> **状态更新（2026-10-21）**：本节是当时的决策记录，已被 §11.20 取代——`v` 前缀无歧义规则、`RE_VER4` 上下文规则、存量回填、版本精确匹配都已落地并实测（A5 top1 20→21，目标 case rank 3→1，A8 误抬仍为 0）。以下保留原始测量与推理。
+
+`RE_VER`（`slots.py:46`）最多 3 段：`0.1.44.1` 抽不出。全库 latest 6,160 行实测：**189 行含 4 段数字，slots 里 versions 命中 0 条**；但按 token 去重后 29 个 token 里 **319 次是 IP**（`172.16.0.218`、`127.0.0.1`），非 IP 形状只有 **18 次 / 7 个 token**（`v0.1.40.4`×4、`v0.1.44.1`×4、`10.0.19041.3636`×3 等）。
+
+结论：放开到 4 段必须先排除 IP 形状，而 `0.1.44.1` 与 `1.2.3.4` 在语法上无法区分 → 只能用「有 `v` 前缀」「紧邻 `@`/`版本`」这类上下文规则，收益 18 次、成本是全量回填 + A5/A8 重跑。**记为待办，不在 P2+ 里做**；届时只需加 `v\d+\.\d+\.\d+\.\d+` 这条无歧义规则（`v` 前缀绝无可能是 IP）。
+
+
+
+### 11.11 误抬审计：A8 逐条归因 + 线上打点（2026-10-20，收起 A8 局限）
+
+§11.8 记录过 A8 的局限："gold 由字面量反推，不能回答线上会不会抬错"。这一节把能测的部分测完，剩下的交给打点。
+
+**(1) A8 逐条归因（`eval/a8_field_gold.py` 新增，不是新实验，是同一批 40 条的分类）**
+
+| 类别 | 条数 | 含义 |
+|:--|--:|:--|
+| 保持 | 25 | off/on 都是 gold 在 top1 |
+| 转好 | 4 | off 非 top1 → on top1（`fe798f8f` 4→1、`fd37d505` 2→1、`f9182d1d` 2→1、`f85e69c8` 3→1） |
+| **误抬** | **0** | off=gold 在 top1 而 on 被挤掉——一条都没有 |
+| 均未中 | 11 | off/on 都没进 top1 |
+
+**这是直接回答"会不会抬错"的数字**：40 条字面量查询里，抬升**从未**把本该第一的条目挤下去。top1 25→29 的净 +4 全部来自"转好"，没有"转好 6 条同时踩掉 2 条"的对冲。原文 miss 列表也印证：11 条均未中的多是查询词本身弱（`17891 【218 实测 Strata`）或字面量太泛（`2.1`）。
+
+**(2) 线上打点（`pg_bridge._fm_trace`，默认关）**
+
+`BOSHI_FM_TRACE=1` 时，每次 `_field_match` 在**排序前**记一行到 `~/.boshi/logs/fm_trace.jsonl`：
+
+```json
+{"ts":"2026-10-20T09:50:52+08:00","query":"端口 8199 怎么配","fields":{"ports":["8199"]},
+ "top_k":5,"cand":15,"hit_n":6,"pre_top":["8c747d44",...],"post_top":["fe798f8f",...],
+ "top1_changed":true,"top1_hit":true}
+```
+
+- 只在 `qfields` 非空（query 真带字面量）时才走到这里，频率低；一次 append，无 IO 压力
+- `pre_top` 取的是**尚未 sort** 的 `items` 顺序，所以 `top1_changed` 是真实的名次变化
+- `top1_hit` = 抬升后的 top1 自身是否命中字段；**若 `top1_changed=true` 而 `top1_hit=false`，说明重排逻辑出错**（抬上去的不含该字面量），报告脚本会单列"可疑"
+- 任何异常吞掉，绝不影响主检索
+
+**首次抽样**（`BOSHI_FM_TRACE=1` 跑 A8 40 条 + A5 35 条，`scratch/fm_trace_report.py`）：
+
+| 指标 | 值 |
+|:--|:--|
+| 打点条数 | 44（A8 40 + A5 里带版本号的 4 条） |
+| 候选有字段命中 | 42 / 44 |
+| **top1 被改动** | **8 / 44 = 18.2%** |
+| 改动后 top1 带命中 | 95.5%（21/22 命中） |
+| 平均命中条数 | 4.32 |
+| 可疑（改了 top1 但新 top1 无命中） | **0** |
+
+A5 那 4 条 churn（如 `218 vLLM v0.2.2-post2 驱动 595.91.07`、`llama 20.4 tok/s 内核 7.0 gdm 停 595.84`）**没有改变 A5 的 gold top1 计数（20/30/32 与 off 逐条一致）**——抬上来的也是一条真含该版本号的记忆，对 gold 中性。这正是"18.2% churn 但 0 误抬"能同时成立的原因：churn 衡量的是"名次动没动"，误抬衡量的是"动错没动错"。
+
+**(3) 收口口径**
+
+- 可测范围内（40 条字面量集）：**误抬 0**
+- 真实分布：靠 `BOSHI_FM_TRACE=1` 累计，`scratch/fm_trace_report.py` 一键看 churn/命中/可疑
+- 若线上出现可疑 > 0：先 `BOSHI_FIELD_MATCH=0` 关掉止血，再看 `fm_trace.jsonl` 定位——**不要动 BM25 口径**
+
+**(4) 资产**
+
+| 文件 | 作用 |
+|:--|:--|
+| `~/.boshi/pg_bridge.py` `_fm_trace()` | 打点实现（`BOSHI_FM_TRACE=1` 开） |
+| `~/.boshi/scratch/fm_trace_report.py` | 读 jsonl，出 churn / 命中 / 可疑 / 改动样本 |
+| `~/.boshi/tests/test_fm_trace.py` | 5 条单测（默认不写、检测 top1 变化、无变化不谎报、坏输入不炸、query 截断 200） |
+| `~/.boshi/logs/a8_field_gold.json` | 新增 `attrib` 与 `detail`（keep/fixed/broken/neither 逐条） |
+
+
+### 11.12 纯中文 query：A5 答不了，另建 A9（2026-10-20）
+
+**(1) 问题**：`pg_bridge.py:1252-1256` 的 auto 门（`mode == "auto" and not _has_anchor(query)` → 跳过关键词通道）会让**纯中文自然语言提问**只用向量通道。要不要放开，需要度量「放开后有没有用」。
+
+**(2) A5 回答不了**（`scratch/a5_fusion_modes.py`）：A5 的 35 条 query **全部** `_has_anchor=True`（带锚点 35 / 纯中文 0），auto 与 score 逐条 35/35 相同。**验收集的构造决定了它能回答什么问题**——这是 A8 那条方法论坑的翻版。
+
+顺带杀掉一个假信号：总览里 auto 184ms vs score 106ms 看着是 auto 更慢，交叉排序复测（同 8 条 query）`('score','auto')` 得 score 367 / auto 131，`('auto','score')` 得 auto 119 / score 122 → **同进程内每个 query 的第一次调用带冷成本**，模式对比必须交叉排序。
+
+**(3) A9 测集**（`eval/cases_a9.py`，`eval/a9_eval.py`）：20 条 gold × 2 种问法 = 40 条，同一条 gold 配两种问法以消掉「gold 难度」混杂：
+
+- `overlap`：用户凭印象复述、复用原文词
+- `paraphrase`：完全换词、只留语义
+
+自检两条（不满足即 exit 1）：① anchor 必须逐字出现在 gold 正文；② `_has_anchor(q)` 必须为 False。首跑就抓出 `b74d2c87` 的 anchor「拉扁」不在正文（原文是「视频拉伸了原图，扁了」），改成「扁了」后 40 条全过。
+
+**(4) A9 v1 结果**（`logs/a9_v1.json`，scope=all，gold 名次 top1/top3/top5）：
+
+| 组 | auto | score | vector |
+|:--|:--|:--|:--|
+| overlap (n=20) | 0 / 2 / 6 | 0 / 2 / 6 | 0 / 2 / 6 |
+| paraphrase (n=20) | 0 / 1 / 1 | 0 / 1 / 1 | 0 / 1 / 1 |
+
+**40 条逐条 auto == score，一条不差**。两层含义：
+
+1. 纯中文无锚点 query 的**绝对召回极差**（top1 0/40），瓶颈不在关键词通道；
+2. 「放开通道」在当时对 top5 **没有可测影响**——但机制未明（kw 零命中？被阈值砍？被余弦压出榜？），不能就此下结论（见 §11.13）。
+
+**(5) 软命中口径**（`scratch/a9_soft.py`）：记忆库把同一段对话切成多条近重复记录（A9 的 20 条 gold 里只有 7 条有 `session_id`，同一话题常有 3~4 条近文），用 record id 判分会低估检索质量。故另算两档可接受命中：`soft5` = top5 里有同 session_id 的兄弟切片；`dup5` = top5 里有与 gold 余弦 ≥ 0.92 的近文。基线（auto=vector）：overlap soft/dup 11/20、paraphrase 6/20。
+
+### 11.13 coord 退化：纯中文上关键词通道是静默死路（2026-10-20，已修）
+
+**(1) 探针**（`scratch/a9_kwprobe.py`）：8 条纯中文 query 的 `_kw_channel` 候选**全部 0 条**。再往下查，`_kw_tokens`（`pg_bridge.py:646-652`）把整段连续汉字当成**一个 3.0 权重的主 token**（如 18 字整句），bigram 只取前 6 个（`range(min(n-1, 6))`）；整句几乎不可能作为 token 存在于 postings（df=0）。
+
+**(2) 归零链条**（`scratch/a9_coord_zero.py` 复算证实）：
+
+```
+整句主 token df=0 → hits[idx]["cov"] 不累加（pg_bridge.py:889-901 只对 w>=2.5 的命中计 cov）
+→ pr 全 0 → scores = s * (0 / denom) = 0
+→ top = ranked[0][1] or 1.0 → rel = 0 < _KW_MIN(0.05) → 候选全灭
+→ search_memory 侧 kw_items 为空 → 退回纯向量
+```
+
+实测：「群晖硬盘显示已损毁但检测是好的怎么办」raw BM25 **295 候选**、gold `7f6c4aba` 排 #2，coord 后**非零 0/295**；「显存不足怎么办」raw 897 → coord 后 0/897；只有整句恰好等于库内 token 的「显存不足」幸存（coord 后 6/594）。
+
+**后果**：为 CJK 设计的 `_kw_abs` 部分信用（`pg_bridge.py:843-847`）在 CJK-only query 上是**死代码**——候选已在上游被丢光，根本走不到它。
+
+**(3) 修复**（两处，默认开）：
+
+- **coord 退化保护**：`main_hit_n`（主 token 里库内真有的个数）计数；`main_hit_n == 0` 时不施加 coord，保留原始 BM25 分。可证明的 no-op：只要有一个主 token 命中就走原分支，故对带锚点查询**逐条不变**（A5 三模式 0/105 变化）。
+- **弱证据降权**：`_kw_channel` 给降级候选打 `_weak=True`；`_score_merge` 见到 `_weak` 且调用方未显式传权时，把 `(wv, wk)` 从 `(0.45, 0.55)` 降到 `(0.70, 0.30)`（`BOSHI_KW_WEAK_WV/WK` 可调）。理由：只剩 bigram 证据时 `kw_abs` 表达的是「零星 2 字切片对上」，与整词命中不可同日而语；等权融合实测会把 gold 挤出 top5。`_weak` 在 `_score_merge` / `_rrf_merge` 出口 `pop` 掉，不外泄给调用方。
+
+**(4) 验收**（A9 v2，`logs/a9_v2.json`，源码态无 monkeypatch）：
+
+| 组 | auto（门关） | score（门开） | vector |
+|:--|:--|:--|:--|
+| overlap top1/top3/top5 | 0 / 2 / 6 | **4 / 9 / 12** | 0 / 2 / 6 |
+| paraphrase top1/top3/top5 | 0 / 1 / 1 | **1 / 1 / 2** | 0 / 1 / 1 |
+
+- 中间态对比（`scratch/a9_option_c.py`）：只做 coord 保护不做降权 → overlap 4/8/10、paraphrase 1/1/1，且 paraphrase 有一条反向（`56d59b74` 被 bigram 噪声挤出 top5）。降权后 overlap top3 8→9、top5 10→12，paraphrase top5 1→2，**三个口径全面不劣**。
+- A5 回归：`eval/a5_eval.py` 仍是 auto 20/30/32、rrf 12/27/29、vector 8/12/13，与修复前逐条一致。
+- 单测 `tests/test_kw_coord.py` 9 条（纯中文保候选 / 主 token 命中不打 weak / coord 仍生效 / 空 postings 返空 / 弱证据按 0.70-0.30 / 强证据 0.45-0.55 / 显式传权不被覆盖 / 两个 merge 都不外泄 `_weak`）。全套 45 tests OK（20+11+5+9）。
+
+**(5) 门开不开还没定（政策项，待乐之拍）**：修复只让 score/rrf 模式在有主 token 命中的查询上等价于现状、在纯中文查询上不再静默失效；**auto 门本身未动**（默认融合仍是 auto，所以线上行为对带锚点查询零变化，对纯中文查询仍走纯向量）。
+
+门开的收益与风险（`scratch/a9_negation_probe.py` 定性 4 例）：
+
+- 收益：A9 overlap top5 6→12、top1 0→4；「不是歌词整理那件事，是分镜怎么排」的目标记录从榜外升到 #2
+- 风险：否定句会把**被否定的主题**拉进来——「别管显存不足，我问的是代理连不上外网」在 score 下第 3 名就是显存记录（auto 的 top3 全是代理）；这正是当初关门的原因（源码注释：「不是佛教微调，是通用的」被顶到第一）
+- 注意：弱证据降权**覆盖不到**这个风险——否定句的主 token 是会命中的，走的是「强证据」分支（0.55 等权）
+
+### 11.14 auto 门放开（2026-10-20 乐之拍板）+ 评测自身写入污染
+
+**(1) 改动**：`pg_bridge.py` `search_memory` 的 auto 门从「纯中文只走向量」改为「纯中文也走关键词通道」，一行开关控制：
+
+```python
+_auto_kw_noanchor = os.environ.get("BOSHI_AUTO_KW_NOANCHOR", "1") == "1"
+if not toks or (mode == "auto" and not _auto_kw_noanchor and not _has_anchor(query)):
+    items = vec_items[:int(pool_k)]      # 回退：BOSHI_AUTO_KW_NOANCHOR=0
+```
+
+默认 `1` = 放开；设为 `0` 即恢复 11.13 之前的旧行为（纯中文只走向量），无需改代码。
+
+**(2) 验收（三条基准全跑，2026-10-20 10:2x）**
+
+| 基准 | 门关（改前基线） | 门开（改后） | 结论 |
+|:--|:--|:--|:--|
+| A5 35 条（全带锚点）auto / rrf / vector | 20/30/32 · 12/27/29 · 8/12/13 | **20/30/32 · 12/27/29 · 8/12/13** | 逐条一致，零影响 |
+| A8 40 条字面量 fm off→on | 25/32/36 → 29/33/36，误抬 0 | **25/32/36 → 29/33/36，误抬 0** | 不变 |
+| A9 40 条纯中文 overlap | auto 0/2/6 · score 4/9/12 | **auto 4/9/12**（= score） | 门开生效 |
+| A9 paraphrase | auto 0/1/1 · score 1/1/2 | **auto 1/1/2**（= score） | 门开生效 |
+
+即：门开后 `auto` 在纯中文 query 上**逐条等于**已验收的 `score` 路径（40/40 一致），带锚点场景 0 变化。
+
+**(3) 代价**：10 条纯中文 query × 3 轮交替测，门关 56.2 ms/q → 门开 61.7 ms/q，**+5.4 ms（约 +10%）**。代价来自多跑一次 `_kw_channel`（BM25 全表候选 + coord）+ 融合；量级可接受。
+
+**(4) 否定句风险实测（门开后，带时间窗过滤）**：`scratch/a9_negation_probe.py` 原样本复跑，**11.13 里「第 3 名是显存记录」的现象没有复现**——「别管显存不足，我问的是代理连不上外网」门开后 top1 是代理相关记录（`71470c5d`），top3 无显存记录；原因正是弱证据降权：纯中文 query 只有 bigram 级证据，权重 0.30，压不过向量分。「不是歌词整理那件事，是分镜怎么排」门开后 top1 仍是歌词相关（`dea4f8c4`），与向量口径同类，未额外恶化。→ 风险仍在（BM25 先天不辨否定），但**实测危害比关门时的估计低**；若要止血，`BOSHI_AUTO_KW_NOANCHOR=0` 一键回退。
+
+**(5) 评测自身写入污染（这一轮踩到的坑）**：A9 v3 首跑（无时间窗）overlap top1 从 v2 的 4 掉到 3，唯一变化是 `7f6c4aba` 1→3。查 `created_at`：插到前面的是 **`5d71877b`，写入时间 2026-10-20 10:07:55** —— 就是本轮助手自己 10:07 写入的工作摘要（正文含「群晖」等词），在 **v2 跑完（10:04:58）之后 3 分钟**产生。**评测期间插件仍在往库里写对话记忆，跨轮名次天然不可比。**
+
+对策（两条，都落地）：
+- `_cond()` 新增 `created_at` 真列支持（`{"created_at": {"$lte": <unix秒或ISO>}}` → `created_at <= to_timestamp(%s)`）。此前所有条件键都走 `meta->>'<k>'`，而 `created_at` 是真列、不在 meta 里 → 不特判就是全表筛空。
+- `eval/a9_eval.py` 新增 `A9_ASOF` 环境变量，传 `where={"created_at": {"$lte": ASOF}}`。用 `A9_ASOF=1792461898`（= v2 跑的时刻）复跑：overlap **auto 4/9/12 = score 4/9/12**、paraphrase **1/1/2**，与 v2 的 score 结果**逐条一致** → 证明 4→3 是自身写入污染，不是代码回归。
+
+**(6) 单测**：`tests/test_where_cond.py` 6 条（`$lte`/`$gte`/`$gt`/ISO 串/标量等值/未知操作符返回 TRUE/不落 `meta->>`），全套 **51 tests OK**（20+11+5+9+6）。
+
+**(7) 结论**：auto 门放开，默认生效；带锚点场景零影响、纯中文场景拿到已验收的 kw 融合收益（A9 overlap top5 6→12、top1 0→4）而只付 +5.4 ms；`BOSHI_AUTO_KW_NOANCHOR=0` 是一键回退口。
+
+**(8) 运行时生效核验（2026-10-20 10:36，乐之拍板重启「网关 + Studio」后）**
+
+- **宿主判定口径**：`Get-CimInstance Win32_Process` 的 `CreationDate` 与 `pg_bridge.py` 的 `st_mtime`（本次 `10:18:25`）比大小。重启后实测：网关 19296（10:32:17）、Ekko Studio 22192（10:34:14）、Studio 侧 agent 宿主 21256（10:34:53）、Web UI 侧宿主 8776（10:34:42）——全部晚于 mtime；旧宿主 1048（08:57:42）随整条链消失。
+- **门确已进运行路径**：同一纯中文 query 双跑（只改 `BOSHI_AUTO_KW_NOANCHOR`），结果集完全不同——`=1` → `602c2680` 0.1759 / `5d71877b` 0.197 / `30480e8c` 0.2428；`=0` → `30480e8c` 0.1264 / `7f6c4aba` 0.1563 / `b1023763` 0.1787。两分支都活着，不是死代码。
+- **⚠ score 语义**：`pg_bridge` 的 `score` 是**距离**（越小越近，见 `pg_bridge.py:7`），与 `chroma_bridge` 时代的相似度（越大越好）相反。跨会话比分数前先确认后端；且评测期间插件持续写入新记忆，候选池会变，除非带 `A9_ASOF` 时间窗，否则名次不可跨轮比较。
+- **通道同源**：`chroma_bridge.py:1010-1068` 在 `BOSHI_BACKEND` 未设时默认 `pg`，公开 API `search_memory` / `hybrid_search` 直接 `import pg_bridge as _pgb` 转交 → Hermes 插件自动召回、MCP（`boshi_mcp_server.py`）、CLI 三者走同一份 `pg_bridge.search_memory`，门放开对三条通道同时生效。
+
+### 11.15 P3 写入侧版本化契约：`save(..., upsert=True)`（2026-10-20 10:53，代码+实测完成）
+
+**(1) 契约**：`add_memory(content, metadata=None, memory_id=None, upsert=False)`。`upsert=True` 且 `metadata.session_id` 与 `metadata.topic` 都非空时，同一 `(profile, session_id, topic)` 组内：
+- 已有有效行 → 全部置 `is_latest=false`（`UPDATE ... RETURNING id`），
+- 插入新行 `is_latest=true`，`meta["supersedes"]` = 旧 id（唯一条给字符串，多条给列表）；
+- **不物理覆盖**，沿用 v5.8「不可变日志 + isLatest」；读取侧默认 `isLatest=True`（`pg_bridge.py:1253`），所以调用方无感。
+
+**(2) 退化语义（有意为之）**：`session_id` 或 `topic` 任一为空 → 退化为普通 add。理由：无会话归属的写入（如 `session_summary`、手动 `memory` 工具）彼此无关，若也 upsert 会互相顶掉，把历史抹平。实测无 session_id 连写 2 次 → 2 行。
+
+**(3) 锁：必须用会话级 advisory lock**。`_conn()`（`pg_bridge.py:273`）是 `psycopg.connect(..., autocommit=True)` 单例，autocommit 下 `pg_advisory_xact_lock` 随语句结束立即释放 = 没锁。故用 `pg_advisory_lock(hashtext('boshi.upsert:<prof>|<sid>|<topic>')::bigint)`，INSERT 包 `try/finally` 中 `pg_advisory_unlock`（解锁失败只 `pass`，不覆盖写入结果）。粒度是三元组 → 不同会话/不同 topic 互不阻塞。图谱边（`type=relation`）在加锁前 return，不受影响。
+
+**(4) 三层透传**：`boshi_core.save(..., upsert=False)` → `chroma_bridge.add_memory` / `pg_bridge.add_memory`；MCP `boshi_save(..., upsert=False)` 对外暴露。`chroma_bridge` 侧无事务，实现为「`col.get(where={"$and":[{"session_id":…},{"topic":…},{"isLatest":True}]})` → `col.update(isLatest=False)` → 插新行打 supersedes」，异常降级为普通 add 并 warning —— 回滚后端只保证 API 契约一致。
+
+**(5) 验收（`profile=p3test`，测完删净）**：3 连写 → 总 3 行 / latest 1 行；supersedes 链 v2→v1、v3→v2 且 v1 无 supersedes；退化路径 2 行；`pg_locks` 残留 0；耗时首条 9.3 s（ONNX 模型加载）后每条 +0.1 s。
+
+**(6) 改前的库现状（P3 的必要性证据）**：`topic='task_conclusion'` 全库 **1 条**；`is_latest=false` 全库 **0 条** —— 版本化机制从未被使用；同 `(profile, session_id, topic)` 多有效行的组 **35** 个（`conversation` 18 / `assistant_conclusion` 17）。
+
+**(7) 已知缺口 → 已闭环（见 §11.16）**：写入时机。`task_conclusion` 只在插件 `on_session_end` / `on_pre_compress` 写，而本机压缩由 billion-context 代理接管（原生 `on_pre_compress` 不触发）、CLI 会话常被强杀（`on_session_end` 不跑）→ 事实层几乎不写入（全库仅 1 条）。2026-10-20 12:00 起改由 `sync_turn` **门控**写 `topic='session_fact'`，见 §11.16。
+
+### 11.16 P3 事实层落地：`sync_turn` 门控写 `session_fact`（2026-10-20 12:01）
+
+**(1) 为什么不「每轮都写一条」**：`task_conclusion` 的两个钩子在本机几乎不触发（§11.15(7)），事实层等于空的 —— 下个会话问「上次那个定下来没有」召回不到。但**无条件**每轮再写一条 `session_fact` 只是把 `conversation` 复制一份，库会被滚脏、检索位被占满。故设计成**门控 + 滚动累积**。
+
+**(2) 门控（零模型）**：每轮 `sync_turn` 复用 P2 已抽好的 slots 结果，**只有当轮抽到 `decisions` 或 `open_questions` 条目**才进入写库分支；零条目 → 整轮跳过，连读库都不做（不白付一次 SELECT）。抽提是纯正则，不调模型。
+
+**(3) 滚动累积**：`topic='session_fact'`，正文是「决策 / 待办」两小节的清单：
+
+```
+决策：
+- <原文片段>
+待办：
+- <原文片段>
+```
+
+每轮把新条目并进上一版正文（先 `get_latest_by_topic` 读回上一版），调用 `save(..., upsert=True)` → 旧行 `is_latest=false` 留痕、读路径只看到最新一条。每小节上限 `FACT_CAP=10`，超出**丢最旧的**（滚动事实语义：留最近的结论，不是留全部）。
+
+**(4) 三条不写库的规则**（`session_fact.merge` 返回 `None`）：
+- 本轮零条目（门控）；
+- 抽到的条目**全在旧正文里** → 内容没变化，重写只会 churn 一个新版本（幂等）；
+- `session_id` 为空（无会话归属无法 upsert，插件侧已判空）。
+
+**(5) 条目全部是原文片段**：只做空白归一（连续空白 → 单空格，保证一行一条可解析），**不生成、不总结、不改写**。同一句被 slots 同时抽进 decisions 与 open_questions 时**跨小节去重、「决策」优先** —— 实测「决定事实层只在抽到决策或待办时才写库」两边都命中，不去重正文里就重复一遍（单测 `test_跨小节去重_决策优先` 抓出来的）。
+
+**(6) 数据层新增只读接口** `get_latest_by_topic(session_id, topic, profile=None)`，三处实现：
+- `pg_bridge.py` 真实现（`WHERE profile/session_id/topic AND is_latest ORDER BY created_at DESC NULLS LAST LIMIT 1`）；
+- `chroma_bridge.py` 同名函数返回 `None`，并把名字加进 `_PUBLIC_API` —— BACKEND=pg 时被 `pg_bridge` 同名函数覆盖；chroma 回滚后端下事实层退化为「每轮覆盖不累积」，仍只留 1 条有效行；
+- `boshi_core.get_latest_by_topic` 透传，异常一律 `None`（调用方按首次写入处理，不因读不回来丢内容）。
+
+**(7) 可离线测**：逻辑抽在独立模块 `~/.boshi/session_fact.py`（纯函数 `items_from_slots` / `parse` / `render` / `merge`），插件按路径加载，`tests/test_session_fact.py` 直接 importlib 同一份文件单测 —— 两边跑的是同一份代码。
+
+**(8) 成本**：零 LLM。门控命中轮次 = 1 次 SELECT + 1 次 `add_memory`（含 upsert 的 advisory lock + embedding）≈ **+0.1 s**；未命中轮次 = 0 额外 IO（slots 抽提本来就在 P2 里做，结果被复用，不重复抽）。
+
+**(9) 回滚三档**：① 插件第 3 步整块删除（约 25 行，注释已标「P3，2026-10-20」）；② `DELETE FROM boshi.memories WHERE topic='session_fact'`（只清事实层，不动其它 topic）；③ 后端回 chroma → 自动退化为不累积。
+
+**(10) 验收（全 PASS）**：
+- 单测 `python -m unittest tests.test_session_fact` → **14 条**（门控 / 幂等 / 滚动丢最旧 / 跨小节去重 / 原文保真 / 解析容错）；`discover -s tests` **65 条** OK；
+- 步骤级 e2e（真 PG，profile=p3fact）：首轮 1 行 → 二轮 2 行 latest 1（累积）→ 无条目轮 0 行 → 重复条目轮 0 行；清理后残留 0；
+- **现役插件文件**端到端（stub 掉 Hermes 两个模块后从 `$HERMES_HOME/plugins/boshi/__init__.py` 加载，真调 `initialize()` + `sync_turn()`）：`session_fact` 两版 latest 1、`conversation` 3 条、`assistant_conclusion` 1 条，p3fact2 无残留。
+
+**(11) 同批上线的另一件事（插件副本漂移）**：现役 `$HERMES_HOME/plugins/boshi/__init__.py` 原为 **927 行**旧版（md5 `6d23b354`），缺 `_qkey`/`_pcache_get`/`_pcache_put`/`_write_slots_enabled` —— 症状「同会话第 2 轮起注入的永远是第 1 轮问题的召回」。本次已用 `~/.boshi/plugins/boshi/` 源文件覆盖现役（**1052 行，md5 `cb3ee537`**），旧文件备份 `scratch/plugin_live_927.bak`。**教训：两文件 mtime 经常相同（10:52:58），只能比 md5/行数判断新旧。**
+
+**(12) 生效边界：改文件 ≠ 生效，必须重启宿主（12:33 已验）**：12:01 写完文件时网关 PID 21964 是 11:54 起的，进程内模块早已加载 → 文件改了但行为不变。12:33 重启网关（旧 PID 21964 干净退出 0.54 s → 新 PID 11988，12:32:27 启动完成、weixin 已连）。生效用**三重验证**：
+1. **时序**：宿主启动时间（12:32:27）> 插件 mtime（12:01:01），且现役文件 md5 `cb3ee537`（1052 行）；mtime 早于启动 = 必然读到旧代码，这是最快的一条判据；
+2. **真环境导入**：用 `hermes-agent/.venv` 的 python（不用 stub）按路径 `exec_module` 现役插件 → `import OK, lines: 1052`；`_boshi_session_fact()` 返回 `FACT_TOPIC=session_fact` / `FACT_CAP=10`；`inspect.getsource(BoshiMemoryProvider.sync_turn)` 含 `FACT_TOPIC` 与 `upsert=True`；
+3. **无加载错误**：`logs/gateway.log` 与 `logs/errors.log` 的 12:3x 段无插件相关 Traceback。
+
+**Studio 侧不随网关重启**：Studio 的 Agent 链（父进程 15672 等，11:47:53 起）进程内仍是旧模块，**必须新开 Studio 会话**才换插件；仍在跑的旧会话（含 CLI 当前会话）本轮不会写 `session_fact`。验收口径：新会话说一句带明确取舍/待办的话 → `SELECT count(*), count(*) FILTER (WHERE is_latest) FROM boshi.memories WHERE topic='session_fact'` 应 ≥1（12:35 基线 0 条）。
+
+
+### 11.17 P3.1 事实层质量补丁：只采用户侧 + 抽提器三处修复（2026-10-20 13:45）
+
+**为什么有这一节**：P3 事实层上线后写进库的第一条就是垃圾 —— `session_fact` 首行（13:19:15，`ad88831e-…`）内容为「决策：**2. 你那个新窗口的日志**（`…ekko-agent.jsonl`）…」，即把助手**列出的菜单**记成了用户**点好的菜**。乐之授权两项：只采用户侧 + 打质量补丁；两条脏记录已删（`session_fact` 归 0）。本节记录修了什么、怎么验、边界在哪。
+
+**(1) 三个根因（均为实测复现）**
+
+| # | 位置 | 旧行为 | 后果 |
+|:--|:--|:--|:--|
+| ① | `plugins/boshi/__init__.py:798` | `for _m in (u_slots_meta, a_slots_meta)` 两侧槽位合并 | 助手列选项的句子进决策 |
+| ② | `slots.py` `DECIDE_RE` | 含 `我建议`、`切(?:换)?到` | 「我建议用 A」= 菜单；「手动切到 bili-deepseek 就能继续用」= 备选方案 → 都成决策 |
+| ③ | `slots.py` `_sentences` / `_clip` | 只按 `。！？；` 切块（markdown 列表整段算一句），截断从块首数 180 字 | 关键词在末条时，存下来的是无关开头（日志路径那条） |
+
+**(2) 修法**
+
+- **只采用户侧**：`new_items = dict(_fact.items_from_slots(u_slots_meta))`，删掉合并循环。理由写进注释：*不要把菜单记成点好的菜；助手内容仍在 `assistant_conclusion` 里，不丢*。
+- **决策词收窄**：`DECIDE_RE` 只留 `改用` 与 `(?<![判认指规固])定为|(?<![指认规判固])定了`；真取舍词仍在 `DECIDE` 元组（决定/改为/选用/采用/放弃/不再/换成/定下来/结论是/结论：）。
+- **一行一条**：新增 `_RE_BULLET = re.compile(r"^\s*(?:[-*+•]|\d+[.)、]|[（(]\d+[)）])\s*\S")` 与 `_split_items(seg)`，`_sentences` 先切列表项再按句末标点切。非列表行仍与下文合并（保住「当前状态一句话：」引出行 + 下文的原设计）。
+- **锚定截取**：`_clip_at(s, pos)` 以命中词为锚（`start = max(0, min(pos - cap//3, len(s)-cap))`，窗口内优先在分句标点收尾），返回值**仍是原文连续子串**——只搬运、不生成、不加省略号。`_hit_pos(s, keys, regexes)` 取最早命中位置。四个句子级槽位（decisions/open_questions/reusable_experience/boundary_envs）全部改用 `_clip_at`。
+- **否定判断局部化**：`_DECIDE_NEG`（`还没决定/未决定/没定/尚未决定/待定/不确定/没想好`）由**整句**判断改为 `_clause_at(s, hit)` **只看命中词所在分句** —— 否则「A 方案定了，Y 还没定」会把真决策整体否掉（端到端跑出来的）。
+
+**(3) 测试**（`~/.boshi/venv/Scripts/python.exe -m unittest discover -s tests -p "test_*.py"` → **79 OK**）
+- `tests/test_slots_p31.py`（12 例）：真实 13:18 列表块切成 3 句且 `decisions == []`；关键词在长列表项末尾的「定下来用 DuckDB」被保住且 ≤`_ITEM_CAP` 且是原文子串；「我建议…」不算决策；真取舍词仍算；「指定了/规定了/固定了/判定了」被挡；「还没决定」归 open_questions；混合语料全槽位 verbatim 子串不变式；冒号引出行仍合并为一句。
+- `tests/test_fact_source.py`（3 例）：源码级锁 `items_from_slots(u_slots_meta)` 在、`for _m in (u_slots_meta, a_slots_meta)` 不在、`FACT_TOPIC` 附近仍有 `upsert=True`。*为什么不用单测跑 `sync_turn`：插件 import Hermes 运行时，`~/.boshi/venv` 里 import 不了；为一行接线把整个 Hermes 塞进单测不划算。*
+- 全量 79 条（原 65 + 新增 14）无回归。
+
+**(4) 端到端判定（新 slots + 新 session_fact）**
+
+```
+坏输入（13:19 那 258 字原文）        → decisions=[] open=[] merge=None  （不写库）
+好输入「…A 方案定了。…Y 那个还没定。」→ 决策 1 条 + 待办 1 条，均原文子串
+```
+
+**(5) 已知取舍（写下来免得以后当 bug 修）**：`slots.extract()` 层面**同一句可以同时进 `decisions` 与 `open_questions`**（「A 方案定了，Y 还没定。」两句都进）——因为值必须是原文连续子串，不从一句话里抠字。但**落库后不会重复**：`session_fact.items_from_slots` 跨小节去重（§11.16 测试项「跨小节去重」），同一字符串只保留在**先遍历到的那一节**（decisions 优先）。所以「微调基座决定用 27B，4B 那个还没定。」落库只有 `决策：- 微调基座决定用 27B，4B 那个还没定。`，没有重复的 `待办：` 段 —— **21:5x 活体验证实测如此**，本节早前版本写成"两处都留"是不准确的，已更正。
+
+**(6) 生效边界 → 已生效（21:13 重启整机后验证）**：代码 mtime 13:41，网关/会话进程全部起于 **21:13:55 之后**（17580→1960→5228→840→7652 链；另一条 15804→8720→5932→10396 起于 21:28:59）→ 所有宿主都晚于文件 mtime，**P3.1 已全部生效**。判据仍是 §11.16(12)：**mtime 晚于宿主启动 = 必然仍跑旧代码**（13:41 那批进程，如 PID 11988 起于 12:32，就是跑旧代码的）。
+
+**(6b) 重启后实测（21:16–21:56）**
+- 两个真实会话（`20261020_211601_d466d8`、`mqzhwxumsvuduf`）共写 **9 条 conversation + 9 条 assistant_conclusion**，`session_fact` **0 条** —— 用户那 9 句（「回个消息」「测试记忆系统…」「桌面版升级新版本…」「继续」「计划任务就是电脑开机会触发启动它？」等）都不含取舍词，**该 0 就是 0，不是漏写**；9 条 `slots` 列 `decisions=[] open_questions=[]`，无假阳性。
+- **活体三案例**（用 `hermes-agent/.venv` 真环境加载 `$HERMES_HOME` 现役插件，`BOSHI_PROFILE=p31live` 隔离，真写 PG，跑完删除 8 行）：
+
+| 案例 | 输入 | 结果 |
+|:--|:--|:--|
+| A 正常决策 | 用户侧「微调基座决定用 27B，4B 那个还没定。」 | **1 行**：`决策：- 微调基座决定用 27B，4B 那个还没定。` ✔ |
+| B 坏原文喂用户侧 | 13:19 那段助手列表 | 只有 1 条 `待办：- - 我建议用 A 方案，下一步你来定 A 还是 B。`（被 `下一步` 抓，非决策） |
+| C 只有助手侧有词 | 用户侧「回个消息」+ 助手侧「我建议用 A…你来定 A 还是 B」 | **写入 0 行** ✔ 菜单不进事实层 |
+
+- **列表记号已剥（22:05 修）**：原先把列表项整行（含 `- `）落库 → 渲染成 `待办：` 换行 `- - 我建议…`（多一个短横）。修法：`slots.py` 加 `_RE_BULLET_STRIP`，`_split_items()` 返回前 `sub("", it, count=1)`；`(?!\d)` 防止「1.5 倍」被吃成「5 倍」。**注意生效边界**：该改动晚于网关启动 → 下次重启才生效（存量脏行已清空，无累积污染）。
+- **存量脏数据已清（22:05）**：`topic='session_fact'` 的 4 行旧插件产物已备份后删除（`~/.boshi/backups/session_fact_dirty_20261020.json`），表内剩 0 行，事实层从干净状态开始。
+
+**(7) 回滚**：① `cp __init__.py.bak-20261020-134114 现役` + `git checkout slots.py`；② 事实层数据 `DELETE FROM boshi.memories WHERE topic='session_fact'`；③ 事实层整体关闭看 `_write_slots_enabled()` / 插件 P3 块开关。
+
+
+### 11.18 P1③ 经验层落地：零模型、跨会话累积的可复用教训（2026-10-20 22:46）
+
+**为什么补这一层**：事实层（`session_fact`）回答「这一轮定了什么」，但**只在会话内滚动**（`FACT_CAP=10`），会话一结束就沉底。原升级方案里 P1③ 的要求是「经验/程序性记忆须一等公民且带适用条件」——之前只有 `slots.py:318-321` 抽出来的两个**文本片段**（`reusable_experience` / `boundary_envs`），既没有独立存储、也没有价值门槛与出处链，等于没收。本层是这项的补课。
+
+**存储：复用 `boshi.memories`，`topic='experience'`，不建新表。** 理由：经验行天然继承现有的向量/关键词检索、`is_latest` 版本化与时间线查询；独立通道只是在排序前把它们单独捞一遍，不需要新 schema。去重键 `meta.exp_key = sha1(norm(entry))[:16]`，`norm()` 只压空白、去首尾、去尾部标点——**不改正文其余字符**，所以同一句话换个空行仍是同一 key，而「差不多」的两句话不会误合并。
+
+**价值门槛（两级，全规则、零模型）**
+
+| 级 | 判据 | 为什么 |
+|:--|:--|:--|
+| A 质量门（写入即判） | 长度 12–300 字；非问句（不以 `？`/`?` 结尾）；非元话语（不含「你觉得/要不要/谢谢/请问」等）；**且** 有三者之一：① `slots` 里的技术锚点（`files/commands/ports/versions/flags/numbers` 任一非空）② 具名物标识符 `_IDENT_RE`（如 `local-rag-kb-querying`、`CUDA`）③ 因果/条件词（`_CAUSAL`：因为/所以/否则/必须/实测/坑…） | 只靠「有因果词」会收进「代码应该写得干净一点」这类观点句；只靠锚点会漏掉「实测过了，别开 MTP」这种无路径的经验。三者取或，恰好把「点到具体东西」和「说清了条件」两种可复用形态都收下 |
+| B 复用门（跨会话） | 同 `exp_key` 在 **≥2 个不同 session** 出现 → `status=promoted`；只在一个会话出现留 `candidate`，召回时 ×0.5 降权 | 单靠 A 会把「顺带一提的感想」也收进来；单靠 B 永远收不到第一条。两级合用才既收得住又不被污染。**同会话重复只累加 `hits`，不升级**（否则一轮里说两遍就算「复用」） |
+
+超过 300 字**丢弃而非截断**——截断等于伪造半句，违反原文保真。每轮最多新收 `ROUND_CAP=3` 条（`slots` 每个槽位本身也限 3 条）。
+
+**双向链**：经验行 `meta` 写 `source_fact_ids` / `source_msg_ids`（各上限 8 个，去重追加）；事实行与消息行的 `meta` 回写 `derived_experience_ids`。这样从「这条教训」能查到它出自哪一轮的哪句原文，从「那轮对话」也能看到沉淀出了什么经验——`remember()` 返回到链行数，`link_back()` 负责回写。
+
+**召回：独立通道，零模型打分**
+- `experience.recall(query, top_k, profile, scope)`：`score = 命中 token 数 / min(查询 token 数, 8)`；promoted ×1.0、candidate ×0.5；入选门槛 `score ≥ 0.34` **且命中 ≥2 个 token**（中文里单 token 命中几乎等于噪声），或整条查询（≥4 字）作为子串出现直接置 0.8。查询侧 token = 中文 2-gram（去 30 个纯虚词 bigram）+ 英文小写词。
+- 全量取本 profile ≤300 条经验进内存打分，45s 进程内缓存（`_CACHE`，写入时 `gen` 自增失效）——经验体量天然小，比再走一次向量检索便宜且可解释。
+- `pg_bridge.search_memory` 在 `_session_expand` 之后、`include_graph` 之前注入（`pg_bridge.py:1377-1419`）：只占 `top_k` 里 1 个名额（`BOSHI_EXP_SLOTS`），**未转正且 score<0.8 的不占名额**；score 转成距离语义 `1.0-score`（与 `_row_to_item` 的「越小越近」一致）后置顶。
+- 若该经验行已被向量/关键词带上来：**不重复占位**，只把 `"experience"` 追加进它的 `metadata["channels"]`——让「经验层也认可了它」对调用方可见（这一条是冒烟时发现并改的：原实现直接 `continue`，导致 top1 明明就是经验行却标着 `channels=None`）。
+- `boshi_core.search` 补 `if "experience" in ch: tag="experience"`，否则 `tag` 判定会把单通道经验行误标成 `vector`。
+
+**接线位置**：`plugins/boshi/__init__.py` 的 `sync_turn` 第 4 步（事实层之后，第 870 行起），与事实层同级、**不受 `if sid_fact:` 门控**；`u_msg_id`/`a_msg_id`/`fact_row_id` 由三处 `save()` 的返回值取出（原代码丢弃返回值，为此改成 `_r = self._core.save(...)`）。整段包在 `except Exception: logger.debug` 里——经验层是增强项，坏了不许拖累主写入。开关 `BOSHI_WRITE_EXPERIENCE=0`。
+
+**实测（2026-10-20）**
+
+| 项 | 结果 |
+|:--|:--|
+| 单测 `tests/test_experience.py` | **26 条全过**（判重键 / 质量门 / 抽提 / 复用门 / token 与召回） |
+| 全量回归 `discover -s tests` | **91 条全过**（原 65 条 + 新 26 条，无回归） |
+| 端到端（`scratch/exp_smoke.py`，一次性 profile，跑完 DELETE） | 首次 `new`+candidate+1 条回链 → 同会话 `duplicate` 仍 candidate → 第二会话 `confirmed`+**promoted**（hits=3/sessions=2）→ PG 内 content 与原文**逐字相同**、两条事实行 `derived_experience_ids` 双向指回 → `recall` 命中且 `channels=["experience"]` → `search_memory` **top1 就是经验行**（dist 0.0677） |
+| 通道占位 | 假 recall 验证：promoted 挤进 top1 且 `top_k=3` 未被撑成 4；candidate(0.4) 不占席 |
+| 噪声门槛 | `recall("端口")` 在无相关经验时返回空 |
+| 插件侧加载器 `_boshi_experience()` | 按路径加载成功、`backend_ok=True`、collect 带 envs、观点句被拒、二次调用命中缓存（打桩 `agent.memory_provider` / `tools.registry` 后 exec 插件文件验证，未启动 Hermes） |
+
+**首轮踩的坑（已修）**：`test_accept_lesson_with_causal` 拒了「知识库检索：佛学走 local-rag-kb-querying，科技人文走 zhishiku，两库勿混」——无因果词、无 slots 锚点。修法不是往 `_CAUSAL` 里塞「勿」（词表会越塞越像规则堆），而是加**具名物锚点** `_IDENT_RE`：点到了具体技能/工具/参数名的句子，本身就比观点句可复用。
+
+**生效边界**：插件侧与 `pg_bridge` 的改动都要 **重启宿主**才生效（当前会话仍跑旧代码，所以库里 `topic='experience'` 暂时为 0，属预期）。
+
+**回滚**：① 召回侧 `BOSHI_EXPERIENCE_CHANNEL=0`；② 写入侧 `BOSHI_WRITE_EXPERIENCE=0`；③ 数据 `DELETE FROM boshi.memories WHERE topic='experience'`；④ 代码 `git checkout experience.py pg_bridge.py plugins/boshi/__init__.py`（备份 `__init__.py.bak-acpfilter-20261020-223546`）。
+
+**已知限制**：① 无 PG 分词，全靠中文 2-gram，同义改写（「内存不够」vs「显存溢出」）召不回——这正是将来 reranker 的位置；② 候选行也落库，值门槛挡掉大部分感想，但「跨会话才转正」意味着库里会有 candidate 沉积；③ `stats()` 只统计 `is_latest`，改写过正文的旧版本不计入。
+
+### 11.19 经验层生效验收：六条判据全过 + 事实层首次落库（2026-10-20 23:20）
+
+**先踩的坑：改了源、没部署**。22:43 写完 `experience.py` 与插件改动后，用 `hermes -z` 起了真正的新进程复验，`topic='experience'` 仍是 **0**；但纯函数直测全对（`slots.extract` 命中 `reusable_experience`、`experience.passes_value_gate`=True、`collect`=1 条、`backend_ok()`=True）。
+
+根因：**宿主加载的不是开发源**。实际加载 `C:/Users/wulezhi/AppData/Local/hermes/plugins/boshi/__init__.py`（1055 行，mtime 10-20 13:41），开发源 `~/.boshi/plugins/boshi/__init__.py`（1115 行，mtime 22:45）**从未部署**；两份 diff 10 hunks、+64/−10，安装副本上 `grep -c BOSHI_WRITE_EXPERIENCE` = **0**。`~/.boshi/install.sh:64-68` 就是做 `$INSTALL_DIR/plugins/boshi` → `$HERMES_DIR/plugins/boshi` 的拷贝，两目录下多个 `.bak-*` 说明历来靠手工/脚本。
+
+> **铁律（新增，血的教训）**：改 `~/.boshi/plugins/` 下任何文件后，必须 deploy 到 `AppData/Local/hermes/plugins/` 并删该目录的 `__pycache__`，否则所有复验测的都是旧代码；「纯函数对、线上不对」时第一件要查的事就是安装副本 mtime/行数。
+> 部署动作：备份 `__init__.py.bak-20261020-231127` → 覆盖（1115 行、23:11:27、`diff -q` 一致）→ `rm -rf __pycache__`。
+
+**另一个操作性结论：Studio 里「开新会话」不换进程**。本会话宿主链实测 `bash ← bash ← python(10396) ← 5932 ← uv-python(8720) ← python(hermes_bridge.py 15804) ← node(8432) ← Ekko Studio.exe(14100)`，agent-bridge 是**常驻单进程**，所有会话复用同一进程与同一份模块缓存。想验证「新代码生效」只有两条路：`hermes -z`（CLI 一次性进程，本次采用，不动 Studio、不中断当前会话）或重启 Studio/电脑。插件里 `_EXP_MOD`/`_boshi_experience()` 按文件路径加载并做进程内缓存（`plugins/boshi/__init__.py:180-203`），所以**生效判据 = 进程启动时间晚于目标文件 mtime**，与「开几个会话」无关。
+
+**六条判据（2026-10-20 23:11–23:25 实测）**
+
+| # | 判据 | 实测结果 |
+|:--|:--|:--|
+| 1 | 进程启动晚于 `experience.py` mtime（22:43:58） | `hermes -z` 新进程 23:11:31 ✓ |
+| 2 | `topic='experience'` ≥1 且能溯源 | 首条 23:12:00：session `20261020_231141_0fafa2`、`status=candidate`、`hits=1`、`exp_key=d522aad895fad4f1`；`source_msg_ids=["13655484-f55c-47c9-ab65-0fcd8f80e1df"]` 回查正是 `conversation|user` 原句 ✓ |
+| 3 | candidate → 跨会话 promoted | 同句在第三个会话（`20261020_231252_4e25c6`）命中 → `status=promoted`、`hits=2`、`sessions` 两条、正文与原文逐字相同 ✓（同会话重复只 +hits，实测未升级） |
+| 4 | 召回走独立通道、只占 1 席、`top_k` 不撑大 | `pg_bridge.search_memory("配置变更先确认再动手", top_k=5)` → 5 条，前 2 条 `channels=['experience']`（promoted dist 0.0360 / candidate dist 0.0363，已是距离语义），第 3 条起仍是主链路 ✓ |
+| 5 | 主链路不退化 | `eval/a5_eval.py` 同日对照：23:14（通道开）与 10:17 `a5_gate_open` 均为 **auto 20/35 top1、30 top3、32 top5，35 条逐条 rank 完全一致**；再与 `BOSHI_EXPERIENCE_CHANNEL=0` 对比亦完全一致（35 条 gold 与经验行无交叠，通道只在命中时插席）✓ |
+| 6 | 两个回退开关各自有效 | ① `BOSHI_WRITE_EXPERIENCE=0` + 全新句「给生产库改索引前必须先跑一遍 explain」→ 经验行 **2→2 未增**；② `BOSHI_EXPERIENCE_CHANNEL=0` → 同一 query 仍 5 条，`experience` 席位 **0** ✓ |
+
+**顺带解决：`topic='session_fact'` 长期为 0 不是 bug 的延续**。部署新副本后跑一轮带明确取舍的 prompt（「决定：知识库检索以后统一走本地 PG，Chroma 只留作回滚备份」）→ 23:18 出现**全库第一条** `session_fact`：正文 `决策：\n- 决定：知识库检索以后统一走本地 PG，Chroma 只留作回滚备份。`，同会话 user/assistant/experience 三行 `slots.decisions` 同值。此前为 0 有两个叠加原因：① 安装副本还停在 P3.1「只采用户侧」老逻辑；② 部署后到 23:17 之间的几条 `-z` 轮次 `decisions`/`open_questions` 都是空数组（`items_from_slots` 返回 `{}` → 整轮跳过，属设计内的门控）。
+
+**验收中新看到的两件事（只记录，暂不改）**
+
+1. **判重是逐字**：`exp_key = sha1(norm(正文))[:16]`，`norm` 只压空白/去尾标点。实测「经验教训：配置变更…」与「先说清一件事：配置变更…」措辞不同 → 两条 candidate 并存。这是「零改写、只搬运」的必然代价，长期会让经验层变胖；要合并只能引入同义归一（= 将来 reranker / 嵌入的活），现在不动。
+2. **同文本双份呈现**：查「配置变更先确认再动手」时，经验通道给 2 条经验行，向量通道又给 3 条含同一句的 `conversation` 行（`-z` 的整句 prompt 也进了库）。经验行短、原文行长，两份都落在 top5 内 → 窄查询下会挤掉第 5 席真记忆。是否在经验行命中时抑制原文行，留到 B 阶段有真实样本量后再判（现在调就是对着自己造的样本调参）。
+
+**当前库状态**（23:25）：`topic='experience'` = 2（1 promoted + 1 candidate）；`topic='session_fact'` = 1；两仓代码已提交（`~/.boshi` `c7d5e93`、镜像 `projects/boshi-memory-system` `0fa3e19`），本次只改文档，推送仍暂停。
+
+### 11.20 四段版本号落地 + 版本精确匹配 + 存量 slots 回填 + fm_stats 打点（2026-10-20 深夜）
+
+§11.10 记的是「测得该做但暂不做」。这一节是把它做完，并记录实施后暴露出的**两个次生问题**（版本包含判定、存量槽位过期）与验收数字。
+
+**(1) 抽提器（`slots.py`，三路合并保序去重 `_versions()`）**
+
+```python
+RE_VER4_V = r"(?<![\w.])(v\d+\.\d+\.\d+\.\d+)(?![\d.\w])"          # v 前缀：无条件收
+RE_VER4   = r"(?<![\w.])(\d+\.\d+\.\d+\.\d+)(?![\d.\w])"           # 无 v：需上下文
+_VER4_CTX = ("版本","版号","升到","升级","降级","回滚","发布","固件","内核","更新到")
+_VER4_CTX_RE = re.compile(r"(?<![A-Za-z])(?:version|build|ver)(?![A-Za-z])")
+```
+
+无 `v` 的 4 段号只在「任一节 > 255」（`172.16.0.218` 这类 IP 的首节必然 ≤255，端口/年份同理）或紧邻版本语境词时收。全库采样 209 行含 4 段号：**accepted 45 / rejected 332，零泄漏**。`tests/test_slots.py` 新增 `TestFourSegmentVersion` 6 条。
+
+**(2) 首跑就回退：v 前缀规则自己引出新问题**
+
+A5 出现唯一一条回退——`218 strata 0.1.43.1 升到 0.1.44.1 全过程`：auto rank 3→**None**、rrf 2→4，汇总 top1 20、top3 30→29、top5 32→31。逐条 diff 确认**只有这 1 条动**。
+
+归因（三层）：
+1. query 侧现在抽到 `versions=["0.1.43.1","0.1.44.1"]` → 触发 P2+ 抬升；
+2. gold `3462e8fb` 的 DB `slots.versions` 是**旧抽提器截断值** `["v0.1.44","0.5"]`（`0.1.44.1` 被切成 `v0.1.44` + `0.5`），按双向包含，`0.1.44.1` 与 `v0.1.44` 互不命中 → gold 得不到抬升；
+3. 邻居 `1bedf359`(`0.1.43`)、`7ff2e8be`(`0.1.44`)、`6629ef14`(`0.1.43`) 因「截断值 ⊂ 真值」**单向命中**，各被抬 0.10 → gold 被挤出 top5。
+
+结论两条：**版本号不能做双向包含**（`0.1.43` ≠ `0.1.43.1`），**存量 slots 必须回填**。
+
+**(3) 版本精确比较（`pg_bridge._fm_hits`）**
+
+```python
+_RE_VER_STRIP = re.compile(r"^[vV]\s*")
+def _fm_ver(v: str) -> str:
+    return _RE_VER_STRIP.sub("", _fm_norm(v))      # 只做形态归一，不改数字
+...
+if key == "versions":
+    cver = {_fm_ver(x) for x in cvals if x}
+    if any(qv and _fm_ver(qv) in cver for qv in qvals):
+        hits.append(key)
+    continue
+```
+
+其他字段（`ports`/`files`/`flags`）保持双向包含——`127.0.0.1:8199` ⊃ `8199` 的语义仍然需要。`tests/test_field_match.py` 新增 `VersionExactTest` 4 条（`v0.1.44.1`=`0.1.44.1`、截断值不命中、`7.2`≠`7.2.0`、端口仍包含）。
+
+**(4) 存量回填（`backfill_slots.py`，零模型）**
+
+对 `boshi.memories` 每行重跑 `slots.extract(content)`，与旧 `slots` 逐字段比较，**只 UPDATE 差异行**；每 200 行 commit；旧值全量备份到 `backups/slots_backfill_<ts>.json`。
+
+| 阶段 | 结果 |
+|:--|:--|
+| dry-run | 总行 6274 ｜ 有差异 **4630**（其中原为 NULL **3316**）｜ 一致 1644 ｜ 跳过 0 |
+| apply | 备份 1,315,922 B（4630 条旧值）；写完后 `slots` 非空 **6274/6274**，含 `versions` **1338** 行 |
+| 修复效果 | gold `3462e8fb` 的 versions 由 `["v0.1.44","0.5"]` → `["0.1.43.1","0.1.44.1","v0.1.44","0.5"]`（多形态并存，靠 `_fm_ver` 归一后精确命中） |
+
+> 复用手册：抽提器以后再改，先 `--dry-run` 看差异行数，再 `--apply`（脚本自带备份，可整表还原）。
+
+**(5) 复测（回填 + 精确匹配后）**
+
+| 口径 | 基线 `a5_gate_open`(10-20 10:17) | 现在 `a5_final_slots` | 变化 |
+|:--|:--|:--|:--|
+| auto top1/top3/top5 | 20 / 30 / 32 | **21 / 30 / 32** | top1 +1 |
+| rrf | 12 / 27 / 29 | 12 / 27 / 29 | 一致 |
+| vector | 8 / 12 / 13 | 8 / 12 / 13 | 一致 |
+| 目标 case 名次 | 3 | **1** | +2 |
+
+A8（n=40，每次现场按 ports/versions/flags 重建 gold，跨日只看比例与 broken 数）：off `24/31/35` → on **`28/32/37`**；归因 keep 24 / fixed 4 / **broken 0** / neither 12。剩余 3 条 miss（`f67a0add`/`f06effc4` ports、`fede2599` versions）属 **gold 本就不在 off top5**（候选池未召回），不是抬升失效。
+
+回归：`unittest discover` **107 条全过**（原 97 + 版本 4 + 打点 6）。
+
+**(6) `fm_stats` 线上打点（新，默认开）**
+
+`_FM_W` 的字段权重一直是拍的。新增按天×字段的聚合表，用真实流量算「命中率 / 平均抬升 / 改变 top1 的比率」：
+
+```sql
+CREATE TABLE IF NOT EXISTS boshi.fm_stats (
+    day date, field text, queries bigint, hits bigint,
+    gain_sum double precision, top1_changed bigint,
+    PRIMARY KEY (day, field));
+```
+
+- `_fm_stats(c, qfields, top, pre_top1)` 在**排序后**调用，每 query 每字段一行 upsert（最多 4 行）；`top1_changed` 只在「该字段命中且 top1 换人」时记 1
+- 走 `_conn()` 的 autocommit 连接，不占事务；`try/except: pass` —— 打点永远不许拖累检索；`BOSHI_FM_STATS=0` 可关
+- 表在首次写入时懒建（`_FM_STATS_READY`），不需要迁移脚本
+- 报表 `eval/fm_stats_report.py`（`--days N` / `--daily`），输出 `hit/query`、`avg_gain`、`t1_rate`
+- 首条真实打点：`8199 端口 llama-server 怎么配` → `ports queries=1 hits=3 gain_sum=0.30 top1_changed=1`
+
+与 §11.11 的 `BOSHI_FM_TRACE`（jsonl，默认关）分工：**trace 记单次事件**用于定位个别误抬，**fm_stats 记聚合**用于将来调 `_FM_W`。
+
+**(7) 后续**
+
+- 等 `fm_stats` 累计到几百条带字面量 query 再重估 `_FM_W`（`files` 0.8、`numbers` 0.4 都是拍的）
+- 三条 A8 miss 若长期稳定，说明问题在**召回**不在抬升，届时查 `_FM_POOL`（当前 3）与向量通道
+
+### 11.21 P3.1 补丁丢失与恢复：只改安装副本 = 下次部署必丢（2026-10-20 23:37）
+
+**怎么发现的**：给镜像仓 `projects/boshi-memory-system` 跑全量单测，121 条里 3 条 FAIL，而开发仓 `~/.boshi` 只有 107 条。差异不是本轮改动：镜像独有 `tests/test_fact_source.py`（3 条）与 `tests/test_slots_p31.py`（11 条），`git stash -u` 回到镜像 HEAD 复跑**同样 3 条失败** → 既有回归：
+
+```
+test_不再两侧合并        AssertionError: 'for _m in (u_slots_meta, a_slots_meta)' unexpectedly found in …
+test_只从用户侧槽位取条目  assertIn("items_from_slots(u_slots_meta)", src) 失败
+test_列表块不再整体算一句  slots._sentences(REAL_LIST_BLOCK) 断言过期（见下）
+```
+
+**根因（diff 证实）**：13:45 的 P3.1「只采用户侧 + 抽提器三处修复」只写进了**安装副本** `AppData/Local/hermes/plugins/boshi/__init__.py`，开发源 `~/.boshi/plugins/boshi/__init__.py` 从未同步；23:11 部署 P1③ 时用开发源（1115 行）覆盖安装副本 → §11.17 那条接线被覆盖，事实层退回「两侧合并」。
+
+- 证据 1：`grep 只采用户侧` 只命中安装侧备份 `__init__.py.bak-20261020-134114` 与 `__init__.py.bak-20261020-231127`，开发源无。
+- 证据 2：`diff -u` 13:41 备份 vs 开发源，全部差异只有两块 —— ①事实层 `dict(_fact.items_from_slots(u_slots_meta))` 变回 `for _m in (u_slots_meta, a_slots_meta)`；②新增经验层 `_boshi_experience()` / `_ACP_MARKER_RE` / `u_msg_id`·`a_msg_id`·`fact_row_id` 捕获。**只回退①，②保留。**
+
+**恢复**：`~/.boshi/plugins/boshi/__init__.py:839-843` 改回
+
+```python
+new_items: Dict[str, List[str]] = dict(_fact.items_from_slots(u_slots_meta))
+# P3.1（2026-10-20，2026-10-21 恢复）：只采用户侧……助手侧的话天然充满
+# 「我建议/下一步/可以切到」→ 菜单记成点好的菜……（经验层 P1③ 不受此限：
+# 教训两侧都可能给，见下面第 4 步。）
+```
+
+经验层 `_exp.collect([u_slots_meta, a_slots_meta])` 保持两侧（教训与菜单不同，助手侧也会给真教训）。
+
+**测试侧两件事**：
+1. 两个镜像独有测试文件 cp 进开发仓 `~/.boshi/tests/` —— 此前开发仓没有这两个守卫，**补丁被覆盖也没有任何报警**，这是事故能发生的直接条件。
+2. `test_slots_p31::test_列表块不再整体算一句` 是**断言过期不是代码回归**：974c20d 起 `_sentences()` 为进 BM25 会剥列表记号（`- ` / `1. `），实测该真实列表块返回 3 句 `['**2. 你那个新窗口的日志**…', '不想改也行…切到…', '13:18 复测…']`。断言改为剥记号后的形态并注明原因（返回的仍是原文连续子串，不破坏「只搬运不生成」）。
+
+**验证**：开发仓与镜像仓各 `python -m unittest discover -s tests -p "test_*.py"` → **121 条全过**。部署顺序固定为「先 `cp` 备份 `.bak-<ts>` → 覆盖 → `rm -rf __pycache__`」，部署后 `diff -q` 一致且 `grep -c "items_from_slots(u_slots_meta)"` = 1。**当前进程仍持有旧模块，下次会话/网关重启生效**（§11.16(12) 的 mtime 判据仍然适用）。
+
+**分工与铁律（新增）**：
+- 任何人改 `AppData/Local/hermes/plugins/boshi/` 后，必须回写 `~/.boshi/plugins/boshi/` 并 commit；只改安装副本 = 下次部署必丢。
+- 守卫测试必须住在开发仓 `~/.boshi/tests/`；只放镜像仓不算数（镜像可能很久才同步一次）。
+- 部署脚本化建议（待做）：`deploy.sh` 里的源固定为 `~/.boshi/plugins/boshi/`，禁止反向 `cp` 安装副本 → 开发源。
+
+### 11.22 query 侧 CJK bigram 全量 + kw_abs 换分母（2026-10-21，A9 5→13）
+
+**动机**：§11.13 已修 coord 把候选清零，但关键词通道在纯中文问法上仍几乎不贡献名次。先查「证据是不是根本没进候选」：
+
+`scratch/a9_bigram_probe.py`（读 `eval/cases_a9.py` 的 40 条 query，直接用 `pg_bridge._kw_index` 的 postings 统计）
+- bigram 总需求 **588**；旧代码 `for i in range(min(n-1, 6))` 只用前 6 个 → 实际使用 **240（41%）**，被截断 **348（59%）**；
+- 被截断的 bigram 里有 **295（85%）** 在库里真有 posting —— 证据是现成的，只是查询端没去取；
+- 40/40 条 query 都存在「截断也命中」的 bigram；**4 条纯损失**（gold 只靠编码在后面的 bigram 命中）：`7f6c4aba`→『问题』、`f9b2f45f`→『刻纹』、`a457b574`→『参数』、`9b678312`→『水面/重复』。
+
+**第一次改（只放开数量）是退化的**：全量 bigram 后 overlap top1 **4→2**、paraphrase top5 2→3，合计 5/10/14 → 3/11/14。原因不是 bigram 本身噪声大，而是**融合层没读它**：`_score_merge`（`pg_bridge.py:1139` 起）只取 `d["k"] = it.get("kw_abs")`，`kw`（相对分）与名次都不参与；弱证据时按 `_KW_WEAK_WV/_KW_WEAK_WK = 0.70/0.30` 加权。纯中文 query 的主 token 是整段汉字、df=0，它的 idf 被算成 `log(1+(n+0.5)/0.5)`（n=6274 时 ≈9.44）→ 分母 `widf_total` 被这一个「库里不存在的词」占满，而 `_kw_abs` 对 CJK 主词又给「共享 bigram 的部分信用」→ kw_abs 退化成「这条文档命中多少查询 bigram」。
+
+**实测分布（`scratch/a9_kwabs_probe.py`，真实库，`_kw_channel` 取 40 候选）**
+
+| query | 旧口径 median / max | abs_all 后 median / max |
+|:--|:--|:--|
+| 干净石面被模型自己加刻纹怎么办 | 0.528 / 0.871 | **0.081 / 0.717** |
+| 显存小的老显卡能不能跑音乐生成 | 0.784 / 0.882 | **0.175 / 0.315** |
+| 群晖硬盘显示已损毁但检测是好的怎么办 | 0.440 / 0.499（该 query 仅 2 条候选，边界例：两口径无差） | 0.440 / 0.499 |
+
+旧口径下人人 0.5–0.88，接近饱和 → 0.30 权重的关键词项等于往排序里灌噪声（这比「恒 0」更准确：早先的「恒 0」是从合成 fixture 推的过度概括，真实库是被 phantom token 的 partial credit 抬满）。
+
+**最终改动**（全部在 `pg_bridge.py`）
+1. `_kw_tokens()`：CJK 段 `grams=[seg[i:i+2] for i in range(n-1)]` **全量生成**；`lim = _KW_QBIG_LIMIT if _KW_QBIG_LIMIT > 0 else len(grams)`；衰减只作用于 `i >= 6`（`w = max(0.35, 1.0 - _KW_QBIG_DECAY*(i-5)/max(1,n-2))`，默认 0=不衰减）；尾部 `return toks[:_KW_MAX_TOKENS]`。
+2. **功能字过滤**（`_KW_QBIG_FUNC`，默认开）：`_FUNC_CHARS` 覆盖「的了着过吗呢吧啊呀…怎么什么能不能还要…」；两字**全**是功能字 → 丢弃，一字是功能字 → `w *= 0.5`。默认 `_KW_QBIG_FUNC_HEAD=0` 只过滤尾部（`i>=6`），前 6 个保持旧行为，便于回退对照。
+3. **`_KW_ABS_ALL`（默认 1）**：仅当 `weak = (main_hit_n == 0)` 时，用「postings 里真有的 token（含 bigram）」重建 `allp` 与 `widf_all`，`idf = log(1+(n-df+0.5)/(df+0.5))`；输出时 `it["kw_abs_all"]` 另存、`it["kw_abs"]` 换成它。主 token 命中（强证据）路径完全不动。
+4. `_KW_MAX_TOKENS` 16 → 64（默认 query 现在 13–19 个 token）。
+5. **双通道查询改写整段删除**：`_KW_QR*` 参数、`_kw_qr_merge()`（原 `pg_bridge.py:1090-1129`）、`search_memory` 内的调用块、`_kw_tokens(expand=False)` 分支全删。理由——`a9_qr_d1` 与基线**逐条相同**（RRF 在头权重 1.0 / 尾 0.45 悬殊时退化成 head 单路），`a9_qr_absall` 9/13/17 也不如单路全 bigram，属死代码。
+
+**扫参（A9 40 条，`A9_ASOF=1792461898.0`，scope=all，fusion=auto；overlap / paraphrase / 合计 top1·top3·top5）**
+
+| 配置 | overlap | paraphrase | 合计 |
+|:--|:--|:--|:--|
+| 基线 `a9_v3_asof` | 4/9/12 | 1/1/2 | 5/10/14 |
+| 全 bigram 无 abs_all `a9_qbig_all_asof` | 2/9/11 | 1/2/3 | 3/11/14 |
+| LIMIT=12 `a9_qbig_l12_d0` | 2/9/11 | 1/1/2 | 3/10/13 |
+| 全+DECAY 0.5 / 0.8 | 2/8/11、2/9/11 | 1/2/4、1/2/5 | 3/10/15、3/11/16 |
+| 全+功能字过滤 `a9_qbig_f1_d0` | 3/8/13 | 1/2/4 | 4/10/17 |
+| 只过滤尾部 `a9_qbig_ft_d0` / `ft_d0.5` | 2/7/13 | 1/2/4 | 3/9/17 |
+| 双通道 `a9_qr_d1` | 4/9/12 | 1/1/2 | 5/10/14（与基线逐条相同） |
+| 双通道+abs_all `a9_qr_absall` | 8/11/14 | 1/2/3 | 9/13/17 |
+| 旧 6 bigram+abs_all `a9_abl_lim6_absall` | 5/10/14 | 1/2/3 | 6/12/17 |
+| **全 bigram 单路+功能字+abs_all（现默认）** | **10/16/18** | **3/4/6** | **13/20/24** |
+
+复现：无 env 覆盖直接跑 `A9_ASOF=1792461898.0 ./venv/Scripts/python.exe eval/a9_eval.py kwv3_clean` → `logs/a9_kwv3_clean.json` = 13/20/24。
+
+**回归与成本**
+- A5（35 条带锚点）：`logs/a5_kwv3_clean.json` auto **21/30/32**、rrf 12/28/30、vector 8/12/13；与基线 `logs/a5_final_slots.json` **逐条 rank 全同（35/35）** —— 强证据路径没被碰。
+- 延迟（`scratch/a9_kw_latency.py`：subprocess 分进程、交叉 A B B A、20 条 × 3 轮）：旧窗口 media **81.7ms**（max_tokens 7）vs 现默认 **81.35ms**（max_tokens 19），p95 117.0 / 106.9 —— 成本在向量通道与倒排构建（6274 条全量入内存），不在 token 数。
+- 单测：`./venv/Scripts/python.exe -m unittest discover -s tests -p "test_*.py"` → **124 条全过**（121 + 新增 `tests/test_kw_coord.py::KwAbsAllTest` 3 条：弱证据拿到真实分母 / 关开关退回 phantom 口径且无 `kw_abs_all` / 强证据路径不产生 `kw_abs_all`）。
+
+**开关（都可 env 覆盖，默认即上表最优）**
+
+| env | 默认 | 作用 |
+|:--|:--|:--|
+| `BOSHI_KW_QBIG_LIMIT` | `0` | 0=全部 bigram；6=旧窗口（回退用） |
+| `BOSHI_KW_QBIG_FUNC` | `1` | 功能字过滤开关 |
+| `BOSHI_KW_QBIG_FUNC_HEAD` | `0` | 1=前 6 个也过滤 |
+| `BOSHI_KW_QBIG_DECAY` | `0` | 尾部 bigram 权重衰减斜率 |
+| `BOSHI_KW_MAX_TOKENS` | `64` | token 上界（0=不限） |
+| `BOSHI_KW_ABS_ALL` | `1` | 弱证据下 kw_abs 换真实分母 |
+| `BOSHI_KW_WEAK_WV` / `_WK` | 0.70 / 0.30 | 弱证据融合权重 |
+
+**限制 / 下一步**
+- paraphrase 的 top1 仍只 3/20（top5 6/20）：换词问法的语义匹配仍在向量通道，关键词只能当辅证；下一步该在向量侧做，不在 bigram。
+- abs_all 后 kw_abs 的量纲整体变小（max 0.72 vs 0.88），0.30 的固定权重可能偏低；若要再调，应连同向量 sim 的分布一起标定，单改 wk 容易把噪声顶上来。
+- `_FUNC_CHARS` 是手写集合（只覆盖高频虚词），没有词表依据；功能字过滤目前只在尾部生效，头部保留是为了守住 A5 的锚点位次。
+
+**教训**
+1. 「多给证据」≠「提高质量」：证据必须在融合层被**读取**才算数（`_score_merge` 只认 kw_abs，其他字段改了也没用）。
+2. 指标要按问法分层：同一批 gold 的 overlap / paraphrase 两栏必须分开看，否则「paraphrase 涨、overlap 跌」会被合计掩盖成小涨。
+3. RRF 在权重悬殊时等价于单路，做「双通道融合」前先验证两路真能改变名次，否则只是在加死代码。
+4. 合成 fixture 只能验证接线，不能推出「恒 0」这类分布结论；机制的绝对值必须在真实库上量（`a9_kwabs_probe.py` 推翻了早先的判断）。
+
+### 11.23 弱证据融合掺入「通道相对分」（2026-10-21，**默认开启 b=0.4**）
+
+**起因**：§11.22 的遗留问题「paraphrase top1 只 3/20」。用 `scratch/a9_recall_probe.py` 把每条 gold 在两条通道各自 top-200 里的名次和最终名次一起打出来，病灶分成两类：
+
+| 类型 | 条数 | 例子（gold, kw 通道名次 → 融合后） |
+|:--|:--|:--|
+| 融合层丢金标 | 4 | `8b027120` 1→None、`eec4f527` 5→None、`0d28d510` 13→None、`f6c71ce8` 10→None |
+| 通道截断 | 3 | `d13aed83` 61、`bc695685` 73、`89a147e0` 27（`_KW_POOL_CAP=20`） |
+| 两路皆无 | 2 | `a457b574`、`3f1be78e` |
+
+第一类是纯排序缺陷：**`_score_merge` 只读 `kw_abs`（绝对 idf 覆盖率）**，改写式 query 的 gold 只对上两三个 bigram → kw_abs 低 → 被「向量近但字面不沾」的候选顶掉，尽管它在关键词通道里排第 1。
+
+**改动**（`pg_bridge.py:717` `_KW_REL_BLEND`，`_score_merge` 内 `pg_bridge.py:1128-1142`）：弱证据 query（`any(_weak)`）下 `k = kw_abs + b*kw`，`kw` 是 `_kw_channel` 已有的通道内相对分（top1 归一）。强证据 query 一律不加（A5 不受影响）。默认 `b=0` 即完全不改变现行为。
+
+**扫描**（线上真实路径 `eval/a9_eval.py`，`A9_ASOF=1792461898`）
+
+| b | overlap | paraphrase | 合计 |
+|:--|:--|:--|:--|
+| 0（当前默认） | 10/16/18 | 3/4/6 | 13/20/24 |
+| 0.15 | 10/16/18 | 3/3/7 | 13/19/25 |
+| 0.25 | 10/15/18 | 3/5/7 | 13/20/25 |
+| 0.3 / 0.35 | 10/15/18 | 3/5/8 | 13/20/26 |
+| **0.4** | 10/15/18 | **4/5/8** | **14/20/26** |
+| 0.5 | 10/16/18 | 4/5/7 | 14/21/25 |
+
+逐条（b=0.4 vs 基线）：涨 `8b027120` None→**1**、`56d59b74` 5→3、`eec4f527` None→5；跌 `231e8410` 3→4、`c0abea75` 4→5、`9b678312` 3→5。**净效果 = paraphrase +1 top1 / +2 top5，代价是 overlap −1 top3。**
+
+池子尺寸（`scratch/a9_pool_scan.py`，kv/max kk 九组网格）：`_KW_POOL_CAP` 20→40/100 线上**没有变化**，因为融合后只留 `pool_k=15` 再进字段匹配，池尾文档进不来 —— 通道截断那 3 条（kw 61/73）确实救不回，需要改池结构而非改 cap。
+
+**回归**：A5 `BOSHI_KW_REL_BLEND=0` 与 `0.4` 两跑完全一致 **21/30/32**（锚点 query 走强证据分支，`qweak=False`）；单测 127 条全过（新增 `KwRelBlendTest` 3 条）。
+
+**判定：默认开到 0.4**（2026-10-21 交付）。担心的是「40 条样本里 ±1 是噪声」，所以不看单次绝对值，改看**跨快照稳定性**——`scratch/a9_b_stability.py` 取 4 个 `A9_ASOF` 语料快照（`1792461898` / `1791500000` / `1790500000` / live），每个快照跑 b=0 与 b=0.4，逐 query 配对计数：
+
+| 快照 | b=0 para t1/3/5 | b=0.4 para | top1 +/− | top3 +/− | top5 +/− |
+|:--|:--|:--|:--|:--|:--|
+| 1792461898 | 3/4/6 | 4/5/8 | +1/−0 | +2/−2 | **+2/−0** |
+| 1791500000 | 2/3/4 | 3/4/6 | +1/−0 | +1/−0 | **+2/−0** |
+| 1790500000 | 1/1/1 | 2/2/3 | +1/−0 | +1/−0 | **+2/−0** |
+| live | 2/3/5 | 3/4/7 | +1/−1 | +2/−2 | **+2/−0** |
+
+**paraphrase top5 在 4/4 快照上都 +2、零条退化**，且涨的是固定的那两条（`8b027120` kw 名次 1、`eec4f527` 名次 5）——这不是抽样噪声，是把「通道头名」这个确定性信号接回来了。代价只是 overlap 偶尔掉 1 个 top3（仍在 top5 内），top1 累计 +3/−1。单条符号检验（n≤4）本来就不可能显著，故以**跨快照同向 + 无退化**为判据，而不是 p 值。
+
+**为什么原先判「过拟合」是误判**：`8b027120` 在 b=0.3 时 rank 3、b=0.4 时 rank 1 的跳动，来源是它与另一个候选的 kw_abs 差距恰好在阈值附近；换语料快照后这个跳跃方向稳定（始终从「池外/榜尾」进入 top1），说明是信号而非噪声。教训：**样本小时看「同一改动的涨跌方向是否跨语料稳定」，比看单次总分更可靠。**
+
+## 11.24 P2 收尾：时间窗接检索 + 白盒运维面 + 冲突链（2026-10-21）
+
+**动机**：升级方案里 P2 留了三个口子——① `get_time_range()` 早就有，但检索主路径没有时间入口，"上周/上个月的记忆"只能整库召回再人工筛；② 白盒约定写成"可读可改可回滚"，实际 CLI 只有 search/save/delete；③ 冲突只有 `is_latest` 一个布尔，没有"被谁取代、为什么"。
+
+### 11.24.1 时间窗（`since` / `until` → `created_at` 真列）
+
+- `pg_bridge.py` 新增 `_time_bounds(since, until) -> (sql, params)`：支持 Unix 秒、数字串、ISO 串；**无边界时返回空串**（不是 `"TRUE"`），调用方 `if _tc:` 才拼 `AND`。踩过：测试先写成断言 `TRUE`，失败后按实现改口径。
+- `search_memory(..., since=None, until=None)` / `hybrid_search(..., since, until)` / `boshi_core.search(..., since, until)` 全链路透传，`vec` 与 `kw` 两条轨道共用同一个 `cond`，所以时间窗对融合后的候选池整体生效，不是只筛一路。
+- 落点是 `created_at`，不是 `meta.timestamp`：真列可走索引，且不受历史 meta 缺失污染。
+- **MCP 原实现是错的**：`boshi_search` 先按 top_k 取回再 Python 端过滤，时间窗宽时返回空结果（假空）。改为把 `since/until` 直接透传给 `core.search`，语义变成"先过滤再取 top_k"。
+- CLI：`boshi search "..." --since 7d --until 2026-10-20`，`_parse_when` 支持 `7d/24h/30m/1.5w`、epoch、`%Y-%m-%d[ %H:%M[:%S]]`、`%Y/%m/%d`、ISO。
+
+### 11.24.2 白盒运维面
+
+| 能力 | 后端 | CLI | 语义 |
+|:--|:--|:--|:--|
+| 就地编辑 | `edit_memory(id, content, meta_patch, topic, is_latest)` | `boshi edit <id> --content/-f/--meta k=v/--topic` | 改正文**重算 embedding 并重抽 slots**（只改 content 不改 embedding = 改了检索看不见；slots 不同步会让字段级匹配继续读旧端口/版本） |
+| 全量快照 | `export_snapshot(path, scope, include_graph)` | `boshi export [--out] [--scope all\|self]` | JSONL，每行 `kind=memory\|edge`，含 meta/slots/is_latest/created_at，可回灌 |
+| 人读版 | `export_markdown(path, scope, limit)` | `boshi export --md --limit 5000` | 按 topic 分组的 Markdown，标"已被新版取代" |
+| 回灌 | `restore_snapshot(path, dry_run)` | `boshi restore <jsonl> [--dry-run]` | **`ON CONFLICT (id) DO NOTHING`**：只补缺失 id，绝不覆盖现状（回滚语义安全侧） |
+
+- `meta_patch` 值为 `None`/空 = 删键；无变化时返回 `changed=[]` 而不是假成功。
+- `restore` 的 `dry_run` 初版计数恒 0（`if dry_run: continue` 放在解析统计之前），改为逐行 SELECT 存在性后再计数；全量演练 19.5s → added 2 / skipped 79918 / error 0（那 2 条是快照之后被删的自检记忆，正好证明 dry_run 数的是真差异）。
+- **踩坑（高频）**：`chroma_bridge._PUBLIC_API` 是 pg 后端接管清单，新函数漏加 → `boshi_core.edit()` 静默回"当前后端不支持就地编辑"。凡新增 pg 能力必须同步进 `_PUBLIC_API`，单测已锁这条（`tests/test_time_window.py::test_whitebox_api_exists`）。
+
+### 11.24.3 冲突建模（极简版，不改表）
+
+- `resolve_conflict(winner_id, loser_id, reason)`：落败行 `is_latest=false` + `meta.superseded_by=赢家` + `meta.supersede_reason`。沿用 v5.8 不可变日志约定，历史答案仍可 `all_versions` 追溯。
+- `fact_chain(memory_id)`：链是**推导出来的**，不额外建表。给定任一版本，向上顺 `superseded_by` 走到最新，同时用递归 CTE 向下找出所有（多级）指向它的旧版，返回 `{chain, descendants, summary}`。
+- `detect_conflicts(topic, top_k, sim_threshold)`：零模型候选。**不做全表 O(n²)**（6283 行自连接实测 12s+），先用 `slots.files` 有交集挑候选对（1343 对），再 Python 侧算余弦，最后只报"同一槽位键取值互斥"的对；包含关系（`['8188']` vs `['8188','11355']`）= 补充信息，不算冲突。全库 1.9s。
+- `boundary_envs` 被排除出冲突键：抽提器往里存的是**整句话**，互相比较只会产噪声。
+- 定位是**候选列表**（按相似度排序供人裁决），不追求精度；实测有 pid/port 混淆导致的假阳性，这是抽提器口径问题而非检测器问题。
+
+### 11.24.4 验收
+
+- 单测 **150 条全过**（1 skip：`build_parser` 未暴露）；新增 `tests/test_time_window.py` 14 条、`tests/test_conflict_chain.py` 8 条。
+- 真实闭环：存两条同文件不同端口的自检记忆 → `detect_conflicts` 命中 sim=0.9898 `ports ['18801'] vs ['18802']` → `resolve_conflict` → 落败方 `fact_chain` = "共 2 版，最新 <赢家>"，赢家 `descendants=[loser]` → 删除清理，库内无残留。
+- CLI 冒烟：`search --since 7d` 3 条、`export --md --limit 20`、`restore --dry-run` 新增 2/跳过 79918、`chain`/`conflicts` 正常、不存在的 id 返回"未找到该记忆"。
+
+## 11.25 P2 ④ 认知层：心智模型预计算页（2026-10-21）
+
+**动机（实测）**：`measure_cold.py` 拆解首轮召回开销 = `import boshi_core` **1.09s** + 首次 hybrid search **6.39s**（bge-m3 ONNX 首次加载），第二次同进程 0.06s。Hermes prefetch 超时线 8s，冷启那次几乎贴着红线，且 bge-m3 加载受磁盘碎片/系统负载影响波动 ±2s。预计算页把「固定问题的答案」提前算好落库，读 = **一条 SELECT（226 ms 实测）**，完全跳过 embedding 加载。
+
+**思路来源**：Hindsight 的 mental model（固定问题提前写好答案，读时一次取回）。**只借机制，不借生成**——见下条。
+
+### 11.25.1 设计约束（不可越线）
+
+- **零模型**：不调 LLM、不调 embedding、不联网。全部是 SQL 过滤 + 正则/关键词规则。页面每一行必须是**某条记忆的原文片段**（`_clip` 只在单条超 `MAX_LINE=220` 时按标点切断并标 `…`），或由**槽位原值**聚合出的计数（如端口出现次数）。
+- **不总结、不改写**：没有「提炼」「概括」「归纳」环节。同一库同一时刻 → 输出**逐字节相同**。
+- **可回溯**：每页带 `evidence_ids`（该页所有行的来源记忆 id 去重），存在 `meta.evidence_ids`。
+- **不参与召回**：页面是派生数据，绝不反向污染检索。`pg_bridge._where_sql()` 与 `get_total_count()` 均加 `COALESCE(topic, '') <> 'mental_model'`。
+
+### 11.25.2 五页结构（`mental_model.PAGES`）
+
+| key | 标题 | 取数规则 |
+|:--|:--|:--|
+| `identity` | 用户画像与长期规矩 | `topic IN (memory_tool, preference, user)`，最近 40 条，过 `_worth`/`_dedupe` |
+| `env` | 环境参数与铁律 | 同上 + 关键词过滤（`_ENV_KW`：端口/路径/代理/显存/临时/目录/磁盘/模型放/镜像/GPU），并展开 `slots` 做端口频次 TOP6 |
+| `active_projects` | 活跃项目 | `topic=project` + 45 天窗，按天去重保留最新 |
+| `pitfalls` | 反复踩的坑 | 经验层 `hits≥3` 且正文含 `_PIT_KW`（教训/坑/bug/根因/解决/踩…） |
+| `open_threads` | 未了事项 | `slots.open_questions` 近 21 天，取第一条问题 |
+
+### 11.25.3 存储约定（不建新表）
+
+- 复用 `boshi.memories`：`topic='mental_model'`、`session_id='__mental_model__'`、`meta.page_key` 作去重键。
+- **不写 embedding**（列本来可空），显式 `embedding IS NULL`。
+- 版本化沿用 v5.8 不可变日志：旧页 `is_latest=false`，新页 `is_latest=true` + `meta.supersedes=<旧 id>`；不删旧版，便于审计「这次重建改了什么」。
+- `boshi_cli status` / `get_total_count()` 都不计页面行（否则记忆总数虚增 4）。
+
+### 11.25.4 scope 隔离（实测必需）
+
+`grep` 查 topic 分布发现：`project` / `troubleshooting` 历史 **90% 挂在 `opencode` / `desktop` profile 名下**，`default` 只有零星几条。不加隔离，`default` 的页面会混进别的 agent 的项目与坑。
+
+- `build_page(..., scope)` 默认 `self`，取 `chroma_bridge.default_scope(prof)`；`scope='all'` 才跨 profile。
+- SQL 前缀由 `_prof_clause()` 生成，用 `IS NOT DISTINCT FROM` 而非 `=`（`profile` 为 NULL 时不能用等号）。
+- 页面写入时把 scope 落到 `meta.scope`，读时按 scope 过滤。
+
+### 11.25.5 超预算裁剪：按行裁，不按页丢
+
+原实现超预算整页丢弃 → 实测只剩 identity 一页（682 字符），env（884 字符，最贵的一页）被整块扔掉。
+
+现实现：从**末页尾部逐行丢**，每页至少保「`### 标题` + 1 行」；`PAGE_BUDGET` 从 1400 提到 **2400**（每会话只注入一次，预算可以更宽松）。实测输出 4 页 / 1316 字符，env 页完整。
+
+### 11.25.6 注入逻辑
+
+- 不在 `system_prompt_block()`（静态、每次会话重组、成本高）；在 `prefetch()` **首调**时注入。
+- `_mental_model_prefix()` 一条 SELECT 拿页 → `_with_mm()` 拼成 `页 + "\n\n" + 本轮召回`（页作背景在前，召回在后）。
+- `_mm_done` 标志保证同一会话只注入一次；`shutdown()` 与 `on_session_switch(reset=True)` 重置。
+- **任何异常静默吞掉**——画像层不许拖垮召回主路径。
+- `BOSHI_MENTAL_MODEL=0` 全局关闭（读/建都 no-op）；`STALE_HOURS=24` 超期后台重建；`REBUILD_MIN_GAP=300` 防抖。
+
+### 11.25.7 接口
+
+- CLI：`boshi model [--show|--rebuild] [--key identity|env|active_projects|pitfalls|open_threads] [--scope self|all]`，以及清理旧版 `boshi model --prune [--keep N]`（只统计）/ `--prune-apply`（真删）
+- MCP：`boshi_mental_model(action=show|rebuild, key=?, scope=?)`（工具数 9 → **10**；清理不给 MCP，避免模型自主删库）
+
+### 11.25.8 实测与验收
+
+| 项 | 数值 |
+|:--|:--|
+| 冷启首次 hybrid search | 6.39s（旧路径，贴 8s 超时线） |
+| 心智模型页读取 | **116–226 ms**（一条 SELECT） |
+| 全五页重建 | **273 ms**（4 页非空，`active_projects` 空） |
+| 注入文本 | 4 页 / **1337 字符**（预算 2400） |
+| 检索隔离 | `search('常用端口 按出现次数', top_k=5)` 返回 id 与 mental_model latest 4 id **交集为空** |
+| 单测 | 新增 `tests/test_mental_model.py` **27 条**；全套 **177 条全过（1 skip）** |
+| 旧版清理 | 库内 12 行 = 4 页 × 3 版；`--prune --keep 2` 报「可删 4 行」、`--keep 1` 报「可删 8 行」，默认 dry-run 零写 |
+
+**判别点（不靠版本号看行为）**：新代码 prefetch 首调日志多一行 `心智模型页注入：N 页 / M 字符`；`boshi status` 条数比老代码少 4（页面不计入）。
+
+### 11.25.9 版本清理与内容去重（2026-10-21）
+
+**问题**：页面是「可重算的派生态」，`rebuild` 每次都插一行；24h 定时重建等于每天往 `boshi.memories` 里堆 4~5 行历史，而历史页面没有任何读取路径（`load_pages` 只取 `is_latest`）。
+
+**两条约束下的解法**：
+
+1. **内容去重（写入侧，先手）**：`save_page()` 查出旧版时顺带取 `content`，若与当前渲染文本逐字相同 → 直接返回旧 id，不落库。现有 12 行（4 页×3 版）都是去重上线前留下，去重尚未在线上观测到省行（只有逻辑与单测覆盖）。 判断放在
+「已经拿到旧版行」之后，不需要额外一次 SELECT。
+2. **版本窗口（清理侧，后手）**：`prune_pages(keep=KEEP_VERSIONS, profile=None, dry_run=True)` 用窗口函数
+   `row_number() OVER (PARTITION BY profile, meta->>'page_key', COALESCE(meta->>'scope','self') ORDER BY is_latest DESC, created_at DESC)` 取 `rn > keep`；
+   `DELETE ... WHERE topic='mental_model' AND is_latest=false AND id = ANY(%s::uuid[])`。
+   `KEEP_VERSIONS = 8`，`dry_run=True` 是默认值——**删除必须显式传 `dry_run=False`**（CLI `--prune-apply`）。
+
+**为什么保留 8 版而不是 1 版**：页面内容带 `evidence_ids`，出问题时需要回看「上周 env 页写了什么」，8 版约等于两周历史，成本 32 行，可忽略。
+
+**为什么清理不碰 `is_latest` 行**：`rn=1` 恒为有效页；`is_latest=false` 是删除前提，即使 SQL 出错也不会把当前页删掉（页面丢了要等下一次 rebuild 才恢复，注入会变空页）。
+
+**接口穿透**：`pg_bridge.prune_mental_model(profile, keep, dry_run)` → `boshi_core.prune_mental_model` → CLI `model --prune/--prune-apply/--keep`；`chroma_bridge._PUBLIC_API` 同步加名（漏加会静默回「当前后端不支持」）。当前公开 API 数 **26**。
+
+**验证手法（不建脏数据）**：先 `GROUP BY profile, page_key, scope` 数出版本分布，再用 `--keep` 递减反推：
+
+| keep | 期望可删 | 实测 |
+|:--|:--|:--|
+| 8（默认） | 0（每页 3 版） | ✅ 无需清理 |
+| 2 | 4（每页第 3 版） | ✅ `env:1 identity:1 open_threads:1 pitfalls:1` |
+| 1 | 8（每页第 2、3 版） | ✅ `env:2 identity:2 open_threads:2 pitfalls:2` |
+
+三次 dry-run 均未写入（`boshi.memories` 行数恒为 12）。
+
+### 11.25.10 评测不污染统计（`BOSHI_FM_STATS`）
+
+`eval/a9_eval.py`、`eval/a5_eval.py` 在 `import pg_bridge` **之前** 加 `os.environ.setdefault("BOSHI_FM_STATS", "0")`。
+
+原因：`pg_bridge.py` 的打点开关在**模块导入时**读一次环境变量（`BOSHI_FM_STATS != "1"` 时跳过打点），导入后再设无效。此前评测跑满 40+35 条用例，把 `boshi.fm_stats` 灌成「versions 252 queries」，而真实流量只有 10-20 的 ports 5 / flags 12 / versions 39 → `_FM_W` 权重再也估不准。单测 `tests/test_mental_model.py::EvalHygieneTest` 已锁「环境变量设置位置在 import pg_bridge 之前」。
+
+### 11.26 锚点查询的「通道名次奖励」（2026-10-21，**默认关，`BOSHI_ANCHOR_BONUS=1` 开启**）
+
+**A 方案（池结构/融合公式，零模型）的完整结论**——先量到底还有多少空间，再动手：
+
+1. **加深候选无用**：`_score_merge` 是按绝对分全排序后截断，`pool_k` 变大只是多进更低的候选，top5 组成不变。深度 60 回放里 `union@60` 的 A9 已达 overlap **20/20**、paraphrase **16/20**，而线上 top5 只有 10/18 与 4/8 → **缺口在排序，不在召回池**。文档 §11.22 记的「`_KW_POOL_CAP` 20→40/100 线上毫无变化」即此机制的旁证。
+2. **12 条 paraphrase 失败按分差分层**（`scratch/a9_gap_inspect.py` 口径，深度 60 缓存、qweak 0.70/0.30）：4 条 gold 连候选池都进不去（d13aed83 / a457b574 / bc695685 / 3f1be78e，其中 3f1be78e 在深度 300 的双通道里也查无此文）、4 条差一点点（0d28d510 0.0248、89a147e0 0.0397、f6c71ce8 0.0466、f9b2f45f 0.0551）、4 条差一大截（7f6c4aba 0.1410、c0abea75 0.1765、1aac404f 0.1766、231e8410 0.2292）。
+3. **权重扫描是白忙**（`scratch/a9_wv_sweep2.py`）：kw 权重占比 0→0.6 在 paraphrase 上 top1/top3/top5 = 0/1/2、2/4/7、**4/4/6**、3/4/6、3/3/7、3/3/7、3/3/7，没有单调最优；overlap 组反而是线上默认的 0.30 最好（10/13/16），挪到 0.55/0.70 掉到 8/13/14——**qweak 降权（`_KW_WEAK_WV=0.70/_WK=0.30`）本身是对的，不需要动**。旁注：此离线复刻比线上实测各差 1~2 条（线上 overlap 10/15/18、paraphrase 4/5/8），因为线上还有 `field_match`、去重、图扩展等后置阶段，**离线只能看方向，验收一律以线上 JSON 为准**。
+4. **唯一找到的零模型杠杆：通道名次在「有锚点」时是强信号**。带型号/端口/版本/数字的 query，字面命中极可靠，而 `kw_abs`（相对 top1 的绝对覆盖）会把 kw 通道第 1 名恒定为 ≈1.0、量纲任意，与余弦不同权——纯 kw 独有的文档即使余弦低也能压死向量独有文档。给「通道内名次靠前」的候选加**小额定分**（不进展示分）即可把这类文档顶到前面。
+
+**实现**（全部在 `pg_bridge.py`，无新依赖）：
+
+| 常量 | 默认 | 含义 |
+|:--|:--|:--|
+| `_ANCHOR_BONUS_ON` | `0`（`BOSHI_ANCHOR_BONUS=1` 开） | 总开关 |
+| `_AB_V` | `0.10`（`BOSHI_ANCHOR_BONUS_V`） | vec 通道名次 ≤5 时加分 |
+| `_AB_K` | `0.15`（`BOSHI_ANCHOR_BONUS_K`） | kw 通道名次 ≤3 时加分 |
+
+- `_score_merge(vec_items, kw_items, top_k, wv, wk, query=None)` 新增 `query` 形参；`pool` 记录 `rv`/`rk`（enumerate 从 1 起）；`bonus_on = _ANCHOR_BONUS_ON and _has_anchor(query)`。
+- 排序键 `it['_sortf'] = f + (bonus if bonus_on else 0.0)`，`out.sort(key=lambda x: -x['_sortf'])`，返回前 `pop('_sortf')`。
+- **奖励不写进 `it['score']`**：展示分仍是 `1-(0.60+0.40*f)`，落在 0.6~1.0；若把 0.10/0.15 加到展示分上，该区间的相对顺序会被打乱且出现 >1 的值。
+- 调用点改为 `_score_merge(vec_items, kw_items, pool_k, query=query)`。
+
+**线上实测**（`eval/a5_eval.py` / `eval/a9_eval.py`，JSON 已落盘）：
+
+| 集合 | 开关 | auto top1 | top3 | top5 | 备注 |
+|:--|:--|--:|--:|--:|:--|
+| A5（35 条，全带锚点） | off | 21 (60.0%) | 30 | 32 | `logs/a5_bonus_off.json` |
+| A5 | **on** | **27 (77.1%)** | 33 | 33 | `logs/a5_bonus_on.json`；rrf 12/28/30、vector 8/12/13 **均不变** |
+| A9（40 条，纯中文无锚点） | off | 10 | 15 | 18 | overlap 10/15/18、paraphrase 4/5/8 |
+| A9 | on | 10 | 15 | 18 | 逐条与 off **完全一致**（分叉未触发，正是预期） |
+
+「锚点」的判定不是我自己发明的口径，复用 `_has_anchor()` = `_ANCHOR_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.+\-]{1,}|\d{2,}")`：连续 ≥2 位数字，或「字母开头、后接字母/数字/`._+-`、总长 ≥2」的 ASCII 串（型号、端口、版本号、路径、命令、英文词都算）。
+
+A5 逐条对比：8 条上升（70cd3d35 None→1、a5ad3de9 4→1、c6db5b3f 4→2、91492b69 3→1、66b6de8f 2→1、e79e3fe9 3→2、08e4fa8e 3→1、e83a096c 3→1）、**0 条下降**。A9 侧的自检输出「40 条，anchor 全在 gold 内，且全部无锚点」证明分叉确实只在有锚点时生效，纯中文叙述句完全不受影响。
+
+**为什么敢加这个奖励**：它不是"猜"，只是把「字面锚点在第 1~3 名」这个已有的确定信息加权；失败样本里 8 条全是名次冲突（gold 在 kw 通道排 3~4 但融合排 4），奖励量 0.15 恰好能翻过这类 margin。风险是「query 里带个无关数字，恰好让某篇 kw 高分文档跳上来」——A5 的 35 条全含数字，未出现回归；A9 的无锚点组逻辑上不进入该分支。
+
+**未决**：默认值是否翻成 1 由乐之决定（当前提交态=默认关）。若翻，建议同时把 A5 的 27/35 写进回归基线，防止后续改动回退。
+
+### 11.26.1 离线扫参脚本（可复跑）
+
+| 文件 | 作用 |
+|:--|:--|
+| `eval/sweep_fuse.py` | 对 A9+A5 各取一次深度 60 的 vec/kw 候选 → 内存里跑 10 种融合 × 2 种深度，报 top1/3/5 与通道可达上限；结果缓存在 `logs/sweep_fuse_cache.json`（命中即跳过嵌入，秒级迭代） |
+| `scratch/a9_pool_probe2.py` | 逐条全深度（vec/kw 各 300）名次探测 → `logs/a9_pool_probe2.json`，判「池内排序 / 池截断 / 通道边界 / 两路皆无」 |
+| `scratch/a9_gap_inspect.py` | 用缓存复刻线上 qweak 口径的融合分，算 gold 与 top5 门槛的分差 |
+| `scratch/a9_wv_sweep2.py` | kw 权重占比 0→0.6 网格 + overlap 防回归 |
+
+**离线结论汇总（深度 60 回放）**：A9 可达上限 overlap 20/20、paraphrase 16/20；A5 35/35。融合模式里 `rrf` 全线更差（A9 o3/14 p0/5）→ 继续否决；`base`(=线上) 在 A9 上最好；`quota`/`quota2`/`adaptive3` 能在 A5 上把 top1 从 20 抬到 26/23，A9 上全部退化 → 于是把「名次奖励」限定在**有锚点**时才启用，就是 11.26 上线的那版。
+
+### 11.27 E 方案：本地 bge-reranker-v2-m3 精排（2026-10-21，**默认开**，端点不可达自动降级）
+
+**为什么走到 reranker**：11.26 的结论是「缺口在排序，不在召回池」——A9 paraphrase 在深度 60 的并集里能捞到 16/20，线上 top5 只有 4/8。零模型手段（融合公式、权重、池深、锚点奖励）能动的都试完了，剩下的是**语义排序**本身，必须上交叉编码器。B/A10 两个零模型尝试都失败，一并落档：
+
+| 方案 | 做法 | 结果 | 结论 |
+|:--|:--|:--|:--|
+| B 库内共现同义表 | 从库内共现挖同义伙伴扩 query（`scratch/b_expand_pilot.py`） | prim 4/5/8 → **3/4/6** | 扩展进来的多是通用词，稀释信号 → 否定 |
+| A10 query 侧 bigram 提权 | monkeypatch `_kw_tokens`，把 df 适中的 bigram 抬到 ≥2.5，让纯中文长问句也能进 `_kw_abs` 的 prim（`scratch/a10_bigram_promote.py`） | prom1.8 A9 (10,15,18)→(10,14,17)、(4,5,8)→(3,4,5)；prom2.6 更差（paraphrase 1/2/4），只 A5 微升 21→23 | A9 全面退化 → 放弃 |
+
+**用户提示的关键事实**：重排模型本机早就有，且 `C:/Users/wulezhi/projects/BuddhistRAG/config.yaml` 里已配好——
+
+| 项 | 值 |
+|:--|:--|
+| 端点 | `http://127.0.0.1:11437`，`POST /rerank`，body `{"model","query","documents"}` → `results[{index, relevance_score}]`（**负 logit，越大越相关**） |
+| 模型文件 | `D:/llama/models/bge-reranker-v2-m3-FP16.gguf`（1.1 GB） |
+| 启动脚本 | `C:/Users/wulezhi/projects/BuddhistRAG/start_llama_rerank.bat`（`--rerank --port 11437 -c 8192 -ngl 99 -b 4096 -ub 4096`） |
+| 既有用法参考 | `BuddhistRAG/annotate.py:144-173`（先粗排 top_k*3 再 rerank，失败降级 distance 排序） |
+
+**启动两个坑（已验证，别重踩）**：
+1. 默认 `-ub 512` 会直接 500：`input (529 tokens) is too large to process. increase the physical batch size (current batch size: 512)` → 必须 `-b 4096 -ub 4096`。
+2. 用 `cmd | tail -40` 起服务会留 wrapper，且 SO_REUSEADDR 让**两个实例同时 LISTEN 同一端口**，请求打到旧实例（表现为「改了参数没效果」）。正确方式：`nohup ./llama-server.exe ... > /d/llama/rerank_11437.log 2>&1 &`，然后 `netstat -ano | grep LISTENING | grep :11437` 确认只有一个 PID。
+
+**池深/截断扫描**（`scratch/e_rerank_sweep.py`，A9 40 + A5 35，top1/top3/top5）：
+
+| pool / chars | A9-overlap | A9-paraphrase | A5 | p50 / p90 (ms) |
+|:--|:--|:--|:--|:--|
+| 10 / 700 | 13/17/18 | 6/9/10 | 29/33/33 | 381 / 543 |
+| **15 / 700** | **13/17/18** | **6/10/10** | **31/34/34** | 593 / 882 |
+| 20 / 700 | 13/17/18 | 6/9/11 | 30/34/34 | 746 / 1038 |
+| 20 / 300 | 12/17/18 | 4/8/10 | 32/34/34 | 422 / 567 |
+| 15 / 300 | 12/17/18 | 5/8/9 | 33/34/35 | 328 / 465 |
+| 10 / 300 | 12/17/18 | 6/9/10 | 32/33/34 | 221 / 316 |
+
+→ **默认 `pool=15`、`chars=700`**（cap 300 切掉文档语义中段，paraphrase 明显掉；pool 15 vs 20 在噪声内但延迟差 150 ms）。**不能只重排已进 top5 的 5 条**：A9 paraphrase 的 7f6c4aba / f9b2f45f / 0d28d510 / f6c71ce8 都要靠 15 深的池才进榜（rerank@5 只得 6/7/8）。
+
+**实现**（`pg_bridge.py`，紧跟 `_time_bounds` 之后、`search_memory` 之前）：
+
+| 常量 | 默认（env） | 含义 |
+|:--|:--|:--|
+| `_RERANK_ON` | `1`（`BOSHI_RERANK=0` 关） | 总开关 |
+| `_RERANK_URL` | `http://127.0.0.1:11437/rerank`（`BOSHI_RERANK_URL`，**要带 /rerank**） | 端点 |
+| `_RERANK_MODEL` | `bge-reranker-v2-m3`（`BOSHI_RERANK_MODEL`） | 请求体 model 字段（llama-server 只校验存在性） |
+| `_RERANK_POOL` | `15`（`BOSHI_RERANK_POOL`） | 候选池深度（也作 field_match 的截断深度 `_cand_k`） |
+| `_RERANK_CHARS` | `700`（`BOSHI_RERANK_CHARS`） | 每条送精排的最大字符数 |
+| `_RERANK_CHUNK` | `2200`（`BOSHI_RERANK_CHUNK`） | 单请求字符预算（中文≈1 char/token，防 ubatch 4096 报错） |
+| `_RERANK_TIMEOUT` | `8`（`BOSHI_RERANK_TIMEOUT`） | read 超时 |
+| `_RERANK_CONNECT_TIMEOUT` | `0.35`（`BOSHI_RERANK_CONNECT_TIMEOUT`） | **connect 超时必须单独压小**，见下 |
+| `_RERANK_COOLDOWN` | `60`（`BOSHI_RERANK_COOLDOWN`） | 失败后熔断静默秒数 |
+| `_RERANK_DOWN_UNTIL` | `[0.0]` | 熔断状态（进程内） |
+
+- `def _rerank_items(query, items, top_k)`：按 `_RERANK_CHARS` 截断正文、按 `_RERANK_CHUNK` 分块请求；`timeout=(connect, read)`；**任何异常 → 记熔断 + 原序返回**（不抛）；**有候选缺分则整批不用**（不采用半套排序）；`p = sigmoid(logit)`。
+- 分数映射：`it["score"] = 1 - (0.60 + 0.40*p)`，另写 `metadata["rerank_score"] = logit`。**不能写成 `1-p`**：那样距离被压到 0~0.05，与 `include_graph` 并进来的余弦距离完全不可比；`1-(0.60+0.40*p)` 与 11.26 的 RRF 伪距离同一量纲（0.6~1.0 相似度区间的补数）。
+- 挂钩两处：① `pool_k = max(int(pool_k), _RERANK_POOL)`；② field-match 后的截断改为 `_cand_k = pool_k if _RERANK_ON else top_k`，调用后 `items = _rerank_items(query, items, top_k)`（关时仍 `items[:top_k]`）。
+
+**空 query 守卫（必须保留，不是可选优化）**：`if len(items) < 2 or not (query or "").strip(): return items[:k]`。伯仕有大量「只按条件取、不给查询词」的调用（`boshi_core.py:403` 热记忆 top1、`experience_log.py:51/80-82` 经验汇总 `search_memory("", top_k=50/100, where={"type": ...})`）。这类请求送进 `/rerank` **不会报错**——端点返回 HTTP 200，但对空 query 输出的是一组近乎随机的顺序（实测 `query=''` 对 3 条候选返回 `[1,0,2]`，`query='伯仕记忆系统'` 才 `[2,0,1]` 且分数 4.354/-4.766/-11.03）。丢了守卫就是「静默错序」：按热度/时间排好的结果被打乱，且没有任何报错可查。回归用例 `tests/test_rerank_guard.py`（5 条：空/空白/None query、单候选、top_k 截断、死端点降级+熔断），`PYTHONPATH=. python tests/test_rerank_guard.py` 全过。
+
+**降级路径的真实代价（必须量，不能猜）**：本机连「没人听的 127.0.0.1 端口」要 **2038 ms** 才 `ConnectionError`（Windows SYN 重试），一次查询白等 2 秒。加 `connect=0.35` + 60 s 熔断后实测：死端口下三次查询 **8171 / 44 / 46 ms**（首次含 embedding 冷载，纯精排失败代价 360~530 ms，之后的 60 秒内为 0）。熔断是进程内状态，重启即清。
+
+**线上回归**（同一脚本 ON/OFF，`BOSHI_FM_STATS=0`，JSON 落盘）：
+
+| 集合 | OFF | ON（pool15/cap700） |
+|:--|:--|:--|
+| A9 overlap（20 条）auto top1/3/5 | 9/14/18 | **13/17/18** |
+| A9 paraphrase（20 条） | 3/4/7 | **5/9/9** |
+| A5（35 条）auto | 21 (60.0%)/30/32 | **31 (88.6%)/34/34** |
+| A5 rrf | 12/28/30 | 30/34/34 |
+| A5 vector | 8/12/13 | 15/15/15 |
+
+- 口径说明：`eval/a9_eval.py` 的 OFF 基线（9/14/18、3/4/7）与 11.26 记录的线上 JSON（10/15/18、4/5/8）差 1~2 条，是脚本阶段差异（该脚本未开全部后置阶段），**只做同脚本 ON/OFF 对比**，绝对数以线上为准。
+- 单测：`PYTHONPATH=. python tests/test_*.py` → 13 个文件全 rc=0（rerank ON 时跑）；`test_fm_trace.py` 必须带 `PYTHONPATH=.`，否则 `ModuleNotFoundError: No module named 'pg_bridge'`。
+
+**性能**（8 条真实 query，同一条链路）：
+
+| 路径 | p50 | p90 | max |
+|:--|--:|--:|--:|
+| `BOSHI_RERANK=0` | 47 ms | 51 ms | 51 ms |
+| `BOSHI_RERANK=1` | **604 ms** | 716 ms | 731 ms |
+| 其中 `_rerank_items` 单独（5 条短条目） | 145 ms | — | — |
+
+→ 精排净增约 **0.55 s/次查询**（15 条 × 700 字符真实正文喂交叉编码器就是这价）。Hermes 每轮 `prefetch` 付一次；想省就把 `BOSHI_RERANK_POOL` 调到 10（约 0.35 s，A5 29/33/33）。
+
+**未决（2026-10-21 13:30 已定：见 §11.27.1）**：
+- **rerank 服务常驻方式**（bat / schtasks / 挂进 `启动伯仕.bat`）需乐之授权后再做；当前不常驻 = 端点没起就自动降级（退回融合序，不报错）。
+- 11437 与 embedding(11436)、ComfyUI/反推共用一张 3060 12 GB，同时跑先看显存。
+
+### 11.27.1 显存让位：`--sleep-idle-seconds 600`（2026-10-21 落地）
+
+**为什么不用自己写"用完卸载"逻辑**：llama.cpp 原生支持按空闲时间释放权重，`--sleep-idle-seconds N`（`-1` = 关闭，默认）。服务不退出、端口不断、`/health` 仍应答，只是权重不再占显存，下一个请求自己唤醒。伯仕侧**零代码改动**。
+
+**实测**（临时实例 `:11440`，`-c 2048`，`--sleep-idle-seconds 12`，与生产 11437 隔离跑，测完 kill）：
+
+| 状态 | nvidia-smi used |
+|:--|--:|
+| 加载前 | 4647 MiB |
+| 加载后 | 5296 MiB（**+650 MiB**） |
+| 空闲 12 s 后 | **4659 MiB**（权重已让出） |
+| 唤醒后 | 5313 MiB |
+
+- 唤醒耗时：**3467 ms**（该次请求）；下一跳回到热态 **239 ms**（`-c 8192` 生产实例热请求 160 ms）。
+- 排序结果在 sleep/wake 前后**逐位一致**（`-1.3307 / -2.1201 / -11.0375`），不存在"睡了就排错"。
+- `/health` 在睡眠态仍返回 `{"status":"ok"}` —— 所以**不能**用 health 判断它是否在显存里。
+
+**生产配置（已生效）**：`--sleep-idle-seconds 600`（10 分钟），`-c 8192 -b 4096 -ub 4096`，`-ngl 99 --no-webui`，启动脚本 `projects/BuddhistRAG/start_llama_rerank.bat`（该脚本原先缺 `-b/-ub 4096`，默认 512 会让长条目批量请求 500，已一并补上）。
+
+**取舍**：对话进行中它一直在（零等待）；停手 10 分钟后让出 650~800 MiB 给 ComfyUI/反推；隔很久后第一条查询 **+3.5 s**。嫌慢改 `-1`（常驻），嫌占显存改 `60`。
+
+> ⚠️ 本节只解决「进程已在跑时让出显存」。进程不在（重启电脑 / 被外部杀掉）时由 **§11.31 按需拉起**补上（2026-10-22 落地）——10-21 当时的说法「整套设定已生效」并不成立。
+
+**验证方式（可复跑）**：`nvidia-smi --query-gpu=memory.used --format=csv` 间隔 11 分钟两次对比；唤醒用 `/rerank` 打一次并计时。
+
+
+### 11.28 P1④ 定档：精排池深 100 + 纯重排（2026-10-21）
+
+**目标**：A9 完全改写型（同义换词、字面几乎不重叠）top5 从 40% → **>60%**。不动嵌入模型、不加新模型，只调精排的**池深**与**名次融合方式**。
+
+#### 11.28.1 两个必须先修的地基（否则扫描结果全错）
+
+| 失效 | 症状 | 修法 | 位置 |
+|:--|:--|:--|:--|
+| HNSW 检索宽度 | `hnsw.ef_search` 默认 40，`k>40` 时只回 `min(LIMIT, ef_search)` 行 → 深池静默退化成浅池（实测 `k=150` 只回 40 行） | `_ensure_ef(c, k)`：`SELECT set_config('hnsw.ef_search', max(40,k), false)`（`_conn` 是 autocommit 单例，`SET LOCAL` 无效，只能会话级）；深池再开 `iterative_scan=relaxed_order` + `max_scan_tuples=max(40000, k*200)`。`_conn()` 每次新连接重置缓存标志 | `pg_bridge.py:45-52`（常量 `_HNSW_EF_FLOOR` / `_HNSW_EF_NOW` / `_HNSW_ITER`），`_vec_channel()` 开头调用 |
+| 重排静默降级 | 14:35 另一会话起 OCR + 4B 决策模型把 12G 卡吃到剩 415 MiB → 11437 被 OOM 杀掉（非崩溃日志，进程直接消失），此后**所有**查询静默退回融合序，那阵子跑出的 para 40% 是「无重排」成绩 | 开火前显存预检：成功重排后 `_RERANK_WARM_SEC`(300s) 内跳过；否则 `_vram_free_mib() < _RERANK_VRAM_MIN`(800) 就当场降级并写 `rerank_status(reason="vram_low")`。异常分支区分 `endpoint_error` / `no_scores` / `partial_scores`；**部分缺分不再整套弃用**，缺分项压到尾部 | `_rerank_items()` / `rerank_status()` |
+
+**判断「到底有没有真重排」只看一处**：`pg_bridge.rerank_status()`。`reason` 出现 `vram_low / endpoint_error / no_scores / partial_scores` 即已降级，此时任何成绩都不能当「有重排」用。
+
+#### 11.28.2 池深扫描（75 条真实 query，top_k=5）
+
+| `BOSHI_RERANK_POOL` | overlap t1/3/5 | paraphrase t1/3/5 | A5 t1/3/5 |
+|--:|:--|:--|:--|
+| 15（旧默认） | 13/17/18 | 6/10/10 | 31/34/34 |
+| 40 | 13/17/18 | 6/8/11 | 31/34/34 |
+| 60 | 13/18/19 | 6/8/11 | 31/34/34 |
+| 80 | 13/18/19 | 7/9/12 | 30/34/34 |
+| **100（定档）** | **13/18/20** | **7/9/12（60%）** | **30/34/34** |
+| 120 | 13/18/20 | 7/9/12 | 30/34/34 |
+| 150 | 13/18/19 | 7/9/10 | 30/34/34 |
+
+**100 是收益拐点**，120 等于 100，150 反而回落（更深处的候选开始把真目标挤下去）。
+**未命中的 8 条 para 分两类**：`d13aed83 / a457b574 / 89a147e0` 连 800 深度的向量池都不在（**失败在召回层**，加池深无解）；池内近失 5 条名次 8/12/19/25/27（不是「差一点排名」，是模型本身不认这种改写）。**池内但 rr>40 的 0 条** → 没有一条是「池够深就能救」的。
+
+#### 11.28.3 融合序 × 重排的 RRF 混合：实验后否决
+
+动机：纯重排**会救一批也打掉一批**（para `8b027120` 融合序第 1 → 重排后第 19；反向 para `c0abea75` 融合序 50 → 重排第 4）。做法：`key = W_RK/(K+重排名次) + W_FU/(K+融合名次)`，只让融合前 `HEAD` 名投票（`pg_bridge.py:1571-1574`，`BOSHI_BLEND_*`）。
+
+**测量方法上的坑（重要）**：先用 `eval/p14_blend.py` 各跑两遍取两串名次，但采集用 `top_k=DEPTH=60`，名次与生产（`top_k=5`，池内截断不同）**不可迁移**，得出的收益是假的。改为 **trace 复算**：`BOSHI_RERANK_TRACE=<dir>` 让 `_rerank_items` 把 `{q, fu, rs}` 落 `trace.jsonl`，`eval/p14_trace_grid.py` 用 rs 降序重建重排名次并配对 75 条用例，离线扫 `w_rk × w_fu × K × head`。
+
+生产口径复算基线：
+
+| 排序 | overlap t1/3/5 | paraphrase t1/3/5 | A5 t1/3/5 |
+|:--|:--|:--|:--|
+| 融合序（`BOSHI_RERANK=0`） | 10/15/18 | 4/5/8 | 22/30/32 |
+| 纯重排（默认） | **13/18/20** | **7/9/12** | **30/34/34** |
+
+病例分型（gold 是否进前 5）：**两侧都进 56 条、只有重排进 10 条、只有融合序进 2 条**（para `8b027120` fu=1/rr=19/gold 重排分 −3.461；A5 `90161ac0` fu=2/rr=13）、两侧都没 7 条 → 重排 **5:1** 压倒融合序。blend 每救回 1 条就要打掉重排独有的大跨度命中：`89a147e0`（融合 93 → 重排 2）、`3f1be78e`（融合 31 → 重排 4）、`0d28d510`（7→1）、`bc695685`（75→1）、`f6c71ce8`（9→5）。
+四档「给融合 top1 留固定名额」全试：**插第 1 位** A5 top1 塌到 26；**插 2/3 位** para 零收益（7,10,12）；**插 4/5 位**与纯重排完全等价（无效）。网格最优 para 13/20 的配置（rk1.2/fu0.5/K10/head1）一律伴随 overlap 掉到 17-18、A5 top1 掉到 25。
+
+→ **`_BLEND_W_FU` 默认 0（纯重排）**，代码保留 `BOSHI_BLEND_*` 供对照复跑。`rerank_status()["blend"]` 会回显四个权重，便于确认线上到底是哪种。
+
+#### 11.28.4 延迟成本与杠杆（全部试过，都无效）
+
+75 条真实 query（A9 40 + A5 35），`eval/p14_latency.py`，重排常驻、3060 12G：
+
+| 配置 | p50 | p95 | max | para top5 |
+|:--|--:|--:|--:|:--|
+| `BOSHI_RERANK=0`（纯融合序） | 64 ms | 92 ms | 106 ms | 8/20 |
+| pool 40 | 976 ms | 1386 ms | — | 11/20 |
+| pool 60 | 1211 ms | 1682 ms | — | 11/20 |
+| pool 80 | 1496 ms | 2144 ms | — | 12/20 |
+| **pool 100** | **1701 ms** | **2527 ms** | 2693 ms | **12/20** |
+
+分类（pool 100）：overlap 1471/1854、paraphrase 1571/1826、A5 2121/2620 ms。
+
+| 试过的省法 | 结果 | 结论 |
+|:--|:--|:--|
+| `BOSHI_RERANK_CHARS` 700→300/200/120 | p50 1456/1280/1113 ms，但 para 掉到 11/11/9 | 真实记忆平均仅 **约 288 字**，截短省不了 token 却直接掉质量 → 保持 700 |
+| `BOSHI_RERANK_CHUNK` 2200→3500 | p50 1817 ms，**更慢** | 请求数/批量不是杠杆 |
+| 请求并发 2/4 线程；另起 `-np 4 -c 16384` 实例 11441 | 2770 → 2517/2527 ms（约 **9%**）；新实例 2792 → 2644 | 生产日志本就 `n_slots=4`，rerank 路径不吃并行 |
+| 确认是否在用 GPU | `--list-devices` → `CUDA0: RTX 3060`；50 条×260 字 1286 ms，期间 nvidia-smi **90~99% util / 5521 MiB** | 算力已打满（约 8-10k tok/s），非 CPU 回退、非显存不足。日志无 `offloaded` 行是该构建的输出差异 |
+| **置信度门控升级**（浅池 40 → top1 logit < thr 才扩 100） | thr=1.0：升级 15/75，ov 13/17/19、para 7/9/12，均值 1.59 s、p95 3.02 s | **否决**：质量仍低于单跑深池，而浅池单跑已 1.26 s、深池边际只 +0.44 s，门控省不下时间却要两趟精排 |
+
+**结论**：池深 × 每条正文是唯一成本杠杆，100×700 的 **p50 1.7 s / p95 2.5 s** 是 3060 上的固有成本。Hermes 每轮 `prefetch` 在后台异步、预算 8 s，占约 21%。嫌慢的现成档位：`BOSHI_RERANK_POOL=40` → 976 ms / para 55%（不达 60% 目标）。
+
+#### 11.28.5 复跑方式
+
+```bash
+cd ~/.boshi
+# 质量（A9 40 + A5 35，单行 SWEEP JSON → logs/p14_sweep_<tag>.json）
+A9_ASOF=1792461898 BOSHI_FM_STATS=0 ./venv/Scripts/python.exe eval/p14_sweep.py final_default
+# 延迟（75 query，含 rerank_status → logs/p14_latency_<tag>.json）
+A9_ASOF=1792461898 ./venv/Scripts/python.exe eval/p14_latency.py p100
+# 回归
+PYTHONPATH=. ./venv/Scripts/python.exe tests/test_rerank_blend.py
+PYTHONPATH=. ./venv/Scripts/python.exe tests/test_rerank_guard.py
+```
+
+`A9_ASOF=1792461898` 固定时间窗（`where={"created_at":{"$lte":ASOF}}`），不固定会因后写入的记忆改变 gold 名次。跑之前先 `pg_bridge.rerank_status()` 确认 `ok:true / reason:""`。
+
+
+#### 11.28.6 自适应池深：锚点查询走 40、纯中文走 100（2026-10-21 落地，默认开）
+
+§11.28.2 的扫描里有个被忽略的信号：**A5（带锚点的真实查询）在 pool 40 时 top1 = 31/35，比 pool 100 的 30/35 还高一条，延迟却只有 976 vs 1701 ms**；而 A9 改写型依赖深池（para 40 → 6/8/11，100 → 7/9/12）。两类查询的最优池深本来就不同，用一把刀切必然有一侧吃亏。
+
+实现（两颗旋钮都不一样，别混）：
+- `pg_bridge.py:1583-1587` `_RERANK_POOL_ANCHOR = int(os.environ.get("BOSHI_RERANK_POOL_ANCHOR", "40"))`，**`0` = 关闭分档**（全部回落到 `_RERANK_POOL`）。
+- `pg_bridge.py:1831-1836`：`_rp = _RERANK_POOL_ANCHOR if (_RERANK_POOL_ANCHOR > 0 and _has_anchor(query)) else _RERANK_POOL`，然后 `pool_k = max(int(pool_k), _rp)`。判据 `_has_anchor(query)` 走 `pg_bridge.py:706` 的 `_ANCHOR_RE = [A-Za-z][A-Za-z0-9_.+\-]{1,}|\d{2,}`（英文标识或两位以上数字）。
+- `rerank_status()` 多返一个 `"pool_anchor"` 字段，用于确认进程里真的是 40（模块级常量，改环境变量必须重启进程）。
+
+实测（`eval/a5_eval.py` + `eval/p14_latency.py`）：A5 auto top1 30/35、top3 34、top5 34（与 pool-40 基线一致，rrf 参照 31/35 不变）；延迟 ALL p50 **1701 → 1598 ms**、p95 **2527 → 2481 ms**。
+
+**重要边界（别再往这个方向省时间）**：降幅只有 ~6%，说明 **p50 的主成本是 query 嵌入 + DB 扫描，不是精排候选数**。§11.28.4 那张表里「削正文长度 / 加并发 / 浅池门控」全部无效也是同一个原因。要再快只能换嵌入与查询路径，而不是继续调精排。
+
+#### 11.28.7 复跑方式（分档版）
+
+```bash
+cd ~/.boshi
+# 默认（锚点 40 / 纯中文 100）
+./venv/Scripts/python.exe eval/a5_eval.py
+./venv/Scripts/python.exe eval/p14_latency.py anchor40
+# 对照：关掉分档，等效全 100
+BOSHI_RERANK_POOL_ANCHOR=0 ./venv/Scripts/python.exe eval/p14_latency.py all100
+```
+
+### 11.29 `boshi doctor`：把「静默降级」变成可见项（2026-10-21）
+
+本系统有三类**不报错但变笨**的失效：精排被 OOM 杀掉后退融合序、PG 没起走本地兜底、嵌入探针打到错的后端。三者共同点是「读起来正常、结果变差」。`doctor.py` 逐项实测并把结论压成 ✓/!/✗，退出码 1 = 有 ✗，可直接给 cron。
+
+| 组 | 项 |
+|:--|:--|
+| A 依赖与进程 | PG 版本与连接耗时、插件 `memory.provider`、`memory_enabled`、boshi 三表（memories/graph_edges/fm_stats）、精排探针 + pool/pool_anchor/blend、模型文件、嵌入维数 = 1024 |
+| B 数据卫生 | 有效行/总行、图谱边数、主题分布、embedding 空值（排除 `topic='mental_model'`，按设计不嵌入）、created_at 空值、槽位覆盖率、心智模型页龄 vs `STALE_HOURS=24`、经验层 `by_status` |
+| C 检索自检 | `slots.extract` 探针（files/ports/versions/boundary_envs 都要非空）、`boshi.fm_stats` 近 3 天、两条真实检索（锚点 query 断言池深 40，纯中文断言 100） |
+
+三个设计要点：
+1. **精排不能用 `_RERANK_STATUS` 判断**——它只记录本进程上一次真实调用，新进程初始 `ok=False / reason=''`，会误报「端点在线但上次调用失败：」。doctor 改用主动探针：3 条假 items 调 `pb._rerank_items("PG 连接超时怎么排查", probe, 3)` 再读状态（实测 170 ms 左右）。
+2. **`memory_enabled` 必须是 true**：它管「内置 memory 工具存不存在」，`provider=boshi` 只把这个工具的落库后端换成伯仕；设 false 工具直接消失，记忆写不进去（源码 `hermes-agent/tools/memory_tool.py:270-282`）。早期理解成「让位给插件」是错的。
+3. `--fast` 只跳 C 组（C 组含两条真实检索，多花约 5 s）；`--fix-ts` 回填 created_at 空行（取该 profile 最新写入时刻，并打 `meta.created_at_derived=true` 留痕；UPDATE 不带 RETURNING 时 psycopg2 不能 `fetchall()`）。
+
+现状：`--fast` 14 项 14✓（7.2 s），全量 18 项 18✓（11.5 s）。
+
+
+## 11.30 2026-10-21 20:5x 三项一致性整改（版本单源 / 未了事项质量门 / 图谱实体噪声门）
+
+来源：用户在看到「三件整改项诊断报告」后直接下指令 **「你不需要建议，你报告我之后就直接执行修复」**，因此本节记录的是已落地并实测的改动，不是方案。
+
+### 11.30.1 版本号三处不一致 → 单一常量源（统一 7.1）
+
+整改前同一套代码对外报三个版本：
+
+| 位置 | 原值 | 谁在读 |
+|:--|:--|:--|
+| `boshi_core.py` `status()` 返回值 | `"version": "6.0"` | `boshi_cli.py` status、`boshi_mcp_server.py` 的工具返回、插件 `__init__.py` 注入头 |
+| `boshi_mcp_server.py` `MCPServer(...)` | `"6.1.0"` | MCP 客户端 `initialize` 的 serverInfo |
+| `memory/VERSION` | `5.4.0` | 无代码读取（纯遗留文件） |
+
+改法：`boshi_core.py` 模块级新增 `__version__ = "7.1"`（带注释说明三方冲突的来源），`status()` 返回 `__version__`；`boshi_mcp_server.py` 从 `boshi_core` 导入 `__version__` 并传给 `MCPServer("boshi-memory", version=__version__)`；`memory/VERSION` 写 `7.1.0`。
+
+**刻意不动**：`plugins/boshi/plugin.yaml` 的 `1.0.0` 是**插件自身**版本（与记忆引擎版本解耦，改了会让 Hermes 认为插件变了）；`register_docs_index.py` 内的 v5.3/v5.7/v5.8 是**文档条目版本**；`memory/memory_relations.py` 的 `"5.8"`、`tiered_memory/` 与 `integrity_guard` 里的数字是**落库数据格式版本**（改了会让老数据被误判不兼容）。
+
+实测：`boshi_core.status()` → `version 7.1`（6453 条记忆 / kg nodes 7514 edges 77825）；`boshi_mcp_server.create_server()` → `boshi-memory 7.1`。
+
+### 11.30.2 未了事项页（`open_threads`）质量门
+
+根因两层，都在**读取侧**，不动写入侧：
+
+- `slots.py:77` `OPEN_Q=("待","未合并","未解决","需要确认","TODO","下一步","还需","还没")` 是纯字面命中，陈述句（「…尚未完成，等我召唤你再继续」）也会被抽成 open_questions；
+- `mental_model.py` 原 `_page_open_threads` 只有 `ORDER BY created_at DESC LIMIT 25` + `q[:1]`，**没有任何质量门**，所以 top1 直接是用户状态播报。
+
+实测 25 个候选：`assistant_conclusion` 23 / `conversation` 1 / `todo` 1，**带问号 0 条** → 不能简单用「必须有问号」一刀切。
+
+终版门（纯字面/形态，零模型调用）：
+
+- `_OPEN_CLOSED_KW`（正式关闭/已关闭/已推送/已合并/作废/不用了…）与 `_OPEN_META_KW`（你还没选/什么都没动/等你回来/等我召唤…）→ 直接丢弃：这是**元语言**，描述的是「这次问答没结果」，不是待办；
+- 断言式开头 `_OPEN_LEAD_DROP=("没有","不是","无法")` → 丢弃；
+- `topic == "conversation"` 且无问号 → 丢弃（用户提问是真未了事项，用户陈述不是）；
+- 其余必须**带问号**或命中 `_OPEN_TASK_KW`；
+- 分档 `_open_thread_rank()`：`0`=命中 `_OPEN_STRONG_KW`（待你/等你/待办/TODO/下一步/未开工…），`1`=弱信号（只有「还没/尚未」这类字面）且 `len<=_OPEN_WEAK_MAX(60)`，`2`=丢弃。**弱信号+长句一律丢**，因为反例实证：一条读书笔记「…区分我们真做到了的和还没做到的」会命中「还没做」。
+
+页面组装：`SELECT id::text, topic, slots->'open_questions' AS q … LIMIT 40`（原 25 → 40，给质量门留余量），每条先 `re.sub(r"\*\*(.+?)\*\*", r"\1")` 剥成对加粗（否则槽位里 `**都还没动手**` 会留下断句残形）、再剥行首 `- `，然后 `_worth(text,15)` → 分档 → `sort(key=_rank)`（稳定排序，强待办在前、各自保持时间倒序）→ `_dedupe(key_len=36)[:6]`。
+
+**为什么不改 `slots.py` 的 OPEN_Q**：该关键词也参与 BM25/召回打分，改字典会让既有召回指标（A5/A9）全部失效、需重跑整套评测；只改页面层可逆且不影响检索。
+
+重建实测（`mm.rebuild`）：
+- `profile='default', scope='self'` → built identity/env/pitfalls/open_threads，空 active_projects。**空是正确结果**：`boshi.memories` 里 topic='project' 共 286 行，按 profile 分布 opencode 205 / desktop 80 / default 1（2026-08-16，超 45 天窗口）；此前 20:28 那份有 6 条项目行的页是 **opencode** 的页，不是 default。
+- `profile='opencode'` → 5 页全建 168 ms。
+- 整改前 default 页的 6 条垃圾（用户「暂停…等我召唤」/问询超时了/选择框超时/「没有中说明还没ocr完成」/v3片头已落地/RAG 读书笔记 + `**都还没动手**` 残形）**全部消失**，重建后 6 行全是待办型（待你/等你/TODO）。
+
+单测：`tests/test_mental_model.py` 新增 `OpenThreadGateTest` 7 条（用户陈述拒 / 用户提问留 / 完成播报拒 / 元语言拒 / 弱信号长句拒 / 强待办长句留 / 弱信号短句 rank=1）。
+
+### 11.30.3 图谱实体噪声门（`is_noise_entity`）
+
+根因：`knowledge_graph.py:673` 中文后缀正则 `([\u4e00-\u9fa5]{2,6}(?:系统|模型|引擎|工具|库|站|平台|框架|项目|技能|插件))` 前缀允许任意 2~6 汉字，无虚词检查，于是从自然句里切出「进了记忆库 / 只有记忆库 / 了你说的工作站 / 一个没在线的模型」。
+
+实测规模（直连 PG）：`boshi.graph_edges` 77,597 边，entity_a 6,242 / entity_b 6,855 / 去重实体 **7,505**；其中含虚词/助词字 **1,407（18.7%）**；中文后缀式实体 2,447，含助词 **1,395（57%）**。`relation` 字段 **100% 为空**（NULL 46,561 + 空串 31,036）→ 图谱当前只能表达「两词共现」，无关系语义（另立专项，不在本轮）。
+
+改法：
+
+- 模块顶部补 `import re`（原先只在 `learn_entities` 内部局部 import，模块级使用会 `NameError: name 're' is not defined` —— 首次导入实测就崩在这里）；
+- 新增 `is_noise_entity(name)`：空 → 噪声；**不含 CJK → 放行**（`MiniMax H3` / `RTX 3060 12GB` / `HTTP 200` 这类带空格符号的名字必须活）；白名单 `_ENT_WHITELIST={"乐之","伯仕","伯仕记忆","伯仕记忆系统","俱舍论","佛光大辞典"}` → 放行；`KNOWN_ENTITIES`（45 条）命中 → 放行；再依次判标点、CJK 间空格、虚词字 `_ENT_FUNC_CHARS`、噪头 `_ENT_NOISE_LEAD`。
+- 写入侧：`learn_entities` 中文后缀循环里 `if is_noise_entity(cand): continue`。
+- 读取侧：`search()` 无 query 分支、模糊匹配分支、`KNOWN_ENTITIES` 兜底都过滤；`query()` 任一端为噪声则跳过该边。
+- **存量不删**：只做读时过滤 + 写时拦截，可随时回滚。
+
+实测：7,514 实体 → 判定噪声 **1,428（19.0%）**，保留 6,086，最多影响 ≤13,330 条边；`learn_entities('Cursor 的 ComfyUI 插件今天给记忆库写了三条，只有记忆库里的一个没在线的模型没用；伯仕记忆系统正常，Qwen-Image 工具链加载中。')` → 只抽出 `['Qwen-Image','Cursor','ComfyUI']`。
+
+坑：第一版规则把「含空格/标点即噪声」也套到了 ASCII 名字上，`RTX 3060 12GB`、`MiniMax H3` 会被误杀 —— 先判「有没有 CJK」再判形态。「乐之」也会被虚词字「之」误杀，只能靠白名单救。
+
+单测：新增 `tests/test_noise_entity.py` 5 条（碎片是噪声 / 白名单存活 / ASCII 实体存活 / 中文技术词存活 / 空串是噪声）。
+
+### 11.30.4 回归
+
+`python -m unittest discover -s tests -q` → **Ran 192 tests, OK (skipped=1)**（20:05 基线 180，新增 7+5=12 条全绿）。落地后需**重启 Hermes** 才让插件进程加载新的 `knowledge_graph.py` / `mental_model.py`（页面数据本身已在库里）。
+
+## 11.31 精排服务按需拉起（2026-10-22，**默认开**，`BOSHI_RERANK_AUTOSTART=0` 关）
+
+**为什么之前是半成品**：10-10 的「使用即拉起」只实现在**嵌入**服务 `projects/BuddhistRAG/embed_client.py::ensure_service()`；精排走的是 `pg_bridge._rerank_items()` 直连 HTTP `127.0.0.1:11437`，**从未接过这个钩子**。10-21 只给启动脚本加了 `--sleep-idle-seconds 600`（空闲让显存，但前提是进程已经在跑），日志却把整套设定写成「已生效」——半成品说成成品。可观测后果：重启电脑或进程被外部杀掉后，检索**永久**静默退化成融合序（`relevance=null`、`confidence=unknown`），直到有人手动双击 bat。
+
+**接入点**（`pg_bridge.py:1840-1856`）：`_rerank_items` 进熔断判断后，先 `_rerank_port_alive()`；端口不通才 `_ensure_rerank()`，成功则 `woke_now=True`：
+
+| 顺序 | 判据 | 失败 reason | 动作 |
+|:--|:--|:--|:--|
+| 1 | 端口 TCP 通（0.4s） | — | 直接用（睡眠态也算通，首个请求 +3.5s 自唤醒） |
+| 2 | 开关 `_RERANK_AUTOSTART` | `service_down` | 返回原序 |
+| 3 | 拉起冷却 `_RERANK_SPAWN_COOLDOWN=120s` | （沿用上次 reason） | 防拉起风暴 |
+| 4 | 显存 ≥ `_RERANK_VRAM_MIN=800MiB`（`_vram_free_mib()` 带 20s 缓存） | `vram_low` | 返回原序 |
+| 5 | Popen 成功 | `autostart_failed`（detail 带异常原文） | 返回原序 |
+| 6 | 轮询 `/health` 至 `_RERANK_AUTOSTART_WAIT=25s` | `autostart_timeout`（detail 带日志路径） | 返回原序 |
+
+**关键设计**：`woke_now=True` 时**跳过** `_RERANK_WARM_SEC` 显存自检 —— 刚加载完权重必然占着显存，此时再判「余量 < 800MiB」会立刻降级，等于白拉；且 `_VRAM_CACHE` 有 20s 缓存，读数本就滞后。
+
+**函数**：`_rerank_endpoint():1697` 正则拆 URL → `_rerank_port_alive():1705`（TCP 0.4s）→ `_rerank_ready():1715`（GET `/health` 认 2xx，**睡眠态也返 200，不能用它判断是否在显存**）→ `_spawn_detached():1726`（`DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP|CREATE_BREAKAWAY_FROM_JOB`；受限 job 下 `OSError` 退回到不带 breakaway）→ `_start_rerank_service():1749`（与 bat 同参：`--rerank --host --port -c 8192 -b 4096 -ub 4096 --sleep-idle-seconds 600 -ngl 99`）→ `_ensure_rerank():1767`。
+
+**脱离子进程树已实测**：拉起它的 python 进程退出后服务仍在（`ppid` 指向已死 PID，端口照通），断电重启后由下一次检索再拉。
+
+**实测**：
+
+| 场景 | 结果 |
+|:--|:--|
+| 检索触发（03:54:27） | `pid=13576` → `03:54:30` 就绪 **3.2s**；「俱舍论是什么」`relevance=0.9947/0.9943 confidence=high` |
+| doctor 触发（03:56:15） | `pid=4376` → 就绪 **3.7s**，doctor 记 4.1s（含端口探测） |
+| 热态第二问 | 0.96s（同一进程） |
+| 新进程首问 | 8.4s —— 大头是**进程内 ONNX bge-m3 冷启**（doctor 实测 5996ms），与重排无关 |
+| 同查询 12.97s | 冷启 ONNX + 拉起 3.2s + 检索，一次性成本 |
+
+**观测面**：`rerank_status()` 增 `autostart / port_alive / spawn_cooldown / last_spawn / last_start`；每次拉起写 `~/.boshi/logs/pg_autostart.log`（`rerank 按需拉起：pid=… port=11437` / `就绪：3.7s` / `降级：<reason>`），服务自身 stdout 落 `~/.boshi/logs/rerank_server.log`。
+
+**doctor 同步改判定**（`doctor.py::check_rerank`）：端口不通且 `autostart=on` 时，**不再报故障**，而是主动拉一次并把耗时写进「✓ 精排未在运行 → 按需拉起成功（4.1s）」；拉不起来才 `fail` 并指向 `rerank_server.log`；只有 `BOSHI_RERANK_AUTOSTART=0` 才回到「手动起」的措辞。体检 20 项仍全绿。
+
+**单测**：`tests/test_beta_fixes.py::TestRerankAutostart` 7 条（已在跑不重复拉 / 禁用 → `service_down` / 显存不足 → `vram_low` / 拉起抛异常 → `autostart_failed` 且不向上抛 / 拉起成功 / 冷却阻止第二次 Popen / 拉不起时原序 + reason）。全量 `Ran 20 tests OK`。
+
+**坑**：
+
+- venv 无 pytest，用 `~/.boshi/venv/Scripts/python.exe -m unittest tests.test_beta_fixes -v`；
+- git-bash 里 `taskkill //PID` 会报「无效参数」，用 `powershell -Command "Stop-Process -Id N -Force"`；
+- 单测会调 `_ensure_rerank` 并写生产日志，`setUp` 必须把 `_RERANK_LOG` 改指临时文件。
+
+**回滚**：`BOSHI_RERANK_AUTOSTART=0` 即回纯手动（行为等同 10-21 之前）；显存紧张时也可临时这样关，避免检索时多占 650~800MiB。
+
+## 11.32 版本号 `v` 前缀规则定案 + 大写 `V` 补抽（2026-10-22）
+
+§11.10 当时留了个开放问题：「`v1.2.3.4` 与 `1.2.3.4` 该不该归一」。本轮定案（用户委派我决定），并顺手补掉了查证时发现的真实缺口。
+
+**规则三句话**
+
+| 层 | 规则 | 代码位置 |
+|:--|:--|:--|
+| 抽提层 | `v` 和 `V` 都收：`RE_VER` 的 `v?` → `[vV]?`，`RE_VER4_V` 的 `v` → `[vV]` | `slots.py:46` / `slots.py:55` |
+| 存储层 | **不归一**：存原串（`V2.5` 不会写成 `v2.5`） | `slots.py::_versions()` |
+| 比较层 | 唯一归一入口 `_fm_ver`（剥 `^[vV]\s*`），两边同函数 | `pg_bridge.py:1372` `_RE_VER_STRIP` |
+
+为什么抽提层要改：大写 `V` 在 Python `\w` 里，`(?<![\w.])` 这条负向断言把 `V2.5` 的**两个**分支（带前缀、裸号回退）一起堵死 → 全库 33 行 `MiMo V2.5` / `Qwen-Image V4.1` / `GLM V2.6` 这类写法整颗漏抽，查询侧同样抽不到，fm 通道直接不命中。
+
+为什么存储层不归一：槽位不变式是「值是原文连续子串，可溯源」；把 `v1.2.3.4` 改写成 `1.2.3.4` 会让槽位变成拼装产物（§11.20 的同一条不变量）。归一放比较层做一次就够：`v1.2.3.4` == `V1.2.3.4` == `1.2.3.4`，而 `0.1.43` ≠ `0.1.43.1`（不做前缀包含）。
+
+**附带的第 4 处修正**（`slots.py::_versions()` 内）：`text[s-1] in "=＝~"` 的「参数值不是版本」规则原本会连 `V4.1` 一起吞（实测 `deepseek-flash=V4.1-Flash` 只抽到末段的 `0.30`）。现改为**仅当 token 无 v/V 前缀时**才按参数值丢弃：`_KW_LENB=0.5` 仍然挡住，`MODEL=V4.1` / `hermes-web-ui=v0.7.21` 能进槽位。
+
+**影响面（`backfill_slots.py` 实测）**
+
+- 首次 `--dry-run`：总行 6566 / 差异 117（原为 NULL 88）。117 里只有 29 行是本次规则差异，其余是 10-20 回填之后新落库、从未回填过的行。
+- `--apply` 后 dry-run 差异 0；再补 `=` 例外后又 apply 3 行（备份 `backups/slots_backfill_20261022-074212.json` 117 条 / `-075143.json` 3 条）。
+- 现状：含 v/V 前缀版本值的行 363，其中大写 `V` 开头 **28 行**；正文含 `V\d+\.\d+` 的 33 行里 29 行已抽到，剩下 4 行是 `真实电影质感V0.1` 这种**紧贴中文或 LoRA 文件名**的写法——`(?<![\w.])` 有意不收（`anything-v5` / `Juggernaut-XL_v9` 同理）。
+
+**对抗集**（`tests/test_slots.py::TestVersionPrefixCase`，7 例）
+
+| 输入 | versions |
+|:--|:--|
+| `MiMo V2.5 这个总参多少？` | `['V2.5']` |
+| `Qwen-Image V4.1 已发布` | `['V4.1']` |
+| `升级到 V0.1.44.1 后正常` | `['V0.1.44.1']` |
+| `对比 GLM V2.6 / V2.5` | `['V2.6','V2.5']`（原样，不转小写） |
+| `AV1.2 编码 与 SV2.0` / `V2 接口` / `IP 172.16.0.219` / `温度 0.7 阈值 0.85` / `vllm…api_server --host 0.0.0.0` / `参数 _KW_LENB=0.5` | `[]` |
+| `deepseek-flash=V4.1-Flash 峰时报价` | `['V4.1']` |
+
+**比较层验证（离线，不经检索）**：doc = `MiMo V2.5 这个总参多少？…` 时，query `MiMo V2.5` / `mimo v2.5` / `MiMo 2.5` 三者 `_fm_hits` 都含 `versions`；`MiMo V2.6` 不含 → 大小写与 `v` 前缀都不影响判等，只有版本号本身影响。
+
+**回归**：`./venv/Scripts/python.exe -m unittest discover -s tests` → **Ran 254 tests, OK (skipped=1)**；`backfill_slots.py --dry-run` 差异 0（除本轮之后新落库的 1 行 NULL 外）。A5 35 条 gold：见下节追加行（运行中，完成即补）。
+
+**回滚**：`[vV]` 改回 `v` 后 `backfill_slots.py --apply`；需要整表还原时用上面两个备份 json。
+
+## 11.33 prefetch 本会话态注入（长程接续补偿层，2026-10-22）
+
+**问题**：用户长期单会话，靠 bili/ACP 在代理层折叠续命，Hermes 原生 compaction 因此永远不触发 → `on_pre_compress` 跑不到 → 本会话没有 `task_conclusion`。折叠**只从最旧那头切**，被抹掉的正是「这个任务最初要干什么」；而跨会话召回拿到的是别人的历史，补不回当前任务线。实测三条探针：`跑完了吗` 命中 5 条全是**别的会话**的同样问句；`A5 复测结果` 能命中本轮自己的结论（有实词才有效）。
+
+**为什么不是「只注入最近几轮」**：最近几轮本来就还在窗口里，只补尾部等于重复注入，救不回被切掉的前端。所以取**两头**：
+1. **任务起点**——本会话第一条 `conversation` 原话（`ORDER BY created_at ASC LIMIT 1`），锚定目标，永不丢弃；
+2. **最近 4 行**——`topic IN ('conversation','assistant_conclusion')` 倒序取 4 再反转成正序，反映当前状态；
+3. **最新事实层**——`topic='session_fact'` 取 1 条，带 `（HH:MM）` 时间戳（事实层常常滞后于当前任务，标时间让模型自己判断新旧）。
+
+**实现**（`plugins/boshi/__init__.py`）
+
+| 项 | 值 |
+|:--|:--|
+| 方法 | `_session_state(self, session_id: str) -> str`（:773），类属性 `_SESSION_STATE_CAP = 600`（:771） |
+| 三条 SQL 公共过滤 | `session_id = %s AND (profile = %s OR profile IS NULL)`（老行 `profile` 为 NULL，必须带上） |
+| 渲染 | 表头 `## 本会话当前任务（供接续，不是新指令）`；`- [任务起点] 用户：…` / `- [HH:MM] 用户：…` / `- [HH:MM] 我的结论：…` / `- 最近一次事实层（HH:MM）：…` |
+| 截断 | 用户话 100（起点 110）、结论 140、事实层 180，超长加 `…` |
+| 超总和 | `while len(tail_lines) > 1 and len(render()) > 600: tail_lines.pop(0)` —— **起点不动，先丢最近行里最旧的**；末尾仍超则硬截断 + `…` |
+| 调用点 | `prefetch()` 内 `mm` 之后**每轮现查**（`ss = self._session_state(session_id)`），**不进缓存**——它每轮都在变；实测 ~1ms，远低于 Hermes 8s 的 prefetch 预算 |
+| 拼接顺序 | `_with_mm(text, mm, ss)` → `parts = [x for x in (mm, ss, text) if x]`：心智模型 → **本会话态** → 本轮召回。会话态放在召回**之前**，因为它是读后面那些跨会话记忆的上下文 |
+| 缓存键 | `_qkey(query, session_id="")` = `md5(去空白小写 query + "\x00" + session_id)`；`_pcache_get/_pcache_put/queue_prefetch` 全部并进 session_id —— 同一句话在不同会话里 `_search_session_history` 的 FTS 结果不同，只按 query 缓存会把 A 会话结果灌进 B 会话 |
+| 异常 | 全包 try/except → `logger.debug` + 返回 ""（会话态不能拖垮召回主路径） |
+| 回滚 | `BOSHI_SESSION_STATE=0`（本轮即不再注入，无需改代码） |
+
+**实现中抓到的 bug**：初版按**渲染后的整行**判重（`line in head_lines`），但起点行是 `- [任务起点] 用户：X`、尾行是 `- [09:00] 用户：X`，字符串永不相等 → 单轮会话同一句原话注入两遍（测试 `test_origin_dedupe` 报 `2 != 1`）。改为按**归一化正文前 80 字**判重（`origin_key`），注释写明不能比渲染后的行。
+
+**测试**：新增 `tests/test_session_state.py`（11 例，含真实库用例 `RealDbTest.test_real_session_state`）——拼接顺序、回滚开关 + 空 session_id、DB 异常静默、起点在首行且时间正序、超长时保起点保最新、起点判重、仅事实层、全空返回空、qkey 含 session、pcache 按会话隔离。全量：**`Ran 265 tests, OK (skipped=1)`**（`tests/test_mental_model.py::PluginTest.test_with_mm` 原为源码字面量断言，已同步到新实现体）。端到端探针（真实会话 `mtntnmgwkbvkac`）：注入 456 字符，首行表头，含 `[任务起点] 用户：hermes升级了，请检查伯仕记忆系统工作正常吗？` 与 10:35/10:36 三条原文，段落顺序 mm→ss→recall 正确，`BOSHI_SESSION_STATE=0` 时返回空串。
+
+**已知边界**
+- **重启才生效**：正在跑的 Hermes 进程在 13:23:32 已 import 旧模块，`_session_state` 不在其中；需重启 provider/进程才能看到注入（日志关键字 `boshi[诊断] 本会话态注入：`）。
+- **不产生 `session_fact`**：注入层只读不写；事实层仍由 `sync_turn` 第 3 步零模型门控写入（只采用户侧 `决策/待办` 槽位）。当前会话事实层停在 07:55 的旧任务上，注入时靠时间戳暴露其陈旧。
+- **与 bili 的分工**：bili 保证「原文不丢、可按地址取回」（本地 `content` 表 19,747 行 / 77.31 MB），本层保证「知道该取回哪一段」。两层互补，都不足以单独维持长程连贯。
+
+## 11.34 数据层委托 boshi venv 子进程（RPC，py3.14 兼容，2026-10-23）
+
+**问题**：10-23 09:19 一次 hermes 源码更新把运行时切到 **Python 3.14.9**。伯仕插件原本**在 hermes 解释器里内联 `sys.path` 导入 `~/.boshi` 数据层**（`import boshi_core` → 触发 `chroma_bridge` → `onnx_embed` → `onnxruntime`）。但 `onnxruntime>=1.20` **没有 3.14 的 wheel**，uv 解析失败，hermes PM 在启动时自动把 boshi 插件**禁用**（日志：`Disabled plugin 'boshi': the dependency environment no longer builds with it`），叠加同日一笔配置把 `memory.provider` 清空 + 写进 `plugins.disabled`，🦄 图标就此消失。数据层本体其实健康——它跑在伯仕自己的 venv（`~/.boshi/venv`, py3.11，onnxruntime/psycopg 齐全），`boshi_cli.py status` 一切正常。
+
+**修法（零 LLM、零生成不变，数据层一行不动）**：把数据层当作**常驻子进程**，hermes 插件经 JSON-lines RPC 调用，彻底摆脱 hermes 解释器版本。
+
+| 项 | 值 |
+|:--|:--|
+| 新增文件 | `~/.boshi/boshi_rpc_server.py`（加法，数据层本体不改）：跑在 boshi venv，stdin/stdout JSON-lines；`target` ∈ {`boshi_core`,`chroma_bridge`,`rpc`}，派发 `fn(**kwargs)`；`rpc.ping`/`rpc.session_state` 为本文件内的服务器侧函数 |
+| RPC 面 | `boshi_core.{search,save,status,profile,get_latest_by_topic,get_mental_model}` + `chroma_bridge.backend_name` + `rpc.session_state`（把 §11.33 的三条 SQL 挪到服务器侧，返回 `{origin,rows,fact}`，ts 已格式化为 `HH:MM`） |
+| 插件侧 | 新增 `_RpcClient`（spawn `~/.boshi/venv/.../python boshi_rpc_server.py`，线程锁串行 request/response，子进程死了自动重启，`shutdown` 时 terminate）+ `_VenvCore`（鸭子实现 `boshi_core` 接口，全部转发 RPC）。`initialize()` 里 `self._core = _VenvCore(_RpcClient(profile))`，**不再** `import boshi_core` |
+| `is_available` / `unavailable_reason` | 改为 spawn 一次 `ping` 探测（结果缓存 `self._avail`），不再进程内 `import chroma_bridge`（py3.14 下会炸） |
+| `_session_state` | 数据获取改 `self._core.rpc_session_state(sid, profile, _TAIL_N)`；渲染/判重/截断仍留在插件侧（dict 形状，ts 是字符串） |
+| `plugin.yaml` | `python_dependencies` **清空**（原来 5 项 onnxruntime/chromadb/transformers/numpy/pyyaml 在 py3.14 建不起来 → 自动禁用）；版本 1.0.0→1.0.1。hermes 侧插件进程内现在只需要 hermes 内建 + stdlib |
+| 会话归属 | `BOSHI_PROFILE` 经子进程 env 传入，逐 provider 实例各起一个子进程（各带自己的 profile） |
+
+**性能**：ONNX 只在 RPC 子进程里加载**一次**（冷启 ~6s，发生在 `initialize()` 的起步自检里，不在每轮 prefetch 的 8s 预算内）；之后 search ~1–2s（含向量通道），`session_state` ~毫秒。
+
+**验证**：在 hermes 的 py3.14 解释器下端到端（`is_available=True`、`search total` 正常、`get_mental_model` 1266 字、`_session_state` 493 字、干净 shutdown）。全量 **`Ran 265 tests, OK (skipped=1)`**；`tests/test_session_state.py` 的桩从旧 `pg_bridge._conn` 缝改到 RPC 缝（`_FakeCore.rpc_session_state` 返回新 dict 形状），测试意图不变。
+
+**已知边界**
+- 每个 provider 实例起一个 RPC 子进程；多 profile gateway 会是多个子进程（各载一次 ONNX）。若成为瓶颈，可后续抽成共享单例。
+- RPC 走 stdout 逐行读，**串行**（锁保护），并发高时排队；当前伯仕负载下无感。
+- `BOSHI_SESSION_STATE`、`BOSHI_MENTAL_MODEL` 等既有开关不变；新增回滚：`BOSHI_RPC=0`（预留，暂未接——需要时再加）。
+
+## 11.35 RPC 子进程解释器环境隔离（PYTHONPATH 污染，2026-10-24）
+
+**现象**：§11.34 的 RPC 架构在**某些启动方式下**静默失效——插件日志成对出现
+
+```
+boshi[诊断] boshi RPC 子进程已启动（py=python.exe profile=default pid=NNNN）
+boshi[诊断] is_available=False（backend=None，经 boshi venv RPC）
+⚠ Memory provider 'boshi' is selected but reports unavailable …
+伯仕数据层 ping 失败：No module named 'pydantic_core._pydantic_core'
+```
+
+即：子进程起来了、握手 `{"ready": true}` 也通了，但 `rpc.ping` 必失败 → provider 判不可用 → 本轮外部记忆关闭、🦄 不出。同一台机器上换个启动路径重启就自动恢复，**看起来像随机故障**。
+
+**根因（实验钉死）**：hermes 主进程把自己的 **插件依赖环境**（py3.14：`installs/<id>/environments/<env>/venv/Lib/site-packages`）放进了 `PYTHONPATH`；`_RpcClient._ensure()` 原先 `env = dict(os.environ)` **原样继承**给子进程，而子进程是 **py3.11** 的伯仕 venv。于是 3.11 的解释器在 `sys.path` 里先撞上 3.14 目录里的 `pydantic_core`（只有 `_pydantic_core.cp314-win_amd64.pyd`），CPython 加载不动该 ABI 扩展 → `ModuleNotFoundError: No module named 'pydantic_core._pydantic_core'`。同目录下的 numpy/pydantic 等纯 py 包也会被异版本覆盖，属一类问题。
+
+判定证据链（可复现）：
+
+| 观察 | 结果 |
+|:--|:--|
+| 失败时子进程 `debug.site_paths`（临时诊断输出） | 含 `…/installs/2b4421044f1d482c/environments/8ce228a3655c4e8ba7060520e5172fd4/venv/Lib/site-packages` |
+| 该目录内容 | `pydantic_core/` 下只有 `_pydantic_core.cp314-win_amd64.pyd`；`pyvenv.cfg: version_info = 3.14.9` |
+| 单点复现 | `PYTHONPATH=<该目录> ~/.boshi/venv/Scripts/python.exe -c "import pydantic_core"` → 同样报 `No module named 'pydantic_core._pydantic_core'` |
+| 对照 | 同一命令不带 `PYTHONPATH` → 正常（`pydantic_core 2.46.4`，`_pydantic_core.cp311-win_amd64.pyd` 在 `~/.boshi/venv` 里） |
+| 直跑 RPC server | `printf '{"id":1,"target":"rpc","fn":"ping",…}' \| venv/python boshi_rpc_server.py` → `{"ready":true}` + `{"ok":true,"backend":"pg"}`，数据层完全健康 |
+
+**修法**（`plugins/boshi/__init__.py::_RpcClient._ensure`，3 行语义、无新依赖）：spawn 前剥掉所有能改写解释器搜索路径的继承变量，只让子进程认自己的 venv。
+
+```python
+env = dict(os.environ)
+for _k in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE"):
+    env.pop(_k, None)
+env["PYTHONNOUSERSITE"] = "1"
+```
+
+`BOSHI_PROFILE` 等业务变量照旧透传；`PATH` 不动（venv python 运行不需要，且可能被数据层的子工具用到）。
+
+**验证**：
+- 脏环境端到端（模拟真实故障条件）：父进程 py3.14 + `PYTHONPATH=<hermes-agent>;<3.14 插件 env>`，加载插件并 `BoshiMemoryProvider().is_available()` → **`True`**；修复前该组合必 False。
+- 干净环境不回归：同脚本无 `PYTHONPATH` → `True`。
+- 全量单测 `Ran 265 tests, OK (skipped=1)`。
+- 线上：`boshi memory provider initialized via boshi-venv RPC (session=…, ctx=primary)` → `Memory provider 'boshi' activated` → `心智模型页注入：4 页 / 1266 字符` → `prefetch 实时检索：count=6` → `recall_status 已交给 UI：🦄 boshi — recalled 6 memories`。
+
+**已知边界**：
+- **不是代码级永久免疫**：本修法只切断「父进程 env」这一条污染路径。若有人手工 `export PYTHONPATH` 指向异版本 site-packages 后直接跑 `boshi_rpc_server.py`，仍会复发——`boshi_rpc_server.py` 自身不校验 `sys.path` 纯净度（可作后续加固项）。
+- **诊断残留**：`boshi_rpc_server.py::ping()` 的失败分支保留 `debug` 字段（`exe` / `pyvenv_cfg` / `site_paths` / `boshi_pkgs` / `env_python`），只在 ping 失败时返回，正常路径零开销。这是本次定位的关键抓手，故意留着。
+- **症状相似但成因不同的旁证**：0.7.21 web-ui 会话若无插入箭头看 `sessions.source/agent`（`api_server`/空 → 应为 `cli`/`hermes`）；与本节无关，勿混。
+
+## 12. 资产位置（补充：P2 写路径与 P2+ 相关）
+
+| 文件 | 作用 |
+|:--|:--|
+| `~/.boshi/eval/cases.py` | 35 条 gold（`(query, gold_id8, anchor)`） |
+| `~/.boshi/eval/check_gold.py` | gold 自检（存在 / is_latest / anchor 逐字命中） |
+| `~/.boshi/eval/a5_eval.py` | 绝对质量：auto / rrf / vector 三模式 top1·3·5 |
+| `~/.boshi/eval/a6_roleprior.py` | 角色先验重排（已否决，留作回归） |
+| `~/.boshi/eval/a7_poolsize.py` | top_k 敏感性 |
+| `~/.boshi/eval/a8_field_gold.py` | 40 条字面量 gold（端口/版本/开关）+ P2+ on/off 对比 |
+| `~/.boshi/scratch/sweep_field_match.py` | P2+ 8 组参数扫描（进程内 monkeypatch） |
+| `~/.boshi/eval/sweep_fuse.py` | 融合公式离线扫参（10 模式 × 2 深度，A9+A5 共用一次深度 60 候选，缓存 `logs/sweep_fuse_cache.json`） |
+| `~/.boshi/scratch/a9_pool_probe2.py` | A9 逐条全深度名次探测 → `logs/a9_pool_probe2.json`（区分池内排序 / 池截断 / 两路皆无） |
+| `~/.boshi/scratch/a9_gap_inspect.py` | 复刻线上 qweak 融合分，算 gold 与 top5 门槛的分差（判"差一点点"还是"差一大截"） |
+| `~/.boshi/scratch/a9_wv_sweep2.py` | kw 权重占比 0→0.6 网格（paraphrase 找最优 + overlap 防回归） |
+| `~/.boshi/tests/test_slots.py` | 抽提器 **26 条**单测（逐字搬运 / 负例 / 标题不占陈述 / 4 段版本号 6 条） |
+| `~/.boshi/tests/test_slots_p31.py` | P3.1 抽提器 **11 条**单测（真实列表块切句 / 关键词在末条仍保住 / 「我建议」不算决策 / 否定词局部化 / verbatim 不变式） |
+| `~/.boshi/tests/test_fact_source.py` | 事实层接线 **3 条**源码级守卫（`items_from_slots(u_slots_meta)` 在 / `for _m in (u_slots_meta, a_slots_meta)` 不在 / `FACT_TOPIC` 后有 `upsert=True`） |
+| `~/.boshi/tests/test_field_match.py` | P2+ **15 条**单测（query 侧端口补扫 / IP 不算端口 / 跨字段不命中 / 版本精确比较 4 条） |
+| `~/.boshi/backfill_slots.py` | 存量 slots 回填（零模型，`--dry-run` / `--apply`，只写差异行 + 全量备份） |
+| `~/.boshi/eval/fm_stats_report.py` | `boshi.fm_stats` 报表（近 N 天按字段：hit/query、avg_gain、t1_rate；`--daily` 看明细） |
+| `~/.boshi/tests/test_fm_stats.py` | 打点 **6 条**单测（命中计数 / top1 归因 / 每字段一行 / 开关与异常兜底 / SQL 形状） |
+| `~/.boshi/session_fact.py` | P3 事实层纯函数（`items_from_slots` / `parse` / `render` / `merge`，门控+滚动累积+跨小节去重） |
+| `~/.boshi/tests/test_session_fact.py` | P3 **14 条**单测（门控 / 幂等 / 丢最旧 / 去重 / 原文保真 / 解析容错） |
+| `~/.boshi/experience.py` | P1③ 经验层：质量门+复用门、跨会话去重累积、双向链、零模型召回（`remember` / `link_back` / `recall` / `stats`，开关 `BOSHI_WRITE_EXPERIENCE`、`BOSHI_EXPERIENCE_CHANNEL`） |
+| `~/.boshi/tests/test_experience.py` | P1③ **26 条**单测（判重键 / 质量门 / 抽提 / 复用门 / token 与召回） |
+| `~/.boshi/mental_model.py` | P2 ④ 心智模型预计算页：五页构建（`_page_*`）/ `build_page` / `render` / `save_page`（内容不变不落库）/ `rebuild` / `prune_pages`（`KEEP_VERSIONS=8`，默认 dry-run）/ `load_pages` / `render_all`（按行裁剪）/ `is_stale` / `refresh_async` |
+| `~/.boshi/tests/test_mental_model.py` | P2 ④ **27 条**单测（helper / 后端 API+公开名 / core 包装 / CLI 含 prune 三开关 / MCP 注册 / 插件注入 / 去重与只删旧版守卫 / 评测防污染） |
+| `~/.boshi/scratch/e_rerank_smoke.py` `e_rerank_eval.py` `e_rerank_sweep.py` | E 方案（精排）三件套：冒烟（1 query + gold）、三档对比（base / rerank@20 / rerank@5）、池深×截断扫描（6 组，含 p50/p90），结果 `logs/e_rerank.json` |
+| `~/.boshi/scratch/a10_bigram_promote.py` | A10 query 侧 bigram 提权（monkeypatch `_kw_tokens`，3 档提权强度），结论：A9 全面退化，放弃 |
+| `~/.boshi/scratch/b_expand_pilot.py` `b_bridge_probe.py` `b_bridge_probe2.py` | B 方案（库内共现同义表扩 query）试点与连通性探针，结论：prim 4/5/8 → 3/4/6，否定 |
+| `~/.boshi/logs/a5_k5.json` `a6_roleprior_all.json` `a7_poolsize.json` `a5_p2plus_base.json` `a5_p2plus_fm4k.json` `a8_field_gold.json` `sweep_field_match.json` | 结果快照 |
+
+**扩展约定**：新增 gold 只往 `cases.py` 加三元组，`anchor` 必须能在 gold 正文里逐字找到（`check_gold.py` 会拦）。想比较两套索引时，**同一批 cases + 同一 top_k + scope=all**，否则数字不可比（10.5 就是这个坑）。
